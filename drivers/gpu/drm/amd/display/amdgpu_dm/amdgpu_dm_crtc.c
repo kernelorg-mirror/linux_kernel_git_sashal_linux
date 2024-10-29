@@ -123,7 +123,7 @@ static void amdgpu_dm_crtc_vblank_control_worker(struct work_struct *work)
 	 * where the SU region is the full hactive*vactive region. See
 	 * fill_dc_dirty_rects().
 	 */
-	if (vblank_work->stream && vblank_work->stream->link) {
+	if (vblank_work->stream && vblank_work->stream->link && vblank_work->acrtc) {
 		if (vblank_work->enable) {
 			if (vblank_work->stream->link->psr_settings.psr_version < DC_PSR_VERSION_SU_1 &&
 			    vblank_work->stream->link->psr_settings.psr_allow_active)
