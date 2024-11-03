@@ -772,7 +772,7 @@ int io_arm_poll_handler(struct io_kiocb *req, unsigned issue_flags)
 	return IO_APOLL_OK;
 }
 
-static __cold bool io_poll_remove_all_table(struct task_struct *tsk,
+static __cold bool io_poll_remove_all_table(struct io_uring_task *tctx,
 					    struct io_hash_table *table,
 					    bool cancel_all)
 {
@@ -787,7 +787,7 @@ static __cold bool io_poll_remove_all_table(struct task_struct *tsk,
 
 		spin_lock(&hb->lock);
 		hlist_for_each_entry_safe(req, tmp, &hb->list, hash_node) {
-			if (io_match_task_safe(req, tsk, cancel_all)) {
+			if (io_match_task_safe(req, tctx, cancel_all)) {
 				hlist_del_init(&req->hash_node);
 				io_poll_cancel_req(req);
 				found = true;
@@ -801,14 +801,14 @@ static __cold bool io_poll_remove_all_table(struct task_struct *tsk,
 /*
  * Returns true if we found and killed one or more poll requests
  */
-__cold bool io_poll_remove_all(struct io_ring_ctx *ctx, struct task_struct *tsk,
+__cold bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
 			       bool cancel_all)
 	__must_hold(&ctx->uring_lock)
 {
 	bool ret;
 
-	ret = io_poll_remove_all_table(tsk, &ctx->cancel_table, cancel_all);
-	ret |= io_poll_remove_all_table(tsk, &ctx->cancel_table_locked, cancel_all);
+	ret = io_poll_remove_all_table(tctx, &ctx->cancel_table, cancel_all);
+	ret |= io_poll_remove_all_table(tctx, &ctx->cancel_table_locked, cancel_all);
 	return ret;
 }
 

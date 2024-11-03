@@ -43,7 +43,7 @@ struct io_cancel_data;
 int io_poll_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
 		   unsigned issue_flags);
 int io_arm_poll_handler(struct io_kiocb *req, unsigned issue_flags);
-bool io_poll_remove_all(struct io_ring_ctx *ctx, struct task_struct *tsk,
+bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
 			bool cancel_all);
 
 void io_apoll_cache_free(struct io_cache_entry *entry);
