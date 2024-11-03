@@ -754,30 +754,19 @@ static void io_cqring_overflow_flush(struct io_ring_ctx *ctx)
 		io_cqring_do_overflow_flush(ctx);
 }
 
-/* can be called by any task */
-static void io_put_task_remote(struct task_struct *task)
-{
-	struct io_uring_task *tctx = task->io_uring;
-
-	percpu_counter_sub(&tctx->inflight, 1);
-	if (unlikely(atomic_read(&tctx->in_cancel)))
-		wake_up(&tctx->wait);
-	put_task_struct(task);
-}
-
-/* used by a task to put its own references */
-static void io_put_task_local(struct task_struct *task)
-{
-	task->io_uring->cached_refs++;
-}
-
 /* must to be called somewhat shortly after putting a request */
 static inline void io_put_task(struct task_struct *task)
 {
-	if (likely(task == current))
-		io_put_task_local(task);
-	else
-		io_put_task_remote(task);
+	struct io_uring_task *tctx = task->io_uring;
+
+	if (likely(task == current)) {
+		tctx->cached_refs++;
+	} else {
+		percpu_counter_sub(&tctx->inflight, 1);
+		if (unlikely(atomic_read(&tctx->in_cancel)))
+			wake_up(&tctx->wait);
+		put_task_struct(task);
+	}
 }
 
 void io_task_refs_refill(struct io_uring_task *tctx)
@@ -1039,7 +1028,14 @@ static void __io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
 		 * we don't hold ->completion_lock. Clean them here to avoid
 		 * deadlocks.
 		 */
-		io_put_task_remote(req->task);
+		{
+			struct io_uring_task *tctx = req->task->io_uring;
+
+			percpu_counter_sub(&tctx->inflight, 1);
+			if (unlikely(atomic_read(&tctx->in_cancel)))
+				wake_up(&tctx->wait);
+			put_task_struct(req->task);
+		}
 		wq_list_add_head(&req->comp_list, &ctx->locked_free_list);
 		ctx->locked_free_nr++;
 	}
