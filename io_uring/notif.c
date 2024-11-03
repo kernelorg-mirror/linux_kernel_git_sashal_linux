@@ -73,7 +73,7 @@ struct io_kiocb *io_alloc_notif(struct io_ring_ctx *ctx)
 	notif->opcode = IORING_OP_NOP;
 	notif->flags = 0;
 	notif->file = NULL;
-	notif->task = current;
+	notif->tctx = current->io_uring;
 	io_get_task_refs(1);
 	notif->rsrc_node = NULL;
 	notif->io_task_work.func = io_req_task_complete;

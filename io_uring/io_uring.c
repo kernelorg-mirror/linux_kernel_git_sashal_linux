@@ -215,7 +215,7 @@ bool io_match_task_safe(struct io_kiocb *head, struct io_uring_task *tctx,
 {
 	bool matched;
 
-	if (tctx && head->task->io_uring != tctx)
+	if (tctx && head->tctx != tctx)
 		return false;
 	if (cancel_all)
 		return true;
@@ -410,11 +410,8 @@ static void io_clean_op(struct io_kiocb *req)
 		kfree(req->apoll);
 		req->apoll = NULL;
 	}
-	if (req->flags & REQ_F_INFLIGHT) {
-		struct io_uring_task *tctx = req->task->io_uring;
-
-		atomic_dec(&tctx->inflight_tracked);
-	}
+	if (req->flags & REQ_F_INFLIGHT)
+		atomic_dec(&req->tctx->inflight_tracked);
 	if (req->flags & REQ_F_CREDS)
 		put_cred(req->creds);
 	if (req->flags & REQ_F_ASYNC_DATA) {
@@ -428,7 +425,7 @@ static inline void io_req_track_inflight(struct io_kiocb *req)
 {
 	if (!(req->flags & REQ_F_INFLIGHT)) {
 		req->flags |= REQ_F_INFLIGHT;
-		atomic_inc(&req->task->io_uring->inflight_tracked);
+		atomic_inc(&req->tctx->inflight_tracked);
 	}
 }
 
@@ -499,7 +496,7 @@ static void io_prep_async_link(struct io_kiocb *req)
 
 static void io_queue_iowq(struct io_kiocb *req)
 {
-	struct io_uring_task *tctx = req->task->io_uring;
+	struct io_uring_task *tctx = req->tctx;
 
 	BUG_ON(!tctx);
 
@@ -518,7 +515,7 @@ static void io_queue_iowq(struct io_kiocb *req)
 	 * procedure rather than attempt to run this request (or create a new
 	 * worker for it).
 	 */
-	if (WARN_ON_ONCE(!same_thread_group(req->task, current)))
+	if (WARN_ON_ONCE(!same_thread_group(tctx->task, current)))
 		req->work.flags |= IO_WQ_WORK_CANCEL;
 
 	trace_io_uring_queue_async_work(req, io_wq_is_hashed(&req->work));
@@ -755,17 +752,17 @@ static void io_cqring_overflow_flush(struct io_ring_ctx *ctx)
 }
 
 /* must to be called somewhat shortly after putting a request */
-static inline void io_put_task(struct task_struct *task)
+static inline void io_put_task(struct io_kiocb *req)
 {
-	struct io_uring_task *tctx = task->io_uring;
+	struct io_uring_task *tctx = req->tctx;
 
-	if (likely(task == current)) {
+	if (likely(tctx->task == current)) {
 		tctx->cached_refs++;
 	} else {
 		percpu_counter_sub(&tctx->inflight, 1);
 		if (unlikely(atomic_read(&tctx->in_cancel)))
 			wake_up(&tctx->wait);
-		put_task_struct(task);
+		put_task_struct(tctx->task);
 	}
 }
 
@@ -1028,14 +1025,7 @@ static void __io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
 		 * we don't hold ->completion_lock. Clean them here to avoid
 		 * deadlocks.
 		 */
-		{
-			struct io_uring_task *tctx = req->task->io_uring;
-
-			percpu_counter_sub(&tctx->inflight, 1);
-			if (unlikely(atomic_read(&tctx->in_cancel)))
-				wake_up(&tctx->wait);
-			put_task_struct(req->task);
-		}
+		io_put_task(req);
 		wq_list_add_head(&req->comp_list, &ctx->locked_free_list);
 		ctx->locked_free_nr++;
 	}
@@ -1370,7 +1360,7 @@ static inline void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 
 static void io_req_normal_work_add(struct io_kiocb *req)
 {
-	struct io_uring_task *tctx = req->task->io_uring;
+	struct io_uring_task *tctx = req->tctx;
 	struct io_ring_ctx *ctx = req->ctx;
 
 	/* task_work already pending, we're done */
@@ -1380,7 +1370,7 @@ static void io_req_normal_work_add(struct io_kiocb *req)
 	if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
 		atomic_or(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
 
-	if (likely(!task_work_add(req->task, &tctx->task_work, ctx->notify_method)))
+	if (likely(!task_work_add(tctx->task, &tctx->task_work, ctx->notify_method)))
 		return;
 
 	io_fallback_tw(tctx, false);
@@ -1573,7 +1563,7 @@ static void io_free_batch_list(struct io_ring_ctx *ctx,
 
 		io_req_put_rsrc_locked(req, ctx);
 
-		io_put_task(req->task);
+		io_put_task(req);
 		node = req->comp_list.next;
 		io_req_add_to_cache(req, ctx);
 	} while (node);
@@ -2226,7 +2216,7 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	req->cqe.user_data = READ_ONCE(sqe->user_data);
 	req->file = NULL;
 	req->rsrc_node = NULL;
-	req->task = current;
+	req->tctx = current->io_uring;
 
 	if (unlikely(opcode >= IORING_OP_LAST)) {
 		req->opcode = 0;
@@ -3397,7 +3387,7 @@ static bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
 				struct io_uring_cmd);
 		struct file *file = req->file;
 
-		if (!cancel_all && req->task->io_uring != tctx)
+		if (!cancel_all && req->tctx != tctx)
 			continue;
 
 		if (cmd->flags & IORING_URING_CMD_CANCELABLE) {
