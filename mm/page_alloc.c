@@ -1529,7 +1529,6 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	int i;
 
 	set_page_private(page, 0);
-	set_page_refcounted(page);
 
 	arch_alloc_page(page, order);
 	debug_pagealloc_map_pages(page, 1 << order);
@@ -3379,6 +3378,7 @@ try_this_zone:
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
 			prep_new_page(page, order, gfp_mask, alloc_flags);
+			set_page_refcounted(page);
 
 			/*
 			 * If this is a high-order atomic allocation then check
@@ -3614,8 +3614,10 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	count_vm_event(COMPACTSTALL);
 
 	/* Prep a captured page if available */
-	if (page)
+	if (page) {
 		prep_new_page(page, order, gfp_mask, alloc_flags);
+		set_page_refcounted(page);
+	}
 
 	/* Try get a page from the freelist if available */
 	if (!page)
@@ -4595,6 +4597,7 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
 		nr_account++;
 
 		prep_new_page(page, 0, gfp, 0);
+		set_page_refcounted(page);
 		if (page_list)
 			list_add(&page->lru, page_list);
 		else

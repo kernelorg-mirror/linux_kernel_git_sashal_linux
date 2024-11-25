@@ -95,6 +95,7 @@ static void split_map_pages(struct list_head *list)
 		nr_pages = 1 << order;
 
 		post_alloc_hook(page, order, __GFP_MOVABLE);
+		set_page_refcounted(page);
 		if (order)
 			split_page(page, order);
 
