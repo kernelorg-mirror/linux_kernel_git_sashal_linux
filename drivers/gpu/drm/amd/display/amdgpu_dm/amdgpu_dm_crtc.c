@@ -127,7 +127,7 @@ static void amdgpu_dm_crtc_vblank_control_worker(struct work_struct *work)
 		if (vblank_work->enable) {
 			if (vblank_work->stream->link->psr_settings.psr_version < DC_PSR_VERSION_SU_1 &&
 			    vblank_work->stream->link->psr_settings.psr_allow_active)
-				amdgpu_dm_psr_disable(vblank_work->stream);
+				amdgpu_dm_psr_disable(vblank_work->stream, false);
 		} else if (vblank_work->stream->link->psr_settings.psr_feature_enabled &&
 			   !vblank_work->stream->link->psr_settings.psr_allow_active &&
 #ifdef CONFIG_DRM_AMD_SECURE_DISPLAY
