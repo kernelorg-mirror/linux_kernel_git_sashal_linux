@@ -81,8 +81,8 @@ int mlx5vf_add_migration_pages(struct mlx5_vhca_data_buffer *buf,
 		return -ENOMEM;
 
 	do {
-		filled = alloc_pages_bulk_array(GFP_KERNEL_ACCOUNT, to_fill,
-						page_list);
+		filled = alloc_pages_bulk(GFP_KERNEL_ACCOUNT, to_fill,
+					  page_list);
 		if (!filled) {
 			ret = -ENOMEM;
 			goto err;
