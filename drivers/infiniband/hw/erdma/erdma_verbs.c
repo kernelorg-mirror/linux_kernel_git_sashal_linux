@@ -121,8 +121,8 @@ static int create_qp_cmd(struct erdma_ucontext *uctx, struct erdma_qp *qp)
 		}
 	}
 
-	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), &resp0,
-				  &resp1);
+	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), &resp0, &resp1,
+				  true);
 	if (!err)
 		qp->attrs.cookie =
 			FIELD_GET(ERDMA_CMDQ_CREATE_QP_RESP_COOKIE_MASK, resp0);
@@ -180,7 +180,8 @@ static int regmr_cmd(struct erdma_dev *dev, struct erdma_mr *mr)
 	}
 
 post_cmd:
-	return erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	return erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				   true);
 }
 
 static int create_cq_cmd(struct erdma_ucontext *uctx, struct erdma_cq *cq)
@@ -243,7 +244,8 @@ static int create_cq_cmd(struct erdma_ucontext *uctx, struct erdma_cq *cq)
 		}
 	}
 
-	return erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	return erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				   true);
 }
 
 static int erdma_alloc_idx(struct erdma_resource_cb *res_cb)
@@ -441,7 +443,8 @@ static void erdma_flush_worker(struct work_struct *work)
 	req.qpn = QP_ID(qp);
 	req.sq_pi = qp->kern_qp.sq_pi;
 	req.rq_pi = qp->kern_qp.rq_pi;
-	erdma_post_cmd_wait(&qp->dev->cmdq, &req, sizeof(req), NULL, NULL);
+	erdma_post_cmd_wait(&qp->dev->cmdq, &req, sizeof(req), NULL, NULL,
+			    true);
 }
 
 static int erdma_qp_validate_cap(struct erdma_dev *dev,
@@ -1210,7 +1213,8 @@ int erdma_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 	req.cfg = FIELD_PREP(ERDMA_CMD_MR_MPT_IDX_MASK, ibmr->lkey >> 8) |
 		  FIELD_PREP(ERDMA_CMD_MR_KEY_MASK, ibmr->lkey & 0xFF);
 
-	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				  true);
 	if (ret)
 		return ret;
 
@@ -1235,7 +1239,8 @@ int erdma_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 				CMDQ_OPCODE_DESTROY_CQ);
 	req.cqn = cq->cqn;
 
-	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				  true);
 	if (err)
 		return err;
 
@@ -1274,7 +1279,8 @@ int erdma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 				CMDQ_OPCODE_DESTROY_QP);
 	req.qpn = QP_ID(qp);
 
-	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				  true);
 	if (err)
 		return err;
 
@@ -1381,7 +1387,8 @@ static int alloc_db_resources(struct erdma_dev *dev, struct erdma_ucontext *ctx,
 		  FIELD_PREP(ERDMA_CMD_EXT_DB_RQ_EN_MASK, 1) |
 		  FIELD_PREP(ERDMA_CMD_EXT_DB_SQ_EN_MASK, 1);
 
-	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), &val0, &val1);
+	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), &val0, &val1,
+				  true);
 	if (ret)
 		return ret;
 
@@ -1416,7 +1423,8 @@ static void free_db_resources(struct erdma_dev *dev, struct erdma_ucontext *ctx)
 	req.rdb_off = ctx->ext_db.rdb_off;
 	req.cdb_off = ctx->ext_db.cdb_off;
 
-	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				  true);
 	if (ret)
 		ibdev_err_ratelimited(&dev->ibdev,
 				      "free db resources failed %d", ret);
@@ -1721,7 +1729,7 @@ void erdma_set_mtu(struct erdma_dev *dev, u32 mtu)
 				CMDQ_OPCODE_CONF_MTU);
 	req.mtu = mtu;
 
-	erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL, true);
 }
 
 void erdma_port_event(struct erdma_dev *dev, enum ib_event_type reason)
@@ -1791,7 +1799,8 @@ static int erdma_query_hw_stats(struct erdma_dev *dev,
 	req.target_addr = dma_addr;
 	req.target_length = ERDMA_HW_RESP_SIZE;
 
-	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL);
+	err = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), NULL, NULL,
+				  true);
 	if (err)
 		goto out;
 
