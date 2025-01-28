@@ -66,6 +66,19 @@ enum btrfs_subpage_type {
 	BTRFS_SUBPAGE_DATA,
 };
 
+/*
+ * Subpage support for metadata is more complex, as we can have dummy extent
+ * buffers, where folios have no mapping to determine the owning inode.
+ *
+ * Thankfully we only need to check if node size is smaller than page size.
+ * Even with larger folio support, we will only allocate a folio as large as
+ * node size.
+ * Thus if nodesize < PAGE_SIZE, we know metadata needs need to subpage routine.
+ */
+static inline bool btrfs_meta_is_subpage(const struct btrfs_fs_info *fs_info)
+{
+	return fs_info->nodesize < PAGE_SIZE;
+}
 bool btrfs_is_subpage(const struct btrfs_fs_info *fs_info, struct address_space *mapping);
 
 int btrfs_attach_subpage(const struct btrfs_fs_info *fs_info,

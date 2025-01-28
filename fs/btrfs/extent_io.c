@@ -937,7 +937,7 @@ static int attach_extent_buffer_folio(struct extent_buffer *eb,
 	if (folio->mapping)
 		lockdep_assert_held(&folio->mapping->i_private_lock);
 
-	if (fs_info->nodesize >= PAGE_SIZE) {
+	if (!btrfs_meta_is_subpage(fs_info)) {
 		if (!folio_test_private(folio))
 			folio_attach_private(folio, eb);
 		else
@@ -1846,7 +1846,7 @@ static noinline_for_stack void write_one_eb(struct extent_buffer *eb,
 	wbc_init_bio(wbc, &bbio->bio);
 	bbio->inode = BTRFS_I(eb->fs_info->btree_inode);
 	bbio->file_offset = eb->start;
-	if (fs_info->nodesize < PAGE_SIZE) {
+	if (btrfs_meta_is_subpage(fs_info)) {
 		struct folio *folio = eb->folios[0];
 		bool ret;
 
@@ -1998,7 +1998,7 @@ static int submit_eb_page(struct page *page, struct btrfs_eb_write_context *ctx)
 	if (!folio_test_private(folio))
 		return 0;
 
-	if (page_to_fs_info(page)->nodesize < PAGE_SIZE)
+	if (btrfs_meta_is_subpage(page_to_fs_info(page)))
 		return submit_eb_subpage(page, wbc);
 
 	spin_lock(&mapping->i_private_lock);
@@ -3490,7 +3490,7 @@ static void detach_extent_buffer_folio(struct extent_buffer *eb, struct folio *f
 		return;
 	}
 
-	if (fs_info->nodesize >= PAGE_SIZE) {
+	if (!btrfs_meta_is_subpage(fs_info)) {
 		/*
 		 * We do this since we'll remove the pages after we've
 		 * removed the eb from the radix tree, so we could race
@@ -3799,7 +3799,7 @@ static struct extent_buffer *grab_extent_buffer(
 	 * don't try to insert two ebs for the same bytenr.  So here we always
 	 * return NULL and just continue.
 	 */
-	if (fs_info->nodesize < PAGE_SIZE)
+	if (btrfs_meta_is_subpage(fs_info))
 		return NULL;
 
 	/* Page not yet attached to an extent buffer */
@@ -3900,7 +3900,7 @@ retry:
 
 finish:
 	spin_lock(&mapping->i_private_lock);
-	if (existing_folio && fs_info->nodesize < PAGE_SIZE) {
+	if (existing_folio && btrfs_meta_is_subpage(fs_info)) {
 		/* We're going to reuse the existing page, can drop our folio now. */
 		__free_page(folio_page(eb->folios[i], 0));
 		eb->folios[i] = existing_folio;
@@ -3992,7 +3992,7 @@ struct extent_buffer *alloc_extent_buffer(struct btrfs_fs_info *fs_info,
 	 * The memory will be freed by attach_extent_buffer_page() or freed
 	 * manually if we exit earlier.
 	 */
-	if (fs_info->nodesize < PAGE_SIZE) {
+	if (btrfs_meta_is_subpage(fs_info)) {
 		prealloc = btrfs_alloc_subpage(fs_info, BTRFS_SUBPAGE_METADATA);
 		if (IS_ERR(prealloc)) {
 			ret = PTR_ERR(prealloc);
@@ -4293,7 +4293,7 @@ void btrfs_clear_buffer_dirty(struct btrfs_trans_handle *trans,
 	percpu_counter_add_batch(&fs_info->dirty_metadata_bytes, -eb->len,
 				 fs_info->dirty_metadata_batch);
 
-	if (eb->fs_info->nodesize < PAGE_SIZE)
+	if (btrfs_meta_is_subpage(fs_info))
 		return clear_subpage_extent_buffer_dirty(eb);
 
 	num_folios = num_extent_folios(eb);
@@ -4323,7 +4323,7 @@ void set_extent_buffer_dirty(struct extent_buffer *eb)
 	WARN_ON(!test_bit(EXTENT_BUFFER_TREE_REF, &eb->bflags));
 
 	if (!was_dirty) {
-		bool subpage = eb->fs_info->nodesize < PAGE_SIZE;
+		bool subpage = btrfs_meta_is_subpage(eb->fs_info);
 
 		/*
 		 * For subpage case, we can have other extent buffers in the
@@ -4369,7 +4369,7 @@ void clear_extent_buffer_uptodate(struct extent_buffer *eb)
 		 * This is special handling for metadata subpage, as regular
 		 * btrfs_is_subpage() can not handle cloned/dummy metadata.
 		 */
-		if (fs_info->nodesize >= PAGE_SIZE)
+		if (!btrfs_meta_is_subpage(fs_info))
 			folio_clear_uptodate(folio);
 		else
 			btrfs_subpage_clear_uptodate(fs_info, folio,
@@ -4390,7 +4390,7 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
 		 * This is special handling for metadata subpage, as regular
 		 * btrfs_is_subpage() can not handle cloned/dummy metadata.
 		 */
-		if (fs_info->nodesize >= PAGE_SIZE)
+		if (!btrfs_meta_is_subpage(fs_info))
 			folio_mark_uptodate(folio);
 		else
 			btrfs_subpage_set_uptodate(fs_info, folio,
@@ -4486,7 +4486,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
 	bbio->inode = BTRFS_I(eb->fs_info->btree_inode);
 	bbio->file_offset = eb->start;
 	memcpy(&bbio->parent_check, check, sizeof(*check));
-	if (eb->fs_info->nodesize < PAGE_SIZE) {
+	if (btrfs_meta_is_subpage(eb->fs_info)) {
 		ret = bio_add_folio(&bbio->bio, eb->folios[0], eb->len,
 				    eb->start - folio_pos(eb->folios[0]));
 		ASSERT(ret);
@@ -4680,7 +4680,7 @@ static void assert_eb_folio_uptodate(const struct extent_buffer *eb, int i)
 	if (test_bit(EXTENT_BUFFER_WRITE_ERR, &eb->bflags))
 		return;
 
-	if (fs_info->nodesize < PAGE_SIZE) {
+	if (btrfs_meta_is_subpage(fs_info)) {
 		struct folio *folio = eb->folios[0];
 
 		ASSERT(i == 0);
@@ -5168,7 +5168,7 @@ int try_release_extent_buffer(struct page *page)
 	struct folio *folio = page_folio(page);
 	struct extent_buffer *eb;
 
-	if (page_to_fs_info(page)->nodesize < PAGE_SIZE)
+	if (btrfs_meta_is_subpage(page_to_fs_info(page)))
 		return try_release_subpage_extent_buffer(page);
 
 	/*
