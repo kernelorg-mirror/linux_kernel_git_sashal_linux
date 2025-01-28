@@ -995,7 +995,7 @@ void clear_page_extent_mapped(struct page *page)
 
 	fs_info = page_to_fs_info(page);
 	if (btrfs_is_subpage(fs_info, page->mapping))
-		return btrfs_detach_subpage(fs_info, folio);
+		return btrfs_detach_subpage(fs_info, folio, BTRFS_SUBPAGE_DATA);
 
 	folio_detach_private(folio);
 }
@@ -3516,7 +3516,7 @@ static void detach_extent_buffer_folio(struct extent_buffer *eb, struct folio *f
 	 * attached to one dummy eb, no sharing.
 	 */
 	if (!mapped) {
-		btrfs_detach_subpage(fs_info, folio);
+		btrfs_detach_subpage(fs_info, folio, BTRFS_SUBPAGE_METADATA);
 		return;
 	}
 
@@ -3527,7 +3527,7 @@ static void detach_extent_buffer_folio(struct extent_buffer *eb, struct folio *f
 	 * page range and no unfinished IO.
 	 */
 	if (!folio_range_has_eb(fs_info, folio))
-		btrfs_detach_subpage(fs_info, folio);
+		btrfs_detach_subpage(fs_info, folio, BTRFS_SUBPAGE_METADATA);
 
 	spin_unlock(&folio->mapping->i_private_lock);
 }
