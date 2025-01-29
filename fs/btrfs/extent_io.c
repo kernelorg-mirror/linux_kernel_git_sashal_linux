@@ -1781,18 +1781,14 @@ static void end_bbio_meta_write(struct btrfs_bio *bbio)
 	struct btrfs_fs_info *fs_info = eb->fs_info;
 	bool uptodate = !bbio->bio.bi_status;
 	struct folio_iter fi;
-	u32 bio_offset = 0;
 
 	if (!uptodate)
 		set_btree_ioerr(eb);
 
 	bio_for_each_folio_all(fi, &bbio->bio) {
-		u64 start = eb->start + bio_offset;
 		struct folio *folio = fi.folio;
-		u32 len = fi.length;
 
-		btrfs_folio_clear_writeback(fs_info, folio, start, len);
-		bio_offset += len;
+		btrfs_meta_folio_clear_writeback(fs_info, folio, eb->start, eb->len);
 	}
 
 	clear_bit(EXTENT_BUFFER_WRITEBACK, &eb->bflags);
@@ -4035,7 +4031,7 @@ reallocate:
 		 * and free the allocated page.
 		 */
 		folio = eb->folios[i];
-		WARN_ON(btrfs_folio_test_dirty(fs_info, folio, eb->start, eb->len));
+		WARN_ON(btrfs_meta_folio_test_dirty(fs_info, folio, eb->start, eb->len));
 
 		/*
 		 * Check if the current page is physically contiguous with previous eb
@@ -4046,7 +4042,7 @@ reallocate:
 		if (i && folio_page(eb->folios[i - 1], 0) + 1 != folio_page(folio, 0))
 			page_contig = false;
 
-		if (!btrfs_folio_test_uptodate(fs_info, folio, eb->start, eb->len))
+		if (!btrfs_meta_folio_test_uptodate(fs_info, folio, eb->start, eb->len))
 			uptodate = 0;
 
 		/*
@@ -4354,10 +4350,7 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
 static void end_bbio_meta_read(struct btrfs_bio *bbio)
 {
 	struct extent_buffer *eb = bbio->private;
-	struct btrfs_fs_info *fs_info = eb->fs_info;
 	bool uptodate = !bbio->bio.bi_status;
-	struct folio_iter fi;
-	u32 bio_offset = 0;
 
 	eb->read_mirror = bbio->mirror_num;
 
@@ -4370,19 +4363,6 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
 	} else {
 		clear_extent_buffer_uptodate(eb);
 		set_bit(EXTENT_BUFFER_READ_ERR, &eb->bflags);
-	}
-
-	bio_for_each_folio_all(fi, &bbio->bio) {
-		struct folio *folio = fi.folio;
-		u64 start = eb->start + bio_offset;
-		u32 len = fi.length;
-
-		if (uptodate)
-			btrfs_folio_set_uptodate(fs_info, folio, start, len);
-		else
-			btrfs_folio_clear_uptodate(fs_info, folio, start, len);
-
-		bio_offset += len;
 	}
 
 	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);

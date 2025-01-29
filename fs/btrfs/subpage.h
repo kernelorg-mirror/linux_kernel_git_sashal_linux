@@ -4,6 +4,7 @@
 #define BTRFS_SUBPAGE_H
 
 #include <linux/spinlock.h>
+#include "btrfs_inode.h"
 
 /*
  * Extra info for subpapge bitmap.
@@ -79,7 +80,13 @@ static inline bool btrfs_meta_is_subpage(const struct btrfs_fs_info *fs_info)
 {
 	return fs_info->nodesize < PAGE_SIZE;
 }
-bool btrfs_is_subpage(const struct btrfs_fs_info *fs_info, struct address_space *mapping);
+static inline bool btrfs_is_subpage(const struct btrfs_fs_info *fs_info,
+				    struct address_space *mapping)
+{
+	if (mapping && mapping->host)
+		ASSERT(is_data_inode(mapping->host));
+	return fs_info->sectorsize < PAGE_SIZE;
+}
 
 int btrfs_attach_subpage(const struct btrfs_fs_info *fs_info,
 			 struct folio *folio, enum btrfs_subpage_type type);
