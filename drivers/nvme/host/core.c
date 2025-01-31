@@ -2069,19 +2069,21 @@ static void nvme_set_chunk_sectors(struct nvme_ns *ns, struct nvme_id_ns *id)
 static int nvme_update_ns_info_generic(struct nvme_ns *ns,
 		struct nvme_ns_info *info)
 {
-	blk_mq_freeze_queue(ns->disk->queue);
+	unsigned int memflags;
+
+	memflags = blk_mq_freeze_queue(ns->disk->queue);
 	nvme_set_queue_limits(ns->ctrl, ns->queue);
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
-	blk_mq_unfreeze_queue(ns->disk->queue);
+	blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 
 	if (nvme_ns_head_multipath(ns->head)) {
-		blk_mq_freeze_queue(ns->head->disk->queue);
+		memflags = blk_mq_freeze_queue(ns->head->disk->queue);
 		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
 		nvme_mpath_revalidate_paths(ns);
 		blk_stack_limits(&ns->head->disk->queue->limits,
 				 &ns->queue->limits, 0);
 		ns->head->disk->flags |= GENHD_FL_HIDDEN;
-		blk_mq_unfreeze_queue(ns->head->disk->queue);
+		blk_mq_unfreeze_queue(ns->head->disk->queue, memflags);
 	}
 
 	/* Hide the block-interface for these devices */
@@ -2095,6 +2097,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		struct nvme_ns_info *info)
 {
 	struct nvme_id_ns *id;
+	unsigned int memflags;
 	unsigned lbaf;
 	int ret;
 
@@ -2109,7 +2112,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		goto error;
 	}
 
-	blk_mq_freeze_queue(ns->disk->queue);
+	memflags = blk_mq_freeze_queue(ns->disk->queue);
 	lbaf = nvme_lbaf_index(id->flbas);
 	ns->head->lba_shift = id->lbaf[lbaf].ds;
 	ns->head->nuse = le64_to_cpu(id->nuse);
@@ -2117,7 +2120,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 
 	ret = nvme_configure_metadata(ns->ctrl, ns->head, id);
 	if (ret < 0) {
-		blk_mq_unfreeze_queue(ns->disk->queue);
+		blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 		goto out;
 	}
 	nvme_set_chunk_sectors(ns, id);
@@ -2126,7 +2129,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	if (ns->head->ids.csi == NVME_CSI_ZNS) {
 		ret = nvme_update_zone_info(ns, lbaf);
 		if (ret) {
-			blk_mq_unfreeze_queue(ns->disk->queue);
+			blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 			goto out;
 		}
 	}
@@ -2141,7 +2144,7 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 		ns->head->features |= NVME_NS_DEAC;
 	set_disk_ro(ns->disk, nvme_ns_is_readonly(ns, info));
 	set_bit(NVME_NS_READY, &ns->flags);
-	blk_mq_unfreeze_queue(ns->disk->queue);
+	blk_mq_unfreeze_queue(ns->disk->queue, memflags);
 
 	if (blk_queue_is_zoned(ns->queue)) {
 		ret = nvme_revalidate_zones(ns);
@@ -2150,14 +2153,16 @@ static int nvme_update_ns_info_block(struct nvme_ns *ns,
 	}
 
 	if (nvme_ns_head_multipath(ns->head)) {
-		blk_mq_freeze_queue(ns->head->disk->queue);
+		unsigned int mp_memflags;
+
+		mp_memflags = blk_mq_freeze_queue(ns->head->disk->queue);
 		nvme_update_disk_info(ns->ctrl, ns->head->disk, ns->head, id);
 		set_disk_ro(ns->head->disk, nvme_ns_is_readonly(ns, info));
 		nvme_mpath_revalidate_paths(ns);
 		blk_stack_limits(&ns->head->disk->queue->limits,
 				 &ns->queue->limits, 0);
 		disk_update_readahead(ns->head->disk);
-		blk_mq_unfreeze_queue(ns->head->disk->queue);
+		blk_mq_unfreeze_queue(ns->head->disk->queue, mp_memflags);
 	}
 
 	ret = 0;
@@ -4750,7 +4755,7 @@ void nvme_unfreeze(struct nvme_ctrl *ctrl)
 	srcu_idx = srcu_read_lock(&ctrl->srcu);
 	list_for_each_entry_srcu(ns, &ctrl->namespaces, list,
 				 srcu_read_lock_held(&ctrl->srcu))
-		blk_mq_unfreeze_queue(ns->queue);
+		blk_mq_unfreeze_queue_nomemrestore(ns->queue);
 	srcu_read_unlock(&ctrl->srcu, srcu_idx);
 	clear_bit(NVME_CTRL_FROZEN, &ctrl->flags);
 }
