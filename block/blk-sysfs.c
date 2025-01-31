@@ -567,6 +567,7 @@ static ssize_t queue_wb_lat_store(struct request_queue *q, const char *page,
 				  size_t count)
 {
 	struct rq_qos *rqos;
+	unsigned int memflags;
 	ssize_t ret;
 	s64 val;
 
@@ -596,13 +597,13 @@ static ssize_t queue_wb_lat_store(struct request_queue *q, const char *page,
 	 * ends up either enabling or disabling wbt completely. We can't
 	 * have IO inflight if that happens.
 	 */
-	blk_mq_freeze_queue(q);
+	memflags = blk_mq_freeze_queue(q);
 	blk_mq_quiesce_queue(q);
 
 	wbt_set_min_lat(q, val);
 
 	blk_mq_unquiesce_queue(q);
-	blk_mq_unfreeze_queue(q);
+	blk_mq_unfreeze_queue(q, memflags);
 
 	return count;
 }

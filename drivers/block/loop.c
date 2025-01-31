@@ -556,6 +556,7 @@ static int loop_change_fd(struct loop_device *lo, struct block_device *bdev,
 {
 	struct file *file = fget(arg);
 	struct file *old_file;
+	unsigned int memflags;
 	int error;
 	bool partscan;
 	bool is_loop;
@@ -593,14 +594,14 @@ static int loop_change_fd(struct loop_device *lo, struct block_device *bdev,
 
 	/* and ... switch */
 	disk_force_media_change(lo->lo_disk);
-	blk_mq_freeze_queue(lo->lo_queue);
+	memflags = blk_mq_freeze_queue(lo->lo_queue);
 	mapping_set_gfp_mask(old_file->f_mapping, lo->old_gfp_mask);
 	lo->lo_backing_file = file;
 	lo->old_gfp_mask = mapping_gfp_mask(file->f_mapping);
 	mapping_set_gfp_mask(file->f_mapping,
 			     lo->old_gfp_mask & ~(__GFP_IO|__GFP_FS));
 	loop_update_dio(lo);
-	blk_mq_unfreeze_queue(lo->lo_queue);
+	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 	partscan = lo->lo_flags & LO_FLAGS_PARTSCAN;
 	loop_global_unlock(lo, is_loop);
 
@@ -1126,6 +1127,7 @@ static void __loop_clr_fd(struct loop_device *lo, bool release)
 {
 	struct file *filp;
 	gfp_t gfp = lo->old_gfp_mask;
+	unsigned int memflags = 0;
 
 	if (test_bit(QUEUE_FLAG_WC, &lo->lo_queue->queue_flags))
 		blk_queue_write_cache(lo->lo_queue, false, false);
@@ -1136,7 +1138,7 @@ static void __loop_clr_fd(struct loop_device *lo, bool release)
 	 * that there is no I/O in progress already.
 	 */
 	if (!release)
-		blk_mq_freeze_queue(lo->lo_queue);
+		memflags = blk_mq_freeze_queue(lo->lo_queue);
 
 	spin_lock_irq(&lo->lo_lock);
 	filp = lo->lo_backing_file;
@@ -1158,7 +1160,7 @@ static void __loop_clr_fd(struct loop_device *lo, bool release)
 	/* This is safe: open() is still holding a reference. */
 	module_put(THIS_MODULE);
 	if (!release)
-		blk_mq_unfreeze_queue(lo->lo_queue);
+		blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 
 	disk_force_media_change(lo->lo_disk);
 
@@ -1254,6 +1256,7 @@ loop_set_status(struct loop_device *lo, const struct loop_info64 *info)
 	int prev_lo_flags;
 	bool partscan = false;
 	bool size_changed = false;
+	unsigned int memflags;
 
 	err = mutex_lock_killable(&lo->lo_mutex);
 	if (err)
@@ -1271,7 +1274,7 @@ loop_set_status(struct loop_device *lo, const struct loop_info64 *info)
 	}
 
 	/* I/O needs to be drained before changing lo_offset or lo_sizelimit */
-	blk_mq_freeze_queue(lo->lo_queue);
+	memflags = blk_mq_freeze_queue(lo->lo_queue);
 
 	prev_lo_flags = lo->lo_flags;
 
@@ -1296,7 +1299,7 @@ loop_set_status(struct loop_device *lo, const struct loop_info64 *info)
 	loop_update_dio(lo);
 
 out_unfreeze:
-	blk_mq_unfreeze_queue(lo->lo_queue);
+	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 
 	if (!err && (lo->lo_flags & LO_FLAGS_PARTSCAN) &&
 	     !(prev_lo_flags & LO_FLAGS_PARTSCAN)) {
@@ -1452,6 +1455,7 @@ static int loop_set_capacity(struct loop_device *lo)
 static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 {
 	bool use_dio = !!arg;
+	unsigned int memflags;
 
 	if (lo->lo_state != Lo_bound)
 		return -ENXIO;
@@ -1465,18 +1469,19 @@ static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 		vfs_fsync(lo->lo_backing_file, 0);
 	}
 
-	blk_mq_freeze_queue(lo->lo_queue);
+	memflags = blk_mq_freeze_queue(lo->lo_queue);
 	if (use_dio)
 		lo->lo_flags |= LO_FLAGS_DIRECT_IO;
 	else
 		lo->lo_flags &= ~LO_FLAGS_DIRECT_IO;
-	blk_mq_unfreeze_queue(lo->lo_queue);
+	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 	return 0;
 }
 
 static int loop_set_block_size(struct loop_device *lo, blk_mode_t mode,
 			       struct block_device *bdev, unsigned long arg)
 {
+	unsigned int memflags;
 	int err = 0;
 
 	/*
@@ -1508,12 +1513,12 @@ static int loop_set_block_size(struct loop_device *lo, blk_mode_t mode,
 	sync_blockdev(lo->lo_device);
 	invalidate_bdev(lo->lo_device);
 
-	blk_mq_freeze_queue(lo->lo_queue);
+	memflags = blk_mq_freeze_queue(lo->lo_queue);
 	blk_queue_logical_block_size(lo->lo_queue, arg);
 	blk_queue_physical_block_size(lo->lo_queue, arg);
 	blk_queue_io_min(lo->lo_queue, arg);
 	loop_update_dio(lo);
-	blk_mq_unfreeze_queue(lo->lo_queue);
+	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
 
 unlock:
 	mutex_unlock(&lo->lo_mutex);

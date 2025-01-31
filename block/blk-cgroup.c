@@ -1570,13 +1570,14 @@ int blkcg_activate_policy(struct gendisk *disk, const struct blkcg_policy *pol)
 	struct request_queue *q = disk->queue;
 	struct blkg_policy_data *pd_prealloc = NULL;
 	struct blkcg_gq *blkg, *pinned_blkg = NULL;
+	unsigned int memflags;
 	int ret;
 
 	if (blkcg_policy_enabled(q, pol))
 		return 0;
 
 	if (queue_is_mq(q))
-		blk_mq_freeze_queue(q);
+		memflags = blk_mq_freeze_queue(q);
 retry:
 	spin_lock_irq(&q->queue_lock);
 
@@ -1640,7 +1641,7 @@ retry:
 	spin_unlock_irq(&q->queue_lock);
 out:
 	if (queue_is_mq(q))
-		blk_mq_unfreeze_queue(q);
+		blk_mq_unfreeze_queue(q, memflags);
 	if (pinned_blkg)
 		blkg_put(pinned_blkg);
 	if (pd_prealloc)
@@ -1684,12 +1685,13 @@ void blkcg_deactivate_policy(struct gendisk *disk,
 {
 	struct request_queue *q = disk->queue;
 	struct blkcg_gq *blkg;
+	unsigned int memflags;
 
 	if (!blkcg_policy_enabled(q, pol))
 		return;
 
 	if (queue_is_mq(q))
-		blk_mq_freeze_queue(q);
+		memflags = blk_mq_freeze_queue(q);
 
 	mutex_lock(&q->blkcg_mutex);
 	spin_lock_irq(&q->queue_lock);
@@ -1713,7 +1715,7 @@ void blkcg_deactivate_policy(struct gendisk *disk,
 	mutex_unlock(&q->blkcg_mutex);
 
 	if (queue_is_mq(q))
-		blk_mq_unfreeze_queue(q);
+		blk_mq_unfreeze_queue(q, memflags);
 }
 EXPORT_SYMBOL_GPL(blkcg_deactivate_policy);
 

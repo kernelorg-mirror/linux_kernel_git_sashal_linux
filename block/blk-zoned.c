@@ -543,6 +543,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
 	sector_t capacity = get_capacity(disk);
 	struct blk_revalidate_zone_args args = { };
 	unsigned int noio_flag;
+	unsigned int memflags;
 	int ret;
 
 	if (WARN_ON_ONCE(!blk_queue_is_zoned(q)))
@@ -599,7 +600,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
 	 * stopped and all I/Os are completed (i.e. a scheduler is not
 	 * referencing the bitmaps).
 	 */
-	blk_mq_freeze_queue(q);
+	memflags = blk_mq_freeze_queue(q);
 	if (ret > 0) {
 		disk->nr_zones = args.nr_zones;
 		swap(disk->seq_zones_wlock, args.seq_zones_wlock);
@@ -611,7 +612,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk,
 		pr_warn("%s: failed to revalidate zones\n", disk->disk_name);
 		disk_free_zone_bitmaps(disk);
 	}
-	blk_mq_unfreeze_queue(q);
+	blk_mq_unfreeze_queue(q, memflags);
 
 	kfree(args.seq_zones_wlock);
 	kfree(args.conv_zones_bitmap);
