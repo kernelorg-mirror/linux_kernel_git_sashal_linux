@@ -1778,7 +1778,6 @@ static struct extent_buffer *find_extent_buffer_nolock(
 static void end_bbio_meta_write(struct btrfs_bio *bbio)
 {
 	struct extent_buffer *eb = bbio->private;
-	struct btrfs_fs_info *fs_info = eb->fs_info;
 	bool uptodate = !bbio->bio.bi_status;
 	struct folio_iter fi;
 
@@ -1786,9 +1785,7 @@ static void end_bbio_meta_write(struct btrfs_bio *bbio)
 		set_btree_ioerr(eb);
 
 	bio_for_each_folio_all(fi, &bbio->bio) {
-		struct folio *folio = fi.folio;
-
-		btrfs_meta_folio_clear_writeback(fs_info, folio, eb->start, eb->len);
+		btrfs_meta_folio_clear_writeback(fi.folio, eb);
 	}
 
 	clear_bit(EXTENT_BUFFER_WRITEBACK, &eb->bflags);
@@ -1851,8 +1848,8 @@ static noinline_for_stack void write_one_eb(struct extent_buffer *eb,
 		bool ret;
 
 		folio_lock(folio);
-		btrfs_meta_folio_clear_dirty(fs_info, folio, eb->start, eb->len);
-		btrfs_meta_folio_set_writeback(fs_info, folio, eb->start, eb->len);
+		btrfs_meta_folio_clear_dirty(folio, eb);
+		btrfs_meta_folio_set_writeback(folio, eb);
 		if (!folio_test_dirty(folio))
 			wbc->nr_to_write -= folio_nr_pages(folio);
 		ret = bio_add_folio(&bbio->bio, folio, range_len,
@@ -4031,7 +4028,7 @@ reallocate:
 		 * and free the allocated page.
 		 */
 		folio = eb->folios[i];
-		WARN_ON(btrfs_meta_folio_test_dirty(fs_info, folio, eb->start, eb->len));
+		WARN_ON(btrfs_meta_folio_test_dirty(folio, eb));
 
 		/*
 		 * Check if the current page is physically contiguous with previous eb
@@ -4042,7 +4039,7 @@ reallocate:
 		if (i && folio_page(eb->folios[i - 1], 0) + 1 != folio_page(folio, 0))
 			page_contig = false;
 
-		if (!btrfs_meta_folio_test_uptodate(fs_info, folio, eb->start, eb->len))
+		if (!btrfs_meta_folio_test_uptodate(folio, eb))
 			uptodate = 0;
 
 		/*
@@ -4265,8 +4262,7 @@ void btrfs_clear_buffer_dirty(struct btrfs_trans_handle *trans,
 		if (!folio_test_dirty(folio))
 			continue;
 		folio_lock(folio);
-		last = btrfs_meta_folio_clear_and_test_dirty(fs_info, folio,
-							     eb->start, eb->len);
+		last = btrfs_meta_folio_clear_and_test_dirty(folio, eb);
 		if (last)
 			btree_clear_folio_dirty_tag(folio);
 		folio_unlock(folio);
@@ -4304,8 +4300,7 @@ void set_extent_buffer_dirty(struct extent_buffer *eb)
 		if (subpage)
 			lock_page(folio_page(eb->folios[0], 0));
 		for (int i = 0; i < num_folios; i++)
-			btrfs_meta_folio_set_dirty(eb->fs_info, eb->folios[i],
-						   eb->start, eb->len);
+			btrfs_meta_folio_set_dirty(eb->folios[i], eb);
 		if (subpage)
 			unlock_page(folio_page(eb->folios[0], 0));
 		percpu_counter_add_batch(&eb->fs_info->dirty_metadata_bytes,
@@ -4320,7 +4315,6 @@ void set_extent_buffer_dirty(struct extent_buffer *eb)
 
 void clear_extent_buffer_uptodate(struct extent_buffer *eb)
 {
-	struct btrfs_fs_info *fs_info = eb->fs_info;
 	int num_folios = num_extent_folios(eb);
 
 	clear_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags);
@@ -4330,21 +4324,17 @@ void clear_extent_buffer_uptodate(struct extent_buffer *eb)
 		if (!folio)
 			continue;
 
-		btrfs_meta_folio_clear_uptodate(fs_info, folio, eb->start, eb->len);
+		btrfs_meta_folio_clear_uptodate(folio, eb);
 	}
 }
 
 void set_extent_buffer_uptodate(struct extent_buffer *eb)
 {
-	struct btrfs_fs_info *fs_info = eb->fs_info;
 	int num_folios = num_extent_folios(eb);
 
 	set_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags);
-	for (int i = 0; i < num_folios; i++) {
-		struct folio *folio = eb->folios[i];
-
-		btrfs_meta_folio_set_uptodate(fs_info, folio, eb->start, eb->len);
-	}
+	for (int i = 0; i < num_folios; i++)
+		btrfs_meta_folio_set_uptodate(eb->folios[i], eb);
 }
 
 static void end_bbio_meta_read(struct btrfs_bio *bbio)
