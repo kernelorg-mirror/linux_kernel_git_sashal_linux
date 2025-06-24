@@ -10,6 +10,9 @@ obj-$(CONFIG_KAPI_SPEC)		+= kernel_api_spec.o
 ifeq ($(CONFIG_KAPI_SPEC),y)
 obj-$(CONFIG_KAPI_SPEC)		+= generated_api_specs.o
 
+# Debugfs interface for kernel API specs
+obj-$(CONFIG_KAPI_SPEC_DEBUGFS) += kapi_debugfs.o
+
 # Find all potential apispec files (this is evaluated at make time)
 apispec-files := $(shell find $(objtree) -name "*.apispec.h" -type f 2>/dev/null)
 
