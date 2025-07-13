@@ -1838,6 +1838,8 @@ static inline void ublk_fill_io_cmd(struct ublk_io *io,
 {
 	io->cmd = cmd;
 	io->flags |= UBLK_IO_FLAG_ACTIVE;
+	/* now this cmd slot is owned by ublk driver */
+	io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
 	io->addr = buf_addr;
 }
 
