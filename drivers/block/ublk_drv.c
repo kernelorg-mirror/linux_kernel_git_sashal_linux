@@ -1141,7 +1141,7 @@ static inline void __ublk_complete_rq(struct request *req)
 	local_bh_enable();
 	if (requeue)
 		blk_mq_requeue_request(req, true);
-	else
+	else if (likely(!blk_should_fake_timeout(req->q)))
 		__blk_mq_end_request(req, BLK_STS_OK);
 
 	return;
@@ -1511,8 +1511,7 @@ static void ublk_commit_completion(struct ublk_device *ub,
 	if (req_op(req) == REQ_OP_ZONE_APPEND)
 		req->__sector = ub_cmd->zone_append_lba;
 
-	if (likely(!blk_should_fake_timeout(req->q)))
-		ublk_put_req_ref(ubq, req);
+	ublk_put_req_ref(ubq, req);
 }
 
 /*
