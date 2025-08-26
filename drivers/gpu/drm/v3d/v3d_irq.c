@@ -42,6 +42,8 @@ v3d_overflow_mem_work(struct work_struct *work)
 		container_of(work, struct v3d_dev, overflow_mem_work);
 	struct drm_device *dev = &v3d->drm;
 	struct v3d_bo *bo = v3d_bo_create(dev, NULL /* XXX: GMP */, 256 * 1024);
+	struct v3d_queue_state *queue = &v3d->queue[V3D_BIN];
+	struct v3d_bin_job *bin_job;
 	struct drm_gem_object *obj;
 	unsigned long irqflags;
 
@@ -61,13 +63,15 @@ v3d_overflow_mem_work(struct work_struct *work)
 	 * some binner pool anyway.
 	 */
 	spin_lock_irqsave(&v3d->job_lock, irqflags);
-	if (!v3d->bin_job) {
+	bin_job = (struct v3d_bin_job *)queue->active_job;
+
+	if (!bin_job) {
 		spin_unlock_irqrestore(&v3d->job_lock, irqflags);
 		goto out;
 	}
 
 	drm_gem_object_get(obj);
-	list_add_tail(&bo->unref_head, &v3d->bin_job->render->unref_list);
+	list_add_tail(&bo->unref_head, &bin_job->render->unref_list);
 	spin_unlock_irqrestore(&v3d->job_lock, irqflags);
 
 	v3d_mmu_flush_all(v3d);
@@ -103,8 +107,8 @@ v3d_irq(int irq, void *arg)
 
 	if (intsts & V3D_INT_FLDONE) {
 		struct v3d_fence *fence =
-			to_v3d_fence(v3d->bin_job->base.irq_fence);
-		struct v3d_file_priv *file = v3d->bin_job->base.file->driver_priv;
+			to_v3d_fence(v3d->queue[V3D_BIN].active_job->irq_fence);
+		struct v3d_file_priv *file = v3d->queue[V3D_BIN].active_job->file->driver_priv;
 		u64 runtime = local_clock() - file->start_ns[V3D_BIN];
 
 		file->jobs_sent[V3D_BIN]++;
@@ -118,7 +122,7 @@ v3d_irq(int irq, void *arg)
 
 		trace_v3d_bcl_irq(&v3d->drm, fence->seqno);
 
-		v3d->bin_job = NULL;
+		v3d->queue[V3D_BIN].active_job = NULL;
 		dma_fence_signal(&fence->base);
 
 		status = IRQ_HANDLED;
@@ -126,8 +130,8 @@ v3d_irq(int irq, void *arg)
 
 	if (intsts & V3D_INT_FRDONE) {
 		struct v3d_fence *fence =
-			to_v3d_fence(v3d->render_job->base.irq_fence);
-		struct v3d_file_priv *file = v3d->render_job->base.file->driver_priv;
+			to_v3d_fence(v3d->queue[V3D_RENDER].active_job->irq_fence);
+		struct v3d_file_priv *file = v3d->queue[V3D_RENDER].active_job->file->driver_priv;
 		u64 runtime = local_clock() - file->start_ns[V3D_RENDER];
 
 		file->jobs_sent[V3D_RENDER]++;
@@ -141,7 +145,7 @@ v3d_irq(int irq, void *arg)
 
 		trace_v3d_rcl_irq(&v3d->drm, fence->seqno);
 
-		v3d->render_job = NULL;
+		v3d->queue[V3D_RENDER].active_job = NULL;
 		dma_fence_signal(&fence->base);
 
 		status = IRQ_HANDLED;
@@ -149,8 +153,8 @@ v3d_irq(int irq, void *arg)
 
 	if (intsts & V3D_INT_CSDDONE(v3d->ver)) {
 		struct v3d_fence *fence =
-			to_v3d_fence(v3d->csd_job->base.irq_fence);
-		struct v3d_file_priv *file = v3d->csd_job->base.file->driver_priv;
+			to_v3d_fence(v3d->queue[V3D_CSD].active_job->irq_fence);
+		struct v3d_file_priv *file = v3d->queue[V3D_CSD].active_job->file->driver_priv;
 		u64 runtime = local_clock() - file->start_ns[V3D_CSD];
 
 		file->jobs_sent[V3D_CSD]++;
@@ -164,7 +168,7 @@ v3d_irq(int irq, void *arg)
 
 		trace_v3d_csd_irq(&v3d->drm, fence->seqno);
 
-		v3d->csd_job = NULL;
+		v3d->queue[V3D_CSD].active_job = NULL;
 		dma_fence_signal(&fence->base);
 
 		status = IRQ_HANDLED;
@@ -199,8 +203,8 @@ v3d_hub_irq(int irq, void *arg)
 
 	if (intsts & V3D_HUB_INT_TFUC) {
 		struct v3d_fence *fence =
-			to_v3d_fence(v3d->tfu_job->base.irq_fence);
-		struct v3d_file_priv *file = v3d->tfu_job->base.file->driver_priv;
+			to_v3d_fence(v3d->queue[V3D_TFU].active_job->irq_fence);
+		struct v3d_file_priv *file = v3d->queue[V3D_TFU].active_job->file->driver_priv;
 		u64 runtime = local_clock() - file->start_ns[V3D_TFU];
 
 		file->jobs_sent[V3D_TFU]++;
@@ -214,7 +218,7 @@ v3d_hub_irq(int irq, void *arg)
 
 		trace_v3d_tfu_irq(&v3d->drm, fence->seqno);
 
-		v3d->tfu_job = NULL;
+		v3d->queue[V3D_TFU].active_job = NULL;
 		dma_fence_signal(&fence->base);
 
 		status = IRQ_HANDLED;
