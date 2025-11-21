@@ -116,9 +116,12 @@ struct ublk_uring_cmd_pdu {
 /* atomic RW with ubq->cancel_lock */
 #define UBLK_IO_FLAG_CANCELED	0x80000000
 
-struct ublk_io {
-	/* userspace buffer address from io cmd */
+union ublk_io_buf {
 	__u64	addr;
+};
+
+struct ublk_io {
+	union ublk_io_buf buf;
 	unsigned int flags;
 	int res;
 
@@ -448,7 +451,7 @@ static blk_status_t ublk_setup_iod_zoned(struct ublk_queue *ubq,
 	iod->op_flags = ublk_op | ublk_req_build_flags(req);
 	iod->nr_sectors = blk_rq_sectors(req);
 	iod->start_sector = blk_rq_pos(req);
-	iod->addr = io->addr;
+	iod->addr = io->buf.addr;
 
 	return BLK_STS_OK;
 }
@@ -963,7 +966,7 @@ static int ublk_map_io(const struct ublk_queue *ubq, const struct request *req,
 		struct iov_iter iter;
 		const int dir = ITER_DEST;
 
-		import_ubuf(dir, u64_to_user_ptr(io->addr), rq_bytes, &iter);
+		import_ubuf(dir, u64_to_user_ptr(io->buf.addr), rq_bytes, &iter);
 		return ublk_copy_user_pages(req, 0, &iter, dir);
 	}
 	return rq_bytes;
@@ -984,7 +987,7 @@ static int ublk_unmap_io(const struct ublk_queue *ubq,
 
 		WARN_ON_ONCE(io->res > rq_bytes);
 
-		import_ubuf(dir, u64_to_user_ptr(io->addr), io->res, &iter);
+		import_ubuf(dir, u64_to_user_ptr(io->buf.addr), io->res, &iter);
 		return ublk_copy_user_pages(req, 0, &iter, dir);
 	}
 	return rq_bytes;
@@ -1055,7 +1058,7 @@ static blk_status_t ublk_setup_iod(struct ublk_queue *ubq, struct request *req)
 	iod->op_flags = ublk_op | ublk_req_build_flags(req);
 	iod->nr_sectors = blk_rq_sectors(req);
 	iod->start_sector = blk_rq_pos(req);
-	iod->addr = io->addr;
+	iod->addr = io->buf.addr;
 
 	return BLK_STS_OK;
 }
@@ -1274,7 +1277,7 @@ static inline void __ublk_rq_task_work(struct request *req,
 		 */
 		io->flags &= ~UBLK_IO_FLAG_NEED_GET_DATA;
 		/* update iod->addr because ublksrv may have passed a new io buffer */
-		ublk_get_iod(ubq, req->tag)->addr = io->addr;
+		ublk_get_iod(ubq, req->tag)->addr = io->buf.addr;
 		pr_devel("%s: update iod->addr: op %d, qid %d tag %d io_flags %x addr %llx\n",
 				__func__, io->cmd->cmd_op, ubq->q_id, req->tag, io->flags,
 				ublk_get_iod(ubq, req->tag)->addr);
@@ -1840,7 +1843,7 @@ static inline void ublk_fill_io_cmd(struct ublk_io *io,
 	io->flags |= UBLK_IO_FLAG_ACTIVE;
 	/* now this cmd slot is owned by ublk driver */
 	io->flags &= ~UBLK_IO_FLAG_OWNED_BY_SRV;
-	io->addr = buf_addr;
+	io->buf.addr = buf_addr;
 }
 
 static inline void ublk_prep_cancel(struct io_uring_cmd *cmd,
@@ -2863,7 +2866,7 @@ static void ublk_queue_reinit(struct ublk_device *ub, struct ublk_queue *ubq)
 		/* forget everything now and be ready for new FETCH_REQ */
 		io->flags = 0;
 		io->cmd = NULL;
-		io->addr = 0;
+		io->buf.addr = 0;
 	}
 }
 
