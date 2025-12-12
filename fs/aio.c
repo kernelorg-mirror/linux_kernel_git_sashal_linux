@@ -1366,18 +1366,222 @@ static long read_events(struct kioctx *ctx, long min_nr, long nr,
 	return ret;
 }
 
-/* sys_io_setup:
- *	Create an aio_context capable of receiving at least nr_events.
- *	ctxp must not point to an aio_context that already exists, and
- *	must be initialized to 0 prior to the call.  On successful
- *	creation of the aio_context, *ctxp is filled in with the resulting 
- *	handle.  May fail with -EINVAL if *ctxp is not initialized,
- *	if the specified nr_events exceeds internal limits.  May fail 
- *	with -EAGAIN if the specified nr_events exceeds the user's limit 
- *	of available events.  May fail with -ENOMEM if insufficient kernel
- *	resources are available.  May fail with -EFAULT if an invalid
- *	pointer is passed for ctxp.  Will fail with -ENOSYS if not
- *	implemented.
+/**
+ * sys_io_setup - Create an asynchronous I/O context
+ * @nr_events: Minimum number of concurrent AIO operations the context should support
+ * @ctxp: Pointer to aio_context_t variable to receive the context handle
+ *
+ * long-desc: Creates an asynchronous I/O context capable of receiving at least
+ *   nr_events concurrent operations. The context handle is returned via ctxp,
+ *   which must be initialized to 0 prior to the call. The returned context
+ *   handle is used with subsequent AIO operations (io_submit, io_getevents,
+ *   io_cancel, io_destroy).
+ *
+ *   The AIO context consists of a memory-mapped ring buffer shared between
+ *   kernel and userspace for efficient completion notification. The kernel
+ *   internally allocates more capacity than requested to account for percpu
+ *   batching (approximately nr_events * 2, but at least num_cpus * 8).
+ *
+ *   The context is bound to the calling process and cannot be shared across
+ *   processes. Each process can have multiple AIO contexts, limited only by
+ *   the system-wide aio-max-nr sysctl.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: nr_events
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, 8388608
+ *   constraint: Must be greater than 0. Internal limit of approximately 8M events
+ *     prevents overflow when calculating ring buffer size (0x10000000 / 32 bytes
+ *     per io_event). The kernel may allocate more capacity than requested to
+ *     optimize for percpu batching.
+ *
+ * param: ctxp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_USER
+ *   size: sizeof(aio_context_t)
+ *   constraint-type: KAPI_CONSTRAINT_USER_PTR
+ *   constraint: Must be a valid userspace pointer to an aio_context_t variable.
+ *     The memory pointed to MUST be initialized to 0 before the call. On success,
+ *     receives the context handle (actually the mmap address of the ring buffer).
+ *     The context handle is opaque and should not be interpreted by userspace
+ *     except to pass to other io_* syscalls.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. On success, *ctxp contains the new context handle.
+ *
+ * error: EFAULT, Invalid pointer
+ *   desc: The ctxp pointer is invalid, not accessible, or points to memory that
+ *     cannot be read or written. Returned from get_user() when reading the
+ *     initial value or from put_user() when storing the context handle.
+ *
+ * error: EINVAL, Invalid parameter
+ *   desc: Either *ctxp is not initialized to 0 (indicating an existing context or
+ *     uninitialized memory), or nr_events is 0, or nr_events is too large causing
+ *     internal overflow when calculating ring buffer size. The internal limit is
+ *     approximately 0x10000000 / sizeof(struct io_event) events.
+ *
+ * error: EAGAIN, Resource limit exceeded
+ *   desc: The system-wide limit on AIO contexts would be exceeded. The limit is
+ *     controlled by /proc/sys/fs/aio-max-nr (default 65536). Each context counts
+ *     as nr_events toward this limit. Also returned if nr_events exceeds the
+ *     current aio-max-nr value. Unlike ENOMEM, this error indicates a policy
+ *     limit rather than physical resource exhaustion.
+ *
+ * error: ENOMEM, Insufficient memory
+ *   desc: Kernel could not allocate required memory for the AIO context. This
+ *     includes the kioctx structure, percpu data, ring buffer pages, or the
+ *     anonymous file backing the ring buffer. Also returned if the kernel could
+ *     not establish the memory mapping for the ring buffer, or if ioctx_table
+ *     expansion failed.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: A fatal signal was received while attempting to acquire the mmap_lock
+ *     for the ring buffer memory mapping. The operation was aborted before any
+ *     state was modified. Only fatal signals (SIGKILL) can cause this error;
+ *     normal signals like SIGINT do not interrupt the operation.
+ *
+ * lock: aio_nr_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   desc: Global spinlock protecting the system-wide aio_nr counter. Held briefly
+ *     to check and update the system-wide AIO context count.
+ *
+ * lock: mm->ioctx_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   desc: Per-mm spinlock protecting the ioctx_table. Held while adding the new
+ *     context to the process's AIO context table.
+ *
+ * lock: ctx->ring_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   desc: Per-context mutex protecting ring buffer setup. Held throughout context
+ *     initialization to prevent page migration during setup, then released once
+ *     the context is fully initialized.
+ *
+ * lock: mmap_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   desc: Process memory map write lock. Acquired via mmap_write_lock_killable()
+ *     during ring buffer mmap operation. This is where EINTR can occur.
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Fatal signal pending during mmap_write_lock_killable
+ *   desc: Fatal signals can interrupt the context creation during the mmap phase.
+ *     The mmap_write_lock_killable() function checks for fatal signals and returns
+ *     -EINTR if one is pending. Non-fatal signals do not interrupt this syscall.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   priority: 0
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: kioctx structure
+ *   desc: Allocates the main AIO context structure from kioctx_cachep slab cache.
+ *     Contains ring buffer metadata, locks, and request tracking.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: percpu kioctx_cpu structures
+ *   desc: Allocates per-CPU structures for request batching via alloc_percpu().
+ *     Used to reduce contention on the global request counter.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: ring buffer pages
+ *   desc: Allocates pages for the completion event ring buffer. The ring is backed
+ *     by an anonymous file on the internal "aio" filesystem and memory-mapped into
+ *     the process address space.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: anonymous inode and file
+ *   desc: Creates an anonymous inode and file on the internal aio filesystem to
+ *     back the ring buffer mapping. This enables proper page migration support.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: process virtual memory
+ *   desc: Creates a new memory mapping (VMA) for the ring buffer in the process
+ *     address space. The mapping is marked VM_DONTEXPAND and uses aio_ring_vm_ops.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: mm->ioctx_table
+ *   desc: Adds the new context to the process's AIO context table. The table is
+ *     dynamically expanded if needed (grows by 4x each time).
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: aio_nr (global counter)
+ *   desc: Increments the system-wide AIO context counter by nr_events. This counter
+ *     is visible via /proc/sys/fs/aio-nr and counts toward the aio-max-nr limit.
+ *   reversible: yes
+ *
+ * state-trans: process AIO state
+ *   from: no AIO context (or fewer contexts)
+ *   to: has AIO context
+ *   condition: successful io_setup
+ *   desc: Process gains an AIO context that can be used for asynchronous I/O
+ *     operations. The context remains until explicitly destroyed via io_destroy
+ *     or process exit.
+ *
+ * state-trans: system AIO resources
+ *   from: aio_nr = N
+ *   to: aio_nr = N + nr_events
+ *   condition: successful io_setup
+ *   desc: System-wide AIO resource counter increases. The counter tracks total
+ *     requested AIO capacity across all processes.
+ *
+ * constraint: System-wide AIO limit (aio-max-nr)
+ *   desc: The /proc/sys/fs/aio-max-nr sysctl (default 65536) limits the total
+ *     number of AIO events system-wide. Each io_setup call adds nr_events to
+ *     the aio_nr counter. If aio_nr + nr_events would exceed aio_max_nr, the
+ *     call fails with EAGAIN. Administrators can increase aio-max-nr if needed.
+ *   expr: aio_nr + nr_events <= aio_max_nr
+ *
+ * constraint: Per-process context limit
+ *   desc: Each process can have multiple AIO contexts, limited only by the
+ *     system-wide aio-max-nr limit and available memory. The ioctx_table grows
+ *     dynamically to accommodate new contexts.
+ *
+ * constraint: CONFIG_AIO required
+ *   desc: The kernel must be compiled with CONFIG_AIO=y for this syscall to be
+ *     available. If not configured, the syscall returns -ENOSYS. This is typically
+ *     enabled by default but may be disabled on embedded systems.
+ *
+ * constraint: Memory for ring buffer
+ *   desc: The kernel must be able to allocate sufficient contiguous pages for the
+ *     ring buffer and establish the memory mapping. Large nr_events values require
+ *     more memory and may fail with ENOMEM on memory-constrained systems.
+ *
+ * examples: aio_context_t ctx = 0; io_setup(128, &ctx);  // Create context for 128 events
+ *   aio_context_t ctx = 0; io_setup(1024, &ctx);  // Create context for 1024 events
+ *
+ * notes: The returned context handle is actually the virtual address of the ring
+ *   buffer mapping in the process address space. This allows userspace libraries
+ *   to directly access completion events without syscall overhead in some cases.
+ *
+ *   The kernel internally doubles nr_events and ensures a minimum of num_cpus * 8
+ *   events for percpu batching efficiency. This means the actual ring capacity may
+ *   be significantly larger than requested.
+ *
+ *   Historical note: A race condition between io_setup and io_destroy was fixed
+ *   in commit 86b62a2cb4fc ("aio: fix io_setup/io_destroy race"). Earlier kernels
+ *   could have the context freed while io_setup was still completing.
+ *
+ *   io_uring (since Linux 5.1) is a more modern alternative that provides better
+ *   performance and more features. Consider using io_uring for new applications.
+ *
+ *   There is no glibc wrapper for this syscall. Use syscall(SYS_io_setup, ...) or
+ *   the libaio library wrapper (note: libaio has slightly different error semantics,
+ *   returning negative error numbers directly instead of -1 with errno).
+ *
+ * since-version: 2.5
  */
 SYSCALL_DEFINE2(io_setup, unsigned, nr_events, aio_context_t __user *, ctxp)
 {
