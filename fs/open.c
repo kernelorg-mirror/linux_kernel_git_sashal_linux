@@ -1427,6 +1427,233 @@ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 	return error;
 }
 
+/**
+ * sys_chroot - Change the root directory of the calling process
+ * @filename: Pathname to the new root directory
+ *
+ * long-desc: Changes the root directory of the calling process to the directory
+ *   specified by @filename. This modifies pathname resolution such that any
+ *   absolute path (beginning with '/') will be interpreted relative to the new
+ *   root. This affects the calling process and its descendants created via
+ *   fork() after the call. The root directory is preserved across execve().
+ *
+ *   chroot() only changes the apparent root directory for pathname resolution;
+ *   it does NOT change the current working directory. After calling chroot(),
+ *   processes should typically call chdir("/") to set the working directory
+ *   inside the new root. Failing to do so allows the process to access files
+ *   outside the new root via relative paths.
+ *
+ *   SECURITY WARNING: chroot() is NOT a security mechanism and does NOT provide
+ *   a secure sandbox. A privileged process can escape a chroot jail trivially
+ *   via: mkdir("foo"); chroot("foo"); chdir(".."); This works because chroot()
+ *   doesn't change the current working directory, so relative paths can reach
+ *   outside. Other escape vectors include: open file descriptors to outside
+ *   directories, ptrace, /proc access, and creating device nodes. For secure
+ *   isolation, use namespaces (unshare/clone with CLONE_NEWNS), pivot_root(),
+ *   or container technologies. FreeBSD's jail() provides stronger isolation.
+ *
+ *   The @filename must resolve to a directory. Symbolic links are followed
+ *   (LOOKUP_FOLLOW). The calling process must have search (execute) permission
+ *   on the target directory and CAP_SYS_CHROOT capability in its user namespace.
+ *
+ *   If the path lookup encounters a stale NFS file handle (-ESTALE), the
+ *   syscall automatically retries with LOOKUP_REVAL to revalidate cached
+ *   dentries before returning the error to userspace.
+ *
+ *   The change affects only the calling process and its descendants. The root
+ *   directory is shared between threads via fs_struct, so threads sharing
+ *   fs_struct (created with CLONE_FS) share the same root. Child processes
+ *   created via fork() inherit the parent's root at fork time.
+ *
+ *   Intended use cases include: installation programs (operating on a different
+ *   root), debugging with specific library versions, running daemons with
+ *   restricted filesystem views (though not for security), and legacy
+ *   application isolation.
+ *
+ *   Not part of POSIX.1-2001 or POSIX.1-2008. Marked LEGACY in SUSv2. Available
+ *   in SVr4, 4.4BSD. This syscall has existed since Linux 1.0.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: filename
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname in user-space memory.
+ *     Maximum total path length is PATH_MAX (4096) bytes including null
+ *     terminator. Individual path components are limited to NAME_MAX (255)
+ *     bytes. The path must resolve to a directory. An empty string returns
+ *     -ENOENT. If the pointer is invalid or inaccessible, returns -EFAULT.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code and
+ *     the root directory remains unchanged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The caller does not have CAP_SYS_CHROOT capability in its user
+ *     namespace. This is the most common error - chroot() is a privileged
+ *     operation. The capability check is performed via ns_capable() against
+ *     current_user_ns(). Also returned if the Linux Security Module (LSM)
+ *     denies the operation through the security_path_chroot() hook.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A component of @filename does not exist, or @filename is an empty
+ *     string, or @filename is a dangling symbolic link pointing to a
+ *     nonexistent target.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @filename is not actually a
+ *     directory, or the final component of @filename is not a directory.
+ *     The LOOKUP_DIRECTORY flag ensures the target must be a directory.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search permission is denied on a component of the path prefix,
+ *     or search (execute) permission is denied on the target directory.
+ *     Permission checking uses effective uid/gid. The calling process needs
+ *     execute permission on the target directory. LSM modules may also
+ *     return EACCES if security policy denies directory traversal.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @filename pointer points outside the accessible address space.
+ *     Detected when copying the pathname from user space via strncpy_from_user()
+ *     in getname_flags().
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: @filename or one of its path components exceeds system limits.
+ *     Individual components are limited to NAME_MAX (255) bytes, and the
+ *     total path is limited to PATH_MAX (4096) bytes including terminator.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The kernel limit is 40 symlinks per path resolution with a maximum
+ *     recursion depth of 8 for nested symbolic links (MAXSYMLINKS).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to allocate the filename structure via
+ *     __getname() or other internal structures during path resolution.
+ *
+ * error: EIO, Input/output error
+ *   desc: An I/O error occurred while reading from the filesystem during
+ *     path resolution or inode lookup. This is filesystem-dependent and
+ *     indicates a hardware or low-level filesystem error.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle has become stale, typically on NFS when the
+ *     directory was deleted or replaced on the server. The kernel
+ *     automatically retries with LOOKUP_REVAL to revalidate, but if it
+ *     still fails, -ESTALE is returned to userspace.
+ *
+ * lock: RCU read-side critical section
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: Path lookup uses RCU-walk mode (rcu_read_lock) for fast path
+ *     resolution. If RCU-walk fails (e.g., due to blocking operation needed),
+ *     the lookup falls back to reference-counted (ref-walk) mode.
+ *
+ * lock: fs->seq (seqlock)
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's fs_struct seqlock is acquired exclusively via
+ *     write_seqlock() in set_fs_root() when updating the root directory.
+ *     This serializes concurrent accesses to fs->root and ensures atomic
+ *     updates visible to other threads sharing the fs_struct.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process root directory (current->fs->root)
+ *   desc: Changes the calling process's root directory to the specified path.
+ *     The new directory's path structure (vfsmount and dentry) is stored in
+ *     current->fs->root. The previous root directory's reference count is
+ *     decremented via path_put(). This affects all pathname resolution
+ *     starting with '/' for the calling process.
+ *   condition: On successful path resolution, permission check, capability
+ *     check, and security module approval
+ *   reversible: yes (via another chroot call with appropriate permissions)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Reference counts on path structures
+ *   desc: Increments reference count on the new root directory's vfsmount
+ *     (via mntget) and dentry (via dget) through path_get(). Decrements
+ *     reference count on the old root directory through path_put().
+ *   condition: On success
+ *   reversible: no
+ *
+ * capability: CAP_SYS_CHROOT
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Permits changing the root directory of the calling process
+ *   without: The syscall fails with -EPERM. Unprivileged processes cannot
+ *     change their root directory under any circumstances.
+ *   condition: Checked via ns_capable(current_user_ns(), CAP_SYS_CHROOT)
+ *     after path resolution succeeds but before setting the new root.
+ *     The capability is checked in the caller's user namespace.
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypasses execute permission check on directories during path
+ *     traversal. Does not bypass the CAP_SYS_CHROOT requirement.
+ *   without: Process must have execute permission on each directory component
+ *     in the path and on the target directory itself
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Overrides all DAC permission checks including execute on directories
+ *     during path traversal. Does not bypass the CAP_SYS_CHROOT requirement.
+ *   without: Process must have appropriate execute permissions for path traversal
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * constraint: LSM security modules
+ *   desc: The security_path_chroot() hook is called to allow Linux Security
+ *     Modules (SELinux, AppArmor, TOMOYO, Smack) to enforce additional access
+ *     control policies. LSM modules may deny the chroot operation based on
+ *     mandatory access control policy, returning -EPERM or -EACCES.
+ *   expr: security_path_chroot(&path) == 0
+ *
+ * examples: chroot("/var/chroot/jail");  // Change root to jail directory
+ *   chroot(".");  // Change root to current directory (still requires CAP_SYS_CHROOT)
+ *   chroot("/"); chdir("/");  // Reset root to system root (requires capability)
+ *
+ * notes: chroot() is often mistakenly used as a security mechanism. It was
+ *   designed for system administration tasks like installation and debugging,
+ *   not for sandboxing untrusted code. Key security limitations include:
+ *
+ *   1. Does NOT change the current working directory - the process can still
+ *      access files outside the new root via relative paths until it calls
+ *      chdir("/") inside the new root.
+ *
+ *   2. Root users inside a chroot can escape trivially by creating a nested
+ *      chroot and using ".." navigation.
+ *
+ *   3. Open file descriptors to directories outside the chroot allow escape.
+ *
+ *   4. /proc, if mounted, provides access outside the chroot.
+ *
+ *   5. Device nodes can be created (if permitted) to access raw devices.
+ *
+ *   6. setuid programs should not run inside chroots as they may have
+ *      unexpected behavior when libraries or configuration files differ.
+ *
+ *   For actual security isolation, use: mount namespaces with pivot_root()
+ *   (which properly changes both root and cwd, and can unmount old root),
+ *   user namespaces, seccomp-bpf filters, or full container solutions.
+ *   FreeBSD's jail() syscall provides much stronger isolation guarantees.
+ *
+ *   The root directory is visible via /proc/[pid]/root symbolic link, which
+ *   reveals the process's root directory to processes with appropriate
+ *   permissions.
+ *
+ *   Multiple chroot() calls do not stack - each call completely replaces
+ *   the root. Calling chroot("/") from within a chroot (with CAP_SYS_CHROOT)
+ *   resolves "/" relative to the current root, not the original system root.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(chroot, const char __user *, filename)
 {
 	struct path path;
