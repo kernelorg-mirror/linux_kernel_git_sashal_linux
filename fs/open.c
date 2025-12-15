@@ -1265,6 +1265,151 @@ out:
 	return error;
 }
 
+/**
+ * sys_fchdir - Change current working directory using a file descriptor
+ * @fd: File descriptor referring to a directory
+ *
+ * long-desc: Changes the current working directory of the calling process to
+ *   the directory referred to by the open file descriptor @fd. The current
+ *   working directory is the starting point for interpreting relative pathnames
+ *   (those not starting with '/').
+ *
+ *   Unlike chdir(), which takes a pathname, fchdir() operates on an already-open
+ *   file descriptor. This provides several advantages: it avoids race conditions
+ *   where the directory could be moved or renamed between path resolution and
+ *   the directory change, and it allows changing to a directory that the process
+ *   can no longer access by path (e.g., after directory permissions changed).
+ *
+ *   The file descriptor @fd must refer to a directory. Since Linux 3.5, O_PATH
+ *   file descriptors are accepted, making fchdir() comparable to the O_SEARCH
+ *   functionality in Solaris. An O_PATH descriptor can be obtained for a
+ *   directory with only execute (search) permission, without read permission.
+ *
+ *   The calling process must have search (execute) permission on the directory.
+ *   Some filesystems (AFS, FUSE, NFS) perform additional permission checks via
+ *   the MAY_CHDIR flag to support access control beyond standard UNIX permissions.
+ *
+ *   The change affects only the calling process. Child processes created via
+ *   fork() inherit the parent's working directory at fork time. The working
+ *   directory is preserved across execve() calls.
+ *
+ *   POSIX.1-2001 and POSIX.1-2008 compliant. This syscall has existed since
+ *   the original Linux kernel.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid open file descriptor referring to a directory.
+ *     O_PATH file descriptors are accepted (since Linux 3.5), allowing the
+ *     caller to change to a directory opened with only search permission.
+ *     The file descriptor must not refer to a regular file, device, socket,
+ *     FIFO, or symbolic link. Referral points (special objects in distributed
+ *     filesystems like AFS) are rejected.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code and
+ *     the current working directory remains unchanged.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The file descriptor @fd is not a valid open file descriptor, or
+ *     the file associated with @fd has been closed. Detected by fdget_raw()
+ *     when looking up the file descriptor in the process's file descriptor
+ *     table.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: The file descriptor @fd refers to a file that is not a directory.
+ *     This includes regular files, symbolic links, block devices, character
+ *     devices, FIFOs, sockets, and special filesystem objects like referral
+ *     points in distributed filesystems (AFS, DFS). Checked via d_can_lookup()
+ *     which verifies the dentry type is DCACHE_DIRECTORY_TYPE.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search (execute) permission is denied on the directory. This is
+ *     checked via inode_permission() using MAY_EXEC | MAY_CHDIR flags. The
+ *     permission check respects POSIX ACLs if the filesystem supports them.
+ *     LSM modules (SELinux, AppArmor) may also deny access based on security
+ *     policy. On filesystems with custom permission handlers (FUSE, AFS, NFS),
+ *     additional access control checks may be performed.
+ *
+ * lock: fs->seq (seqlock)
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's fs_struct seqlock is acquired exclusively via
+ *     write_seqlock() in set_fs_pwd() when updating the current working
+ *     directory. This serializes concurrent accesses to fs->pwd and ensures
+ *     atomic updates visible to other threads sharing the fs_struct.
+ *
+ * lock: inode->i_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: conditional
+ *   released: true
+ *   desc: May be briefly acquired when setting the IOP_FASTPERM flag on an
+ *     inode during permission checking optimization in do_inode_permission().
+ *     This is a one-time operation per inode lifetime.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process current working directory (current->fs->pwd)
+ *   desc: Changes the calling process's current working directory to the
+ *     directory referred to by @fd. The new directory's path structure
+ *     (vfsmount and dentry) is stored in current->fs->pwd. The previous
+ *     working directory's reference count is decremented via path_put().
+ *   condition: On successful permission check
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Reference counts on path structures
+ *   desc: Increments reference count on the new working directory's vfsmount
+ *     (via mntget) and dentry (via dget) through path_get(). Decrements
+ *     reference count on the old working directory through path_put().
+ *   condition: On success
+ *   reversible: no
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypasses execute (search) permission check on directories
+ *   without: Process must have execute permission on the directory
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Overrides all DAC permission checks including execute on directories
+ *   without: Process must have appropriate execute permissions
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * examples: fchdir(dirfd);  // Change to directory opened by open()
+ *   fchdir(fd);  // Change using O_PATH fd from openat(AT_FDCWD, ".", O_PATH)
+ *
+ * notes: Unlike chdir(), fchdir() does not involve any pathname resolution,
+ *   so it cannot fail with ENOENT, ENAMETOOLONG, ELOOP, or ESTALE errors.
+ *   The directory must already be open, which means the path was resolved
+ *   and validated at open() time.
+ *
+ *   The working directory is per-process state stored in the fs_struct.
+ *   Threads sharing the same fs_struct (created with CLONE_FS) share the
+ *   same working directory. A successful fchdir() does not guarantee that
+ *   the directory will remain accessible; it may be subsequently deleted,
+ *   have permissions changed, or become unmounted.
+ *
+ *   fchdir() is particularly useful for implementing secure directory
+ *   traversal patterns: open a directory, verify it's the expected one
+ *   (e.g., by checking device and inode numbers), then fchdir() to it.
+ *   This avoids TOCTOU races present in chdir() with pathnames.
+ *
+ *   Since Linux 3.5, O_PATH file descriptors are accepted. This allows
+ *   changing to a directory that was opened with only execute permission
+ *   (not read permission), similar to Solaris O_SEARCH.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 {
 	CLASS(fd_raw, f)(fd);
