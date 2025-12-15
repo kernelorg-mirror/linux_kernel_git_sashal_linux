@@ -6046,6 +6046,328 @@ exit_putname:
 	return error;
 }
 
+/**
+ * sys_unlinkat - remove a directory entry relative to a directory file descriptor
+ * @dfd: directory file descriptor for relative path resolution
+ * @pathname: pathname of the file or directory to remove
+ * @flag: controls behavior (AT_REMOVEDIR for directory removal)
+ *
+ * long-desc: Removes the directory entry specified by @pathname. The @pathname
+ *   is interpreted relative to the directory referred to by @dfd, unless
+ *   @pathname is absolute (starts with '/'), in which case @dfd is ignored.
+ *   If @dfd is the special value AT_FDCWD (-100), the pathname is resolved
+ *   relative to the current working directory.
+ *
+ *   The behavior depends on the @flag argument:
+ *   - If @flag is 0, the syscall performs an unlink operation, removing a
+ *     non-directory file. If @pathname refers to a directory, EISDIR is
+ *     returned.
+ *   - If @flag is AT_REMOVEDIR (0x200), the syscall performs an rmdir
+ *     operation, removing an empty directory. If @pathname refers to a
+ *     non-directory, ENOTDIR is returned.
+ *
+ *   The removal decrements the link count of the target inode. If this was
+ *   the last link and no process has the file open, the file is deleted and
+ *   its space is freed. If the file is currently open by any process, the
+ *   directory entry is removed but the file remains until all file
+ *   descriptors referring to it are closed.
+ *
+ *   For directories (AT_REMOVEDIR), the directory must be empty (contain
+ *   only "." and ".."). The parent directory's link count is decremented
+ *   by one after successful removal.
+ *
+ *   This syscall was added in Linux 2.6.16 as part of the *at() family of
+ *   system calls, enabling race-free filesystem traversal. It combines the
+ *   functionality of unlink(2) and rmdir(2) with directory-relative path
+ *   resolution.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, or
+ *     the special value AT_FDCWD (-100). If @pathname is an absolute path,
+ *     @dfd is ignored. When @dfd is a valid file descriptor, it must refer
+ *     to a directory; otherwise ENOTDIR is returned. The directory must have
+ *     execute permission for path resolution to proceed. O_PATH file
+ *     descriptors are supported as @dfd.
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. The path must not be empty. Path components are limited
+ *     to NAME_MAX (255) bytes each, and the total path length must not exceed
+ *     PATH_MAX (4096) bytes. The final component must be a normal name (not
+ *     ".", "..", or "/"). When AT_REMOVEDIR is not set, a trailing slash
+ *     results in ENOTDIR if the target is not a directory, or EISDIR if it is.
+ *
+ * param: flag
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: AT_REMOVEDIR
+ *   constraint: Must be either 0 (for unlink behavior) or AT_REMOVEDIR (0x200)
+ *     for rmdir behavior. Any other bits set will result in EINVAL. Unlike
+ *     other *at() syscalls, AT_SYMLINK_NOFOLLOW is not supported as unlinkat
+ *     never follows symbolic links at the final component.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The directory entry has been removed and the
+ *     target inode's link count has been decremented. If the link count
+ *     reaches zero and no process has the file open, the file's resources
+ *     are freed.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Write permission is denied on the directory containing the file, or
+ *     search (execute) permission is denied on a directory in the pathname
+ *     prefix. Also returned if a Linux Security Module (SELinux, AppArmor,
+ *     etc.) denies the operation via security_path_unlink() or
+ *     security_path_rmdir().
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The @dfd argument is not a valid file descriptor and @pathname is
+ *     a relative path (not starting with '/').
+ *
+ * error: EBUSY, Device or resource busy
+ *   desc: The file or directory cannot be unlinked because it is being used
+ *     by the system or another process. Specific cases include: the target
+ *     is a mount point for another filesystem; the target is the root
+ *     directory (AT_REMOVEDIR with "/"); the file is being used as a swap
+ *     file; the directory has S_KERNEL_FILE flag set; the file is undergoing
+ *     NFS silly-rename processing (DCACHE_NFSFS_RENAMED).
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @pathname pointer points outside the process's accessible
+ *     address space. This is detected when copying the pathname from user
+ *     space via strncpy_from_user() in getname().
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from or writing to the
+ *     filesystem. This is returned by the underlying filesystem driver.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: An invalid value was specified in @flag (bits other than
+ *     AT_REMOVEDIR are set). Also returned when attempting to rmdir
+ *     "." (the current directory component).
+ *
+ * error: EISDIR, Is a directory
+ *   desc: Attempted to unlink a directory without AT_REMOVEDIR flag. This
+ *     occurs when @flag is 0 and @pathname refers to a directory, or when
+ *     the final pathname component ends with "/" but is not followed by
+ *     AT_REMOVEDIR, or when the path ends with "." or "..".
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @pathname.
+ *     The kernel limit is MAXSYMLINKS (typically 40 in a single path
+ *     resolution, with a maximum nesting depth of 8).
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: The @pathname argument or one of its pathname components exceeds
+ *     the system limit. Individual components are limited to NAME_MAX (255)
+ *     bytes and the total path is limited to PATH_MAX (4096) bytes.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: The target specified by @pathname does not exist, or a component
+ *     in the pathname prefix does not exist, or @pathname is an empty string.
+ *     Also returned if the parent directory has been removed (IS_DEADDIR).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available. This can occur during
+ *     pathname allocation (getname()) or dentry allocation (d_alloc())
+ *     during path lookup.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @pathname is not a directory,
+ *     or @dfd refers to a file that is not a directory when @pathname is
+ *     relative. Also returned when AT_REMOVEDIR is specified but @pathname
+ *     does not refer to a directory, or when @pathname has a trailing slash
+ *     but the target is not a directory.
+ *
+ * error: ENOTEMPTY, Directory not empty
+ *   desc: The directory to be removed is not empty (contains entries other
+ *     than "." and ".."). Also returned when attempting to rmdir "..".
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The filesystem does not support unlinking or directory removal
+ *     (i_op->unlink or i_op->rmdir is NULL). Also returned in the following
+ *     cases: the parent directory has the sticky bit set and the caller is
+ *     not the owner of the file, the owner of the directory, nor privileged
+ *     (CAP_FOWNER); the file has the append-only (S_APPEND) or immutable
+ *     (S_IMMUTABLE) attribute set; the parent directory has append-only
+ *     attribute set; the file is currently used as a swap file; the file
+ *     has unmapped uid/gid in the current user namespace.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The directory containing the file resides on a read-only
+ *     filesystem, or the filesystem has been remounted read-only. This is
+ *     checked via mnt_want_write() before the operation proceeds.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The target file's uid or gid cannot be represented in the current
+ *     idmap context. This occurs with idmapped mounts when the file's
+ *     uid/gid falls outside the mapped range, making inode writeback unsafe.
+ *
+ * lock: parent_directory->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The parent directory's inode read-write semaphore is acquired
+ *     exclusively (I_MUTEX_PARENT nesting level) in start_dirop() before
+ *     the lookup and removal operation. This serializes concurrent
+ *     modifications to the directory. The lock is held while performing
+ *     the lookup, permission checks, and the actual unlink/rmdir operation.
+ *     Released in end_dirop() after the operation completes or fails.
+ *
+ * lock: target->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: For unlink operations, the target file's inode rwsem is acquired
+ *     exclusively in vfs_unlink() via inode_lock(target). For rmdir
+ *     operations, the target directory's inode rwsem is acquired in
+ *     vfs_rmdir() via inode_lock(dentry->d_inode). This prevents concurrent
+ *     operations on the target while it is being removed.
+ *
+ * lock: sb->s_umount (implicit)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock's s_umount semaphore is acquired for reading via
+ *     sb_start_write() in mnt_want_write(). This prevents filesystem freeze
+ *     operations during the modification. Released via sb_end_write() in
+ *     mnt_drop_write().
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: During blocking waits
+ *   desc: The syscall may block waiting for locks or delegation breaks. If
+ *     an NFSv4 delegation exists on the target or parent directory, the
+ *     syscall blocks in break_deleg_wait() waiting for the delegation holder
+ *     to release it, which is interruptible. Lock acquisition in start_dirop()
+ *     can also be interrupted on some paths.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: directory entry (dentry)
+ *   desc: Removes the directory entry linking @pathname to its inode from
+ *     the parent directory. The dentry is unhashed from the dcache via
+ *     d_delete_notify() and fsnotify_unlink()/fsnotify_rmdir() is called
+ *     to notify filesystem monitors. The dentry is marked DCACHE_DONTCACHE
+ *     to prevent future lookup.
+ *   condition: Successful completion
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: target inode
+ *   desc: The target inode's link count (i_nlink) is decremented. If the
+ *     link count reaches zero and no process has the file open, the inode
+ *     is scheduled for deletion and its data blocks are freed. The inode's
+ *     ctime is updated. For directories, the inode is marked S_DEAD.
+ *   condition: Successful completion
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: parent directory inode
+ *   desc: The parent directory's mtime and ctime are updated to reflect the
+ *     removal of an entry. For rmdir operations, the parent directory's
+ *     link count (i_nlink) is decremented by one (removing the ".." back
+ *     reference). The parent directory inode is marked dirty.
+ *   condition: Successful completion
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FREE_MEMORY
+ *   target: file data blocks
+ *   desc: If the target file's link count reaches zero and no process has
+ *     the file open, its data blocks are freed. This happens asynchronously
+ *     via iput(inode) after the unlink completes. The actual truncation
+ *     occurs outside the parent directory's i_rwsem to avoid blocking
+ *     directory access during potentially lengthy I/O.
+ *   condition: Link count reaches zero with no open file descriptors
+ *   reversible: no
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass sticky bit restriction on directories
+ *   without: Cannot delete files owned by others in sticky directories
+ *   condition: Checked in __check_sticky() when parent directory has sticky
+ *     bit set and caller is not the file owner or directory owner
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control checks on parent directory
+ *   without: Must have write and execute permission on parent directory
+ *   condition: Checked during inode_permission() on parent directory when
+ *     write permission is required
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass directory search (execute) permission checks
+ *   without: Must have execute permission on each directory in the path
+ *   condition: Checked during path traversal for each directory component
+ *
+ * constraint: LSM security hooks
+ *   desc: Linux Security Modules (SELinux, AppArmor, Smack, TOMOYO, etc.)
+ *     may impose additional restrictions. The security_path_unlink() or
+ *     security_path_rmdir() hook is called after path resolution, and
+ *     security_inode_unlink() or security_inode_rmdir() is called within
+ *     vfs_unlink()/vfs_rmdir(). These hooks may return errors (typically
+ *     EACCES or EPERM) based on security policy.
+ *
+ * constraint: Filesystem support
+ *   desc: The underlying filesystem must implement the unlink operation
+ *     (inode_operations->unlink) for files and rmdir operation
+ *     (inode_operations->rmdir) for directories. Pseudo-filesystems may
+ *     not support these operations and return EPERM.
+ *
+ * constraint: NFS delegation handling
+ *   desc: If an NFSv4 delegation exists on the target file or its parent
+ *     directory, the syscall must break the delegation before proceeding.
+ *     This involves notifying the delegation holder and waiting for them
+ *     to return the delegation. The syscall automatically retries after
+ *     delegation break via break_deleg_wait(). During this time, the
+ *     operation may block for an extended period.
+ *
+ * constraint: ESTALE retry handling
+ *   desc: On NFS and similar network filesystems, if an ESTALE error occurs
+ *     during path resolution (indicating a stale file handle), the syscall
+ *     automatically retries with LOOKUP_REVAL flag to force revalidation
+ *     of cached dentries. This is handled by retry_estale().
+ *
+ * examples: unlinkat(AT_FDCWD, "file.txt", 0);  // Remove file in cwd
+ *   unlinkat(dirfd, "subfile", 0);  // Remove file relative to dirfd
+ *   unlinkat(AT_FDCWD, "emptydir", AT_REMOVEDIR);  // Remove empty directory
+ *   unlinkat(dirfd, "/absolute/path", 0);  // dfd ignored for absolute path
+ *
+ * notes: Unlike most *at() syscalls, unlinkat does not support the
+ *   AT_SYMLINK_NOFOLLOW flag because it inherently does not follow symbolic
+ *   links at the final pathname component - it always operates on the link
+ *   itself rather than its target.
+ *
+ *   The unlinkat syscall is atomic with respect to other filesystem
+ *   operations on the same directory. However, the actual freeing of file
+ *   data may be deferred until all file descriptors referring to the file
+ *   are closed.
+ *
+ *   For NFS-exported filesystems, files may undergo "silly rename" instead
+ *   of immediate deletion when the file is still open. The file is renamed
+ *   to a hidden name (e.g., ".nfsXXXX") and deleted when closed. Such files
+ *   cannot be unlinked by another process and return EBUSY.
+ *
+ *   When removing directories with AT_REMOVEDIR, any mount points within
+ *   the directory subtree are detached via detach_mounts() before removal.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE3(unlinkat, int, dfd, const char __user *, pathname, int, flag)
 {
 	if ((flag & ~AT_REMOVEDIR) != 0)
