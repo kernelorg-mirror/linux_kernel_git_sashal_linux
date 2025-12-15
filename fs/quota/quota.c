@@ -908,11 +908,289 @@ retry:
 #endif
 }
 
-/*
- * This is the system call interface. This communicates with
- * the user-level programs. Currently this only supports diskquota
- * calls. Maybe we need to add the process quotas etc. in the future,
- * but we probably should use rlimits for that.
+/**
+ * sys_quotactl - Manipulate disk quotas for a filesystem
+ * @cmd: Operation code encoded as QCMD(subop, type) where subop specifies the
+ *       command and type specifies the quota type (USRQUOTA, GRPQUOTA, PRJQUOTA)
+ * @special: Pathname of the mounted block special device containing the filesystem
+ * @id: User, group, or project ID for quota operations, or quota format ID for Q_QUOTAON
+ * @addr: Pointer to command-specific data structure in user space
+ *
+ * long-desc: Controls disk quotas for filesystems, allowing administrators to
+ *   set and query limits on disk space and inode usage per user, group, or
+ *   project. The cmd parameter is constructed using QCMD(subop, type) where the
+ *   lower 8 bits encode the quota type (USRQUOTA=0, GRPQUOTA=1, PRJQUOTA=2) and
+ *   the upper bits encode the subcommand.
+ *
+ *   Standard VFS quota subcommands: Q_QUOTAON (enable quotas, addr points to
+ *   quota file path), Q_QUOTAOFF (disable quotas), Q_GETFMT (get format into
+ *   addr as __u32), Q_GETINFO (get grace periods into struct if_dqinfo at addr),
+ *   Q_SETINFO (set grace periods from struct if_dqinfo), Q_GETQUOTA (get limits
+ *   into struct if_dqblk), Q_SETQUOTA (set limits from struct if_dqblk),
+ *   Q_GETNEXTQUOTA (get next active quota >= id into struct if_nextdqblk),
+ *   Q_SYNC (sync quota data to disk, special can be NULL to sync all filesystems).
+ *
+ *   XFS-style quota subcommands: Q_XQUOTAON, Q_XQUOTAOFF (enable/disable with
+ *   flags), Q_XGETQUOTA, Q_XSETQLIM (get/set using struct fs_disk_quota),
+ *   Q_XGETQSTAT, Q_XGETQSTATV (get status using fs_quota_stat/fs_quota_statv),
+ *   Q_XQUOTARM (remove quota files), Q_XGETNEXTQUOTA, Q_XQUOTASYNC (no-op since
+ *   kernel 3.4).
+ *
+ *   The special parameter identifies the target filesystem by specifying the
+ *   path to its mounted block device (e.g., "/dev/sda1"). For Q_SYNC, special
+ *   may be NULL to sync all filesystems with active quotas. For filesystems
+ *   without block devices (e.g., tmpfs, UBIFS), use quotactl_fd() instead.
+ *
+ *   Unprivileged users may query their own quotas using Q_GETQUOTA or Q_XGETQUOTA.
+ *   All other operations require CAP_SYS_ADMIN capability. The security_quotactl()
+ *   LSM hook is called to allow security modules to impose additional restrictions.
+ *
+ *   Commands that modify quota state (on/off operations, setquota, setinfo) wait
+ *   for frozen filesystems to thaw before proceeding. On/off commands acquire
+ *   the superblock s_umount semaphore exclusively; other modifying commands
+ *   acquire it shared. Read-only commands like Q_GETFMT do not wait for thaw.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: cmd
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be formed using QCMD(subop, type) macro. The type field
+ *     (lower 8 bits) must be less than MAXQUOTAS (3), i.e., one of USRQUOTA (0),
+ *     GRPQUOTA (1), or PRJQUOTA (2). The subop field must be a valid quota
+ *     command: Q_SYNC, Q_QUOTAON, Q_QUOTAOFF, Q_GETFMT, Q_GETINFO, Q_SETINFO,
+ *     Q_GETQUOTA, Q_SETQUOTA, Q_GETNEXTQUOTA, or XFS commands Q_XQUOTAON,
+ *     Q_XQUOTAOFF, Q_XGETQUOTA, Q_XSETQLIM, Q_XGETQSTAT, Q_XGETQSTATV,
+ *     Q_XQUOTARM, Q_XGETNEXTQUOTA, Q_XQUOTASYNC. Invalid commands return EINVAL.
+ *     The filesystem must support the requested quota type (s_quota_types flag).
+ *
+ * param: special
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_USER_PATH
+ *   constraint: Must be a valid null-terminated pathname in user space pointing
+ *     to a mounted block special device, or NULL only when subop is Q_SYNC. The
+ *     path is resolved using kern_path() with LOOKUP_FOLLOW. The resolved inode
+ *     must be a block device (S_ISBLK); otherwise ENOTBLK is returned. The device
+ *     must have an active superblock; ENODEV is returned if not mounted. If NULL
+ *     for Q_SYNC, all mounted filesystems with active quotas are synchronized.
+ *     For non-Q_SYNC commands with NULL special, returns ENODEV.
+ *
+ * param: id
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation depends on subop. For Q_QUOTAON, specifies the
+ *     quota format: QFMT_VFS_OLD (1), QFMT_VFS_V0 (2), QFMT_OCFS2 (3),
+ *     QFMT_VFS_V1 (4), or QFMT_SHMEM (5). For Q_GETQUOTA, Q_SETQUOTA,
+ *     Q_GETNEXTQUOTA, Q_XGETQUOTA, Q_XSETQLIM, Q_XGETNEXTQUOTA, specifies the
+ *     user/group/project ID. The ID must have a valid mapping in the
+ *     filesystem's user namespace; otherwise EINVAL is returned. ID 0 with
+ *     XFS commands and timer/warning fields sets default limits. For Q_QUOTAOFF,
+ *     Q_GETFMT, Q_GETINFO, Q_SETINFO, Q_SYNC, Q_XGETQSTAT, Q_XGETQSTATV,
+ *     Q_XQUOTAON, Q_XQUOTAOFF, Q_XQUOTARM, Q_XQUOTASYNC, the id is ignored.
+ *
+ * param: addr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Type and direction depends on subop. Q_QUOTAON: input path to
+ *     quota file. Q_GETFMT: output __u32 format ID. Q_GETINFO/Q_SETINFO:
+ *     output/input struct if_dqinfo. Q_GETQUOTA/Q_SETQUOTA: output/input struct
+ *     if_dqblk. Q_GETNEXTQUOTA: output struct if_nextdqblk. Q_XQUOTAON/
+ *     Q_XQUOTAOFF/Q_XQUOTARM: input __u32 flags. Q_XGETQUOTA/Q_XSETQLIM/
+ *     Q_XGETNEXTQUOTA: output/input struct fs_disk_quota. Q_XGETQSTAT: output
+ *     struct fs_quota_stat. Q_XGETQSTATV: input/output struct fs_quota_statv
+ *     (qs_version must be set to FS_QSTATV_VERSION1). For Q_QUOTAOFF, Q_SYNC,
+ *     Q_XQUOTASYNC, addr is ignored and may be NULL. All structures must be
+ *     properly aligned and accessible; EFAULT is returned on copy failures.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The quota type in cmd is >= MAXQUOTAS (3), or the subop is not a
+ *     recognized command, or the filesystem does not support the specified
+ *     quota type, or for Q_SETINFO the dqi_valid field contains invalid flags,
+ *     or for Q_SETINFO the dqi_flags contains unsupported flags, or for
+ *     Q_XGETQSTATV the qs_version is not FS_QSTATV_VERSION1, or the specified
+ *     user/group/project ID has no valid mapping in the filesystem's user
+ *     namespace, or for Q_XSETQLIM with ID 0 the set_info callback is missing.
+ *
+ * error: ENODEV, No such device
+ *   desc: The special parameter is NULL and subop is not Q_SYNC, or the block
+ *     device specified by special is not mounted (no superblock found), or
+ *     CONFIG_BLOCK is not enabled in the kernel configuration.
+ *
+ * error: ENOSYS, Function not implemented
+ *   desc: The filesystem does not have quota operations (s_qcop is NULL), or
+ *     the specific quota operation callback is not implemented by the filesystem
+ *     (e.g., quota_on, quota_off, get_dqblk, set_dqblk, quota_sync, get_state,
+ *     set_info, get_nextdqblk, quota_enable, quota_disable, rm_xquota), or for
+ *     Q_XGETQSTAT/Q_XGETQSTATV no quota is currently enabled on the filesystem.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The calling process does not have CAP_SYS_ADMIN capability and is
+ *     attempting an operation other than Q_GETFMT, Q_SYNC, Q_GETINFO,
+ *     Q_XGETQSTAT, Q_XGETQSTATV, Q_XQUOTASYNC, or querying own quotas with
+ *     Q_GETQUOTA/Q_XGETQUOTA. For Q_GETQUOTA, unprivileged users may only query
+ *     their own user quota (euid matches id for USRQUOTA) or a group quota
+ *     where they are a member (in_egroup_p for GRPQUOTA).
+ *
+ * error: EFAULT, Bad address
+ *   desc: The special or addr pointer points to invalid user memory, or copying
+ *     data to/from user space failed. This includes failures in getname(),
+ *     copy_from_user(), copy_to_user(), get_user(), or put_user() operations.
+ *
+ * error: ENOTBLK, Block device required
+ *   desc: The path specified by special does not refer to a block special device.
+ *     The inode at that path must have S_ISBLK(i_mode) set.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Access to the block device is denied by may_open_dev(), which checks
+ *     device access restrictions (e.g., namespace or cgroup device policies).
+ *
+ * error: ESRCH, No such process
+ *   desc: For Q_GETFMT, quotas are not active for the specified type. For
+ *     Q_GETINFO, quota accounting is not enabled for the specified type. For
+ *     Q_GETNEXTQUOTA/Q_XGETNEXTQUOTA, no quota entry exists with ID >= the
+ *     specified id (returned as ENOENT by the callback).
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: The path specified by special does not exist, or for Q_QUOTAON the
+ *     quota file path specified by addr does not exist, or for Q_GETNEXTQUOTA/
+ *     Q_XGETNEXTQUOTA no quota exists for any ID >= the specified id.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: For Q_XQUOTASYNC, the filesystem is mounted read-only.
+ *
+ * error: EBUSY, Device or resource busy
+ *   desc: For Q_QUOTAON, quotas are already enabled for the specified type.
+ *
+ * error: ERANGE, Math result not representable
+ *   desc: For Q_SETQUOTA/Q_XSETQLIM, the specified quota limits exceed the
+ *     range supported by the quota format.
+ *
+ * lock: sb->s_umount
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock unmount semaphore is acquired to prevent the filesystem
+ *     from being unmounted during quota operations. For Q_QUOTAON, Q_QUOTAOFF,
+ *     Q_XQUOTAON, Q_XQUOTAOFF (on/off commands), acquired exclusively via
+ *     down_write(). For other commands, acquired shared via down_read() through
+ *     user_get_super(). Released via drop_super() or drop_super_exclusive()
+ *     before returning.
+ *
+ * lock: sb_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Global superblock list spinlock acquired briefly during superblock
+ *     lookup in user_get_super() and during Q_SYNC iteration in iterate_supers().
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   condition: While waiting for a frozen filesystem to thaw
+ *   desc: Commands that modify quota state wait for frozen filesystems using
+ *     sb_start_write()/sb_end_write() which may be interrupted by signals.
+ *     Path resolution via user_path_at() may also be interruptible.
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Enables all quota control operations including enabling/disabling
+ *     quotas, setting quota limits for any user, and modifying quota parameters.
+ *   without: Limited to Q_GETFMT, Q_SYNC, Q_GETINFO, Q_XGETQSTAT, Q_XGETQSTATV,
+ *     Q_XQUOTASYNC, and querying own quotas (Q_GETQUOTA for own UID/groups,
+ *     Q_XGETQUOTA for own UID/groups). Other operations return EPERM.
+ *   condition: Checked in check_quotactl_permission() after security_quotactl()
+ *     LSM hook. For Q_GETQUOTA/Q_XGETQUOTA, capability is only required when
+ *     querying quotas for other users (different euid for USRQUOTA, not a
+ *     member group for GRPQUOTA).
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Quota metadata on the filesystem
+ *   desc: Q_QUOTAON enables quota tracking and may create quota files.
+ *     Q_QUOTAOFF disables quota tracking. Q_SETQUOTA/Q_XSETQLIM modify quota
+ *     limits stored on disk. Q_SETINFO modifies grace period settings.
+ *     Q_SYNC writes cached quota data to disk. Q_XQUOTARM removes quota files.
+ *   reversible: yes
+ *   condition: Only for commands that modify state; read-only commands like
+ *     Q_GETQUOTA do not modify filesystem state.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: In-memory dquot structures
+ *   desc: Q_SETQUOTA and Q_XSETQLIM modify in-memory quota structures which
+ *     track current usage and limits. Q_QUOTAON initializes dquot structures
+ *     for the quota type. Q_QUOTAOFF releases dquot structures.
+ *   reversible: yes
+ *
+ * state-trans: quota_state
+ *   from: disabled
+ *   to: enabled
+ *   condition: Q_QUOTAON or Q_XQUOTAON command succeeds
+ *   desc: Quota accounting and optionally enforcement becomes active for the
+ *     specified quota type on the filesystem.
+ *
+ * state-trans: quota_state
+ *   from: enabled
+ *   to: disabled
+ *   condition: Q_QUOTAOFF or Q_XQUOTAOFF command succeeds
+ *   desc: Quota accounting and enforcement is disabled for the specified quota
+ *     type. Cached dquot structures are written back and released.
+ *
+ * constraint: Filesystem Support
+ *   desc: The filesystem must support quotas (s_qcop is set) and must have the
+ *     appropriate quota type enabled in s_quota_types. Not all filesystems
+ *     support all quota types or all commands. For example, XFS uses hidden
+ *     system inodes and doesn't support Q_QUOTAON with a path argument.
+ *
+ * constraint: User Namespace Mapping
+ *   desc: For commands operating on specific user/group/project IDs, the ID must
+ *     have a valid mapping in the filesystem's user namespace (sb->s_user_ns).
+ *     This is verified by qid_has_mapping() and affects Q_GETQUOTA, Q_SETQUOTA,
+ *     Q_GETNEXTQUOTA, Q_XGETQUOTA, Q_XSETQLIM, Q_XGETNEXTQUOTA.
+ *
+ * constraint: Frozen Filesystem
+ *   desc: Commands that write to the filesystem (most commands except Q_GETFMT,
+ *     Q_GETINFO, Q_SYNC, Q_XGETQSTAT, Q_XGETQSTATV, Q_XGETQUOTA, Q_XGETNEXTQUOTA,
+ *     Q_XQUOTASYNC) will wait for a frozen filesystem to thaw before proceeding.
+ *     This prevents quota modifications while a filesystem snapshot is in progress.
+ *
+ * examples: quotactl(QCMD(Q_GETQUOTA, USRQUOTA), "/dev/sda1", uid, &dqblk);
+ *   quotactl(QCMD(Q_SETQUOTA, USRQUOTA), "/dev/sda1", uid, &dqblk);
+ *   quotactl(QCMD(Q_SYNC, USRQUOTA), NULL, 0, NULL);  // Sync all filesystems
+ *   quotactl(QCMD(Q_QUOTAON, USRQUOTA), "/dev/sda1", QFMT_VFS_V1, "/quota.user");
+ *
+ * notes: This syscall requires the block device path to identify the filesystem,
+ *   which is problematic for filesystems without block devices (e.g., tmpfs,
+ *   UBIFS). For such filesystems, use quotactl_fd() (syscall 443, since Linux
+ *   5.14) which accepts a file descriptor referring to any file on the target
+ *   filesystem instead.
+ *
+ *   Quota limits are specified in 1KB blocks (QIF_DQBLKSIZE = 1024) for VFS
+ *   quotas and 512-byte basic blocks (BBs) for XFS quotas.
+ *
+ *   Project quotas (PRJQUOTA) were added in Linux 4.1 for XFS and later extended
+ *   to other filesystems. Not all filesystems support project quotas.
+ *
+ *   The Q_XQUOTASYNC command is a no-op since Linux 3.4 because XFS quotas are
+ *   now fully coherent and sync automatically.
+ *
+ *   For compatibility with 32-bit userspace on 64-bit kernels, structures may
+ *   have different layouts. The kernel handles this transparently using compat
+ *   structures when compat_need_64bit_alignment_fixup() returns true.
+ *
+ *   The LSM security hook security_quotactl() is called before capability checks
+ *   and may impose additional restrictions based on security policy.
+ *
+ * since-version: 1.0
  */
 SYSCALL_DEFINE4(quotactl, unsigned int, cmd, const char __user *, special,
 		qid_t, id, void __user *, addr)
