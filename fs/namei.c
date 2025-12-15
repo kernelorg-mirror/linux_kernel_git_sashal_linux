@@ -5501,6 +5501,273 @@ out_putname:
 	return error;
 }
 
+/**
+ * sys_mkdirat - create a directory relative to a directory file descriptor
+ * @dfd: directory file descriptor for relative path resolution
+ * @pathname: pathname of the directory to create
+ * @mode: permission bits for the new directory
+ *
+ * long-desc: Creates a new directory named @pathname with permissions specified
+ *   by @mode. The @pathname is interpreted relative to the directory referred
+ *   to by @dfd, unless @pathname is absolute (starts with '/'), in which case
+ *   @dfd is ignored. If @dfd is the special value AT_FDCWD (-100), the pathname
+ *   is resolved relative to the current working directory.
+ *
+ *   The permission bits in @mode are modified by the process's umask in the
+ *   usual way: the effective mode of the created directory is (@mode & ~umask).
+ *   The allowed permission bits are the standard read/write/execute bits for
+ *   user/group/other (0777 = S_IRWXUGO) plus the sticky bit (01000 = S_ISVTX).
+ *   The setuid bit (S_ISUID) and setgid bit (S_ISGID) in @mode are stripped by
+ *   vfs_prepare_mode().
+ *
+ *   The newly created directory is owned by the effective user ID of the
+ *   calling process. If the parent directory has the set-group-ID bit set,
+ *   or the filesystem is mounted with group semantics (e.g., grpid mount
+ *   option), the new directory's group is inherited from the parent;
+ *   otherwise, it is set to the effective group ID of the process.
+ *
+ *   This syscall was added in Linux 2.6.16 as part of the *at() family of
+ *   system calls, enabling race-free filesystem traversal by allowing
+ *   operations relative to directory file descriptors rather than the
+ *   process's current working directory.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, or
+ *     the special value AT_FDCWD (-100). If @pathname is an absolute path,
+ *     @dfd is ignored. When @dfd is a valid file descriptor, it must refer
+ *     to a directory; otherwise ENOTDIR is returned. The directory must have
+ *     execute permission for path resolution to proceed. O_PATH file
+ *     descriptors are supported as @dfd.
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. The path must not be empty. Path components are limited
+ *     to NAME_MAX (255) bytes each, and the total path length must not exceed
+ *     PATH_MAX (4096) bytes. The final component must be a normal name (not
+ *     ".", "..", or empty). Trailing slashes are permitted since the target
+ *     is expected to be a directory.
+ *
+ * param: mode
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: S_IRWXU | S_IRWXG | S_IRWXO | S_ISVTX
+ *   constraint: Permission bits specifying access rights for the new directory.
+ *     Valid bits are read/write/execute for user/group/other (07777 octal).
+ *     The sticky bit (S_ISVTX = 01000) is honored. Setuid and setgid bits in
+ *     @mode are stripped by the kernel before creating the directory. The
+ *     effective permissions are (@mode & S_IRWXUGO & S_ISVTX & ~umask).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The directory has been created with the
+ *     requested permissions (as modified by umask). The parent directory's
+ *     link count has been incremented.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The parent directory does not allow write permission to the process,
+ *     or one of the directories in the pathname prefix did not allow search
+ *     (execute) permission. Can also occur when a Linux Security Module
+ *     denies the operation (security_path_mkdir() or security_inode_mkdir()
+ *     returns an error).
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The @dfd argument is not a valid file descriptor and @pathname is
+ *     a relative path (not starting with '/').
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's quota of disk blocks or inodes on the filesystem has been
+ *     exhausted. This error is filesystem-dependent and may not be returned
+ *     by all filesystems.
+ *
+ * error: EEXIST, File exists
+ *   desc: A file or directory with the name @pathname already exists. This
+ *     includes the case where @pathname is a symbolic link (dangling or not).
+ *     The LOOKUP_EXCL flag ensures creation fails if the target exists.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @pathname pointer points outside the process's accessible
+ *     address space. This is detected when copying the pathname from user
+ *     space via strncpy_from_user() in getname().
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The final pathname component is "." or "..". These special names
+ *     cannot be created as new directories.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @pathname.
+ *     The kernel limit is MAXSYMLINKS (typically 40 in a single path
+ *     resolution, 8 nested symlinks).
+ *
+ * error: EMLINK, Too many links
+ *   desc: The number of links to the parent directory would exceed the
+ *     filesystem's maximum link count (stored in sb->s_max_links). Each
+ *     subdirectory increases the parent's link count by one (for the ".."
+ *     entry). This is checked in vfs_mkdir() before the filesystem's
+ *     mkdir operation is called.
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: The @pathname argument or one of its pathname components exceeds
+ *     the system limit. Individual components are limited to NAME_MAX (255)
+ *     bytes and the total path is limited to PATH_MAX (4096) bytes.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A directory component in @pathname does not exist, or a symbolic
+ *     link in the path points to a nonexistent file (dangling symlink).
+ *     Also returned if the parent directory has been removed (IS_DEADDIR)
+ *     or if @pathname is an empty string.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available. This can occur during
+ *     pathname allocation (getname()), dentry allocation (d_alloc()), or
+ *     inode allocation in the filesystem.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The filesystem has no room for the new directory. This is returned
+ *     by the filesystem's mkdir operation when disk space or inodes are
+ *     exhausted.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @pathname is not a directory,
+ *     or @dfd refers to a file that is not a directory when @pathname is
+ *     relative.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The filesystem does not support creating directories (the
+ *     inode_operations->mkdir callback is NULL). Also returned if the
+ *     parent directory is marked immutable (IS_IMMUTABLE). Can also be
+ *     returned by a Linux Security Module denying the operation.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The parent directory resides on a read-only filesystem, or the
+ *     filesystem has been remounted read-only. This is checked via
+ *     mnt_want_write() in filename_create().
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The filesystem cannot represent the process's fsuid or fsgid. This
+ *     occurs with idmapped mounts when the mapped user/group ID cannot be
+ *     represented in the filesystem's ID space. Checked via
+ *     fsuidgid_has_mapping() in may_create().
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: On NFS and similar network filesystems, the file handle for a
+ *     directory in the path has become stale. The syscall automatically
+ *     retries with LOOKUP_REVAL to revalidate the path.
+ *
+ * lock: parent_directory->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The parent directory's inode read-write semaphore is acquired
+ *     exclusively (I_MUTEX_PARENT nesting level) in start_dirop() before
+ *     the lookup and creation. This serializes concurrent modifications to
+ *     the directory. The lock is held while performing the lookup, security
+ *     checks, and the actual mkdir operation. Released in end_dirop() via
+ *     end_creating_path() after the operation completes or fails.
+ *
+ * lock: sb->s_umount (implicit)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock's s_umount semaphore is acquired for reading via
+ *     sb_start_write() in mnt_want_write(). This prevents filesystem freeze
+ *     operations during the modification. Released via sb_end_write() in
+ *     end_creating_path().
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When waiting for parent directory inode lock or delegation break
+ *   desc: The syscall may block waiting for the parent directory's i_rwsem
+ *     lock in start_dirop() using down_write_killable_nested(). If a fatal
+ *     signal is pending, the lock acquisition is aborted and EINTR is returned.
+ *     Additionally, if a delegation exists on the parent directory (NFS lease),
+ *     the syscall blocks in break_deleg_wait() waiting for the delegation
+ *     holder to release it, which is also interruptible by signals.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_CREATE
+ *   target: directory inode and dentry
+ *   desc: Creates a new directory inode and directory entry in the filesystem.
+ *     The inode is allocated by the filesystem's mkdir operation. A dentry
+ *     linking the name to the inode is created and hashed into the dcache.
+ *     The new directory contains entries for "." (itself) and ".." (parent).
+ *     fsnotify_mkdir() is called to notify filesystem monitors of the creation.
+ *   condition: Successful completion
+ *   reversible: yes (via rmdir)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: parent directory inode
+ *   desc: The parent directory's mtime and ctime are updated to reflect the
+ *     creation of a new entry. The parent directory's link count (i_nlink)
+ *     is incremented by one due to the new directory's ".." entry pointing
+ *     back to the parent. The parent directory inode is marked dirty.
+ *   condition: Successful completion
+ *   reversible: no (timestamps cannot be reverted)
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control checks on parent directory
+ *   without: Must have write and execute permission on parent directory
+ *   condition: Checked during inode_permission() on parent directory when
+ *     write permission is required
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass directory search (execute) permission checks
+ *   without: Must have execute permission on each directory in the path
+ *   condition: Checked during path traversal for each directory component
+ *
+ * constraint: LSM security hooks
+ *   desc: Linux Security Modules (SELinux, AppArmor, Smack, TOMOYO, etc.) may
+ *     impose additional restrictions. The security_path_mkdir() hook is called
+ *     before creating the directory (in do_mkdirat), and security_inode_mkdir()
+ *     is called within vfs_mkdir(). These hooks may return errors (typically
+ *     EACCES or EPERM) based on security policy.
+ *
+ * constraint: Filesystem support
+ *   desc: The underlying filesystem must implement the mkdir operation
+ *     (inode_operations->mkdir must not be NULL). Pseudo-filesystems like
+ *     procfs do not support directory creation and return EPERM.
+ *
+ * constraint: Maximum directory link count
+ *   desc: Many filesystems impose a limit on the number of subdirectories a
+ *     directory can contain, stored in sb->s_max_links. For example, ext4
+ *     has a limit of 65000 subdirectories by default. When this limit is
+ *     reached, EMLINK is returned.
+ *
+ * examples: mkdirat(AT_FDCWD, "newdir", 0755);  // Create directory in cwd
+ *   mkdirat(dirfd, "subdir", S_IRWXU | S_IRGRP | S_IXGRP);  // Relative to fd
+ *   mkdirat(AT_FDCWD, "/absolute/path/dir", 0700);  // dfd ignored
+ *
+ * notes: Unlike mknodat(), mkdirat() does not require CAP_MKNOD since
+ *   directories are not special device files. The sticky bit (S_ISVTX) can be
+ *   set on the new directory; when set on a directory, only the owner of a
+ *   file within that directory (or root) can delete or rename the file.
+ *
+ *   The mkdir operation increments the parent directory's link count because
+ *   the new directory's ".." entry creates a hard link back to the parent.
+ *   This is why filesystems have a maximum subdirectory limit.
+ *
+ *   If the parent directory has the set-group-ID (SGID) bit set, the new
+ *   directory may inherit this bit, causing all files and subdirectories
+ *   created within it to also inherit the parent's group. This behavior is
+ *   filesystem-dependent but is standard on most Unix filesystems.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE3(mkdirat, int, dfd, const char __user *, pathname, umode_t, mode)
 {
 	return do_mkdirat(dfd, getname(pathname), mode);
