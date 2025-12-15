@@ -601,6 +601,238 @@ retry:
 	return error;
 }
 
+/**
+ * sys_readlinkat - Read the contents of a symbolic link relative to a directory
+ * @dfd: Base directory file descriptor (or AT_FDCWD for current directory)
+ * @pathname: Path to the symbolic link to read
+ * @buf: User-space buffer to receive the link contents
+ * @bufsiz: Size of the buffer in bytes
+ *
+ * long-desc: Reads the contents of a symbolic link and places them into the
+ *   user-provided buffer. Unlike most path-based operations, readlinkat does
+ *   NOT follow the symbolic link at the end of the path - it reads the link
+ *   itself. The link contents are placed in @buf without a terminating null
+ *   byte. If the link contents are longer than @bufsiz, they are silently
+ *   truncated to @bufsiz bytes.
+ *
+ *   The @pathname is interpreted relative to the directory referred to by
+ *   @dfd. If @pathname is an absolute path (starts with '/'), @dfd is ignored.
+ *   If @dfd is the special value AT_FDCWD (-100), relative paths are
+ *   interpreted relative to the current working directory.
+ *
+ *   Since Linux 2.6.39, @pathname can be an empty string if the LOOKUP_EMPTY
+ *   flag is implicitly enabled (which it is for readlinkat). When @pathname
+ *   is empty, the operation is performed on the symbolic link referred to by
+ *   @dfd itself. In this case, @dfd should have been opened with O_PATH and
+ *   O_NOFOLLOW flags to refer to a symbolic link rather than following it.
+ *
+ *   Some special filesystems (such as AFS mountpoints and certain /proc
+ *   entries) provide a readlink operation even though they are not true
+ *   symbolic links. These are handled by checking if the inode has a
+ *   readlink operation defined.
+ *
+ *   The access time (atime) of the symbolic link is updated upon successful
+ *   read, subject to the usual atime update rules (noatime, relatime, etc.).
+ *
+ *   This syscall is the "at" variant of readlink(2), introduced to enable
+ *   race-free traversal of directory trees and to support virtual per-thread
+ *   working directories.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, the
+ *     special value AT_FDCWD (-100) to indicate the current working directory,
+ *     or (when @pathname is empty) a file descriptor referring to a symbolic
+ *     link opened with O_PATH | O_NOFOLLOW. If @pathname is a relative path
+ *     and @dfd is neither AT_FDCWD nor a valid directory file descriptor,
+ *     EBADF is returned. If @dfd refers to a non-directory file and @pathname
+ *     is a non-empty relative path, ENOTDIR is returned.
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to a null-terminated pathname string in user space.
+ *     May be an empty string, in which case the operation is performed on the
+ *     symbolic link referred to by @dfd (requires @dfd to be a valid file
+ *     descriptor opened with O_PATH | O_NOFOLLOW on a symbolic link). Path
+ *     components are limited to NAME_MAX (255) bytes each, and the total path
+ *     length must not exceed PATH_MAX (4096) bytes including the null
+ *     terminator. The final component must refer to a symbolic link or a
+ *     file with a readlink inode operation. If the pointer is invalid,
+ *     EFAULT is returned.
+ *
+ * param: buf
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to a user-space buffer that will receive the symbolic
+ *     link contents. Must be a valid writable memory region of at least
+ *     @bufsiz bytes. The buffer does NOT receive a null terminator; the
+ *     return value indicates how many bytes were written. If the pointer is
+ *     invalid or the memory is not writable, EFAULT is returned.
+ *
+ * param: bufsiz
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, INT_MAX
+ *   constraint: Size of the buffer @buf in bytes. Must be greater than zero;
+ *     if zero or negative, EINVAL is returned immediately without any other
+ *     checks. If the symbolic link contents exceed @bufsiz bytes, only
+ *     @bufsiz bytes are copied (silent truncation). Applications should
+ *     compare the return value with @bufsiz; if equal, truncation may have
+ *     occurred and a larger buffer should be used. The recommended approach
+ *     is to use lstat(2) to obtain the expected size via st_size, though
+ *     note that /proc and /sys symlinks report st_size as 0.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 1
+ *   desc: On success, returns the number of bytes placed in @buf (not
+ *     including any null terminator, which is NOT appended). This value
+ *     will be at most @bufsiz. If the return value equals @bufsiz, the link
+ *     contents may have been truncated. On error, returns a negative error
+ *     code. Note that a return value of 0 is not possible on success since
+ *     symbolic links cannot have empty content.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned when @bufsiz is less than or equal to zero (checked first
+ *     before any other processing), or when the final path component refers
+ *     to a file that is neither a symbolic link nor has a readlink inode
+ *     operation defined (e.g., a regular file, directory, or device).
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: Returned when @pathname is a relative path and @dfd is neither
+ *     AT_FDCWD nor a valid open file descriptor. The check occurs during
+ *     filename_lookup() when processing the directory component.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: Returned when: (1) a directory component in @pathname does not
+ *     exist; (2) @pathname refers to a dangling symbolic link (a symlink
+ *     in the path prefix, which is followed, points to a nonexistent file);
+ *     (3) @pathname is an empty string and @dfd does not refer to a valid
+ *     file descriptor opened with O_PATH; (4) the empty path special case
+ *     fails during lookup. Note that for the final component being a
+ *     non-symlink, EINVAL is returned instead of ENOENT.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: Returned when a component used as a directory in the path prefix
+ *     of @pathname is not actually a directory, or when @pathname is a
+ *     non-empty relative path and @dfd refers to a file that is not a
+ *     directory.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Returned when search (execute) permission is denied on a directory
+ *     component of @pathname, or when a Linux Security Module (such as
+ *     SELinux, AppArmor, or Smack) denies the readlink operation via the
+ *     security_inode_readlink() hook. The LSM check occurs after the path
+ *     has been resolved but before reading the link contents.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Returned when too many symbolic links were encountered while
+ *     resolving directory components in @pathname. The kernel limit is
+ *     MAXSYMLINKS (40 in a single path resolution, with a maximum nesting
+ *     depth of 8 for traversing symbolic links). Note that this error only
+ *     applies to symlinks in the path prefix; the final component (the
+ *     symlink being read) is never followed.
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: Returned when @pathname exceeds PATH_MAX (4096) bytes, or when a
+ *     single component in the path exceeds NAME_MAX (255) bytes. Checked
+ *     during getname_flags() when copying the pathname from user space.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Returned when kernel memory allocation fails. This can occur
+ *     during pathname allocation in getname_flags() (via __getname() or
+ *     kzalloc()), during dentry allocation in path lookup, or during the
+ *     get_link operation if the filesystem needs to allocate memory to
+ *     retrieve the link target.
+ *
+ * error: EFAULT, Bad address
+ *   desc: Returned when @pathname points outside the accessible address
+ *     space (detected by strncpy_from_user() in getname_flags()), or when
+ *     @buf points to invalid memory that cannot be written to (detected by
+ *     copy_to_user() in readlink_copy()). The check for @buf occurs only
+ *     after successfully resolving the path and reading the link contents.
+ *
+ * error: EIO, Input/output error
+ *   desc: Returned when a low-level I/O error occurs while reading the
+ *     symbolic link contents from the filesystem. This is filesystem-
+ *     dependent and indicates a hardware error or filesystem corruption.
+ *     May be returned by the inode's get_link or readlink operation.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: Returned when the file handle has become stale, typically on NFS
+ *     filesystems when the file has been removed on the server. The syscall
+ *     automatically retries once with LOOKUP_REVAL to force revalidation of
+ *     cached dentries. If the retry also fails with ESTALE, the error is
+ *     returned to user space.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during the fast-path (RCU-walk) portion of
+ *     pathname resolution in filename_lookup(). This allows lock-free
+ *     traversal of the dentry cache. If RCU-walk fails (returns -ECHILD),
+ *     the lookup falls back to reference-counted (ref-walk) mode.
+ *
+ * lock: inode->i_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Briefly acquired in vfs_readlink() when setting the
+ *     IOP_DEFAULT_READLINK flag on an inode that has not been accessed
+ *     via readlink before. This is a one-time initialization per inode
+ *     and the lock is immediately released after setting the flag.
+ *
+ * signal: Any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RESTART
+ *   condition: Waiting during path resolution or filesystem operation
+ *   desc: The syscall may sleep during path resolution (waiting for disk I/O,
+ *     waiting for locks, etc.) and can be interrupted by signals. When a
+ *     signal is pending and the syscall is in a restartable state, it
+ *     returns ERESTARTSYS internally, which the kernel converts to EINTR
+ *     or automatically restarts the syscall depending on the SA_RESTART
+ *     flag in the signal handler configuration.
+ *   error: -ERESTARTSYS
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Symbolic link inode atime
+ *   desc: On successful read of the symbolic link contents, the access time
+ *     (atime) of the symbolic link inode is updated via touch_atime(),
+ *     subject to mount options (noatime, relatime, nodiratime) and
+ *     filesystem capabilities. The atime update may be skipped if the
+ *     filesystem is mounted with noatime or if relatime rules determine
+ *     that an update is not necessary.
+ *   condition: Successful readlink operation
+ *   reversible: no
+ *
+ * examples: readlinkat(AT_FDCWD, "/path/to/symlink", buf, sizeof(buf));
+ *   readlinkat(dirfd, "relative/symlink", buf, sizeof(buf));
+ *   readlinkat(linkfd, "", buf, sizeof(buf));  // read link referred by fd
+ *
+ * notes: The buffer is NOT null-terminated by the kernel. Applications must
+ *   use the return value to determine the length of the link contents and
+ *   add a null terminator if needed. If the return value equals @bufsiz,
+ *   truncation may have occurred; applications should retry with a larger
+ *   buffer. For most filesystems, lstat() returns the expected symlink
+ *   length in st_size, but this is not reliable for /proc and /sys symlinks
+ *   which report st_size as 0. POSIX requires readlinkat but does not
+ *   require support for empty pathname with AT_EMPTY_PATH semantics; this
+ *   is a Linux extension.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE4(readlinkat, int, dfd, const char __user *, pathname,
 		char __user *, buf, int, bufsiz)
 {
