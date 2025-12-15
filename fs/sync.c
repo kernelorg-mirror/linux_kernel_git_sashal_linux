@@ -428,6 +428,275 @@ static int do_fsync(unsigned int fd, int datasync)
 	return vfs_fsync(fd_file(f), datasync);
 }
 
+/**
+ * sys_fsync - Synchronize a file's data and metadata to persistent storage
+ * @fd: File descriptor of the open file to synchronize
+ *
+ * long-desc: Transfers all modified in-core data and metadata for the file
+ *   referred to by the file descriptor fd to the underlying storage device.
+ *   This ensures that the file's contents, along with all metadata necessary
+ *   to retrieve the file (size, timestamps, allocation information), are
+ *   written to persistent storage and will survive a system crash or power
+ *   failure.
+ *
+ *   The syscall performs the following operations in order:
+ *   1. If I_DIRTY_TIME is set and this is not a datasync operation (always
+ *      the case for fsync), marks the inode dirty to ensure timestamps are
+ *      persisted.
+ *   2. Calls the filesystem's fsync callback (file->f_op->fsync) with the
+ *      range 0 to LLONG_MAX (entire file).
+ *   3. The filesystem callback typically writes dirty pages via
+ *      file_write_and_wait_range(), syncs metadata, and issues a storage
+ *      flush/barrier to ensure data reaches persistent media.
+ *
+ *   Unlike fdatasync(2), fsync() always synchronizes all metadata, including
+ *   access and modification timestamps, even if they are not strictly
+ *   necessary for retrieving the file data. This provides the strongest
+ *   durability guarantee.
+ *
+ *   The behavior varies by filesystem type:
+ *   - Regular filesystems (ext4, xfs, btrfs): Full data and metadata sync
+ *     with storage flush/barrier
+ *   - Network filesystems (NFS, CIFS): Commits data to server, may return
+ *     EINTR if interrupted
+ *   - Block devices: Syncs the block device page cache and issues flush
+ *   - Pipes, sockets, FIFOs: Returns EINVAL (no fsync operation)
+ *   - In-memory filesystems (tmpfs, ramfs): Returns 0 immediately (noop)
+ *
+ *   Error Reporting Semantics (Important):
+ *   The error returned by fsync() may reflect errors that occurred during
+ *   earlier write operations on the file. Due to background writeback, write
+ *   errors may not be reported until a subsequent fsync() call. The kernel
+ *   tracks writeback errors per file descriptor using an error sequence
+ *   counter (errseq_t). Each call to fsync() advances this counter and
+ *   returns any errors that occurred since the last fsync() or since the
+ *   file was opened.
+ *
+ *   CAUTION: If multiple file descriptors refer to the same file (via dup()
+ *   or multiple open() calls), an error may be reported to only ONE of the
+ *   descriptors. Applications should either use a single descriptor for sync
+ *   operations or check errors on all descriptors.
+ *
+ *   Storage Cache Considerations:
+ *   This syscall requests the filesystem to issue a cache flush command to
+ *   the storage device. However, whether data actually reaches persistent
+ *   media depends on the device and its configuration:
+ *   - Devices with volatile write cache may not persist data if power is lost
+ *     during the flush (use hdparm -W0 to disable)
+ *   - Battery-backed caches are considered persistent
+ *   - Some filesystems have mount options to control barrier behavior
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid file descriptor for an open file. The file
+ *     must support fsync operations (regular files, block devices, and some
+ *     special files). File must have been opened with at least one of O_RDONLY,
+ *     O_WRONLY, or O_RDWR - the specific access mode does not matter for fsync.
+ *     Using a closed or invalid file descriptor returns EBADF.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating that the file's data and metadata
+ *     have been successfully transferred to persistent storage. Note that some
+ *     filesystems (ramfs, tmpfs) return success immediately without actually
+ *     persisting data, as they are purely in-memory.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The file descriptor fd is not a valid open file descriptor. This
+ *     occurs if fd has never been opened, was already closed, or is outside
+ *     the valid range of file descriptors for the process.
+ *
+ * error: EINVAL, File does not support synchronization
+ *   desc: The file referred to by fd does not support synchronization. This
+ *     happens when the file's underlying filesystem or device does not provide
+ *     an fsync operation (file->f_op->fsync is NULL). Common cases include:
+ *     pipes, FIFOs (named pipes), anonymous sockets, and certain pseudo-files.
+ *     POSIX uses EROFS or EINVAL interchangeably for this condition.
+ *
+ * error: EIO, I/O error during synchronization
+ *   desc: An I/O error occurred while syncing data or metadata. This may
+ *     indicate hardware failure, disconnected storage, or filesystem corruption.
+ *     The error may reflect a previous write() that failed during background
+ *     writeback. After an EIO error, some or all of the file's data may not
+ *     have been persisted. Applications should handle this by retrying or
+ *     failing gracefully. Note that the specific affected data cannot be
+ *     determined from the error.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The filesystem ran out of space while attempting to complete the
+ *     sync operation. This typically occurs when metadata operations (such as
+ *     allocating blocks for data that was written past EOF) require additional
+ *     space that is not available. Can also be reported from delayed allocation
+ *     filesystems when reserved space becomes unavailable.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's disk quota was exceeded during the sync operation. Most
+ *     commonly returned by NFS and other networked filesystems when the server
+ *     enforces quota limits. Can occur for delayed allocations that exceed
+ *     quota at sync time even though the original write appeared to succeed.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: The syscall was interrupted by a signal before completion. This is
+ *     primarily returned by network filesystems (NFS) where the sync involves
+ *     a potentially long RPC operation. Most local filesystems use
+ *     uninterruptible waits and do not return EINTR. When EINTR is returned,
+ *     some data may or may not have been synced - the application should retry.
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: The file resides on a read-only filesystem. While writes to such
+ *     files would normally fail earlier, this can occur if the filesystem
+ *     was remounted read-only after the file was opened for writing, or
+ *     for certain special file types. Some implementations return EINVAL
+ *     instead.
+ *
+ * lock: inode->i_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired briefly in vfs_fsync_range() when checking and clearing
+ *     I_DIRTY_TIME flag before marking the inode dirty. This ensures atomic
+ *     handling of the lazytime state. Also acquired by filesystem callbacks
+ *     when updating inode state during writeback.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by most filesystem fsync implementations (e.g.,
+ *     __generic_file_fsync) to serialize metadata synchronization and
+ *     prevent concurrent modifications during sync. Held for the duration
+ *     of sync_mapping_buffers() and sync_inode_metadata() calls. Some
+ *     filesystems (ext4 with journaling) do not acquire this lock.
+ *
+ * lock: file->f_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired during file_check_and_advance_wb_err() to atomically
+ *     check and advance the file's writeback error sequence number. This
+ *     ensures that concurrent fsync calls on the same file descriptor
+ *     properly serialize error reporting.
+ *
+ * lock: mapping->i_pages (xa_lock)
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The xarray lock protecting the page cache is acquired during
+ *     writeback operations when looking up dirty pages and clearing
+ *     writeback state. Held briefly during page cache manipulation.
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: During network filesystem operations (NFS)
+ *   desc: For network filesystems like NFS, signals can interrupt the RPC
+ *     operations involved in committing data to the server. In this case,
+ *     the syscall returns -EINTR. For local filesystems, the wait for I/O
+ *     completion typically uses TASK_UNINTERRUPTIBLE, making the syscall
+ *     non-interruptible. The process may appear hung if storage is slow
+ *     or unresponsive.
+ *   error: -EINTR
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File data and metadata on storage device
+ *   desc: Writes all dirty pages belonging to the file's address space to
+ *     the backing storage device. For regular files, this includes file
+ *     contents that have been modified since the last sync. Metadata changes
+ *     (inode information: size, timestamps, permissions, ownership, extended
+ *     attributes) are also written. For journaling filesystems, this may
+ *     involve journal commits.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_HARDWARE
+ *   target: Storage device write cache
+ *   desc: Issues a cache flush command (FUA or explicit flush) to the
+ *     underlying storage device to ensure data in the device's volatile
+ *     write cache is committed to persistent media. This is critical for
+ *     data durability guarantees. The exact mechanism depends on the
+ *     filesystem and device (blkdev_issue_flush, REQ_FUA, etc.).
+ *   condition: Only if filesystem enables barriers/flushes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File writeback error tracking (file->f_wb_err)
+ *   desc: Advances the file descriptor's writeback error cursor
+ *     (file->f_wb_err) to match the current mapping error sequence
+ *     (mapping->wb_err). This marks any pending errors as "seen" so they
+ *     are reported exactly once to userspace. Also clears the AS_EIO and
+ *     AS_ENOSPC flags on the address space for legacy compatibility.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode dirty state (I_DIRTY_TIME, I_DIRTY_SYNC)
+ *   desc: If the inode has I_DIRTY_TIME set (lazy timestamps), the fsync
+ *     operation clears this flag and sets I_DIRTY_SYNC to ensure timestamps
+ *     are written to disk. This transitions the inode from lazytime state
+ *     to regular dirty state for proper synchronization.
+ *   condition: Only if inode has I_DIRTY_TIME set
+ *   reversible: yes (subsequent file operations will re-dirty timestamps)
+ *
+ * constraint: File type restrictions
+ *   desc: Only files with an fsync file operation callback can be synced.
+ *     Regular files, directories, block devices, and character devices with
+ *     fsync support can be synchronized. Pipes, sockets, and FIFOs return
+ *     EINVAL as they have no persistent storage backing.
+ *
+ * constraint: Per-file-descriptor error reporting
+ *   desc: Writeback errors are tracked per file descriptor, not per file.
+ *     Each file descriptor maintains its own error sequence cursor. An error
+ *     will only be reported once, to the first file descriptor that calls
+ *     fsync() after the error occurs. Applications that open the same file
+ *     multiple times must check all file descriptors for errors.
+ *
+ * constraint: Write ordering
+ *   desc: fsync() provides ordering guarantees only for the specific file
+ *     being synced. Data written to other files or the same file through
+ *     different descriptors may not be ordered with respect to this sync.
+ *     For directory entry durability (making sure a newly created file
+ *     survives a crash), an fsync on the parent directory is also required.
+ *
+ * examples: fsync(fd);  // Sync file data and metadata to disk
+ *   ret = fsync(fd); if (ret) { perror("fsync"); }  // With error checking
+ *
+ * notes: fsync vs fdatasync: fsync() synchronizes all metadata including
+ *   timestamps, while fdatasync() only synchronizes metadata necessary
+ *   for data retrieval (size, allocation). fdatasync() may be faster for
+ *   applications that don't need timestamp durability.
+ *
+ *   Directory fsync: To ensure a newly created file (via create/link/rename)
+ *   survives a crash, applications must fsync both the file AND its parent
+ *   directory. The file's fsync ensures the data is written; the directory
+ *   fsync ensures the directory entry pointing to the file is written.
+ *
+ *   Historical note: Early Linux implementations (pre-2.6) had various bugs
+ *   and inconsistencies in fsync behavior. The current implementation was
+ *   significantly improved around the 2.6.17 timeframe and again in 4.18
+ *   with better error reporting (errseq_t infrastructure).
+ *
+ *   PostgreSQL fsync surprise (LWN 2018): A notable issue was discovered
+ *   where errors during background writeback could be lost if no file
+ *   descriptor had called fsync() recently. Modern kernels (4.18+) track
+ *   errors per-file-descriptor to improve error reporting reliability.
+ *
+ *   O_SYNC/O_DSYNC files: For files opened with O_SYNC or O_DSYNC, each
+ *   write() already provides synchronization guarantees, so fsync() may
+ *   not perform additional I/O beyond verifying any pending errors.
+ *
+ *   NFS considerations: NFS fsync() actually sends a COMMIT RPC to the
+ *   server, which can take significantly longer than local fsync and
+ *   may return EINTR if interrupted. Server-side errors (quota exceeded,
+ *   no space) are reported through this mechanism.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(fsync, unsigned int, fd)
 {
 	return do_fsync(fd, 0);
