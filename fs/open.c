@@ -1769,6 +1769,309 @@ SYSCALL_DEFINE4(fchmodat2, int, dfd, const char __user *, filename,
 	return do_fchmodat(dfd, filename, mode, flags);
 }
 
+/**
+ * sys_fchmodat - Change file permissions relative to a directory file descriptor
+ * @dfd: Directory file descriptor or AT_FDCWD for current working directory
+ * @filename: Pathname of the file whose permissions are to be changed
+ * @mode: New permission bits to set on the file
+ *
+ * long-desc: Changes the permission bits of the file specified by @filename
+ *   relative to the directory referred to by @dfd. If @filename is relative
+ *   (does not start with '/'), it is interpreted relative to the directory
+ *   referred to by @dfd. If @dfd is the special value AT_FDCWD, the path is
+ *   interpreted relative to the current working directory. If @filename is
+ *   absolute, @dfd is ignored.
+ *
+ *   The new permissions are specified in @mode and include the permission bits
+ *   (S_IRWXU, S_IRWXG, S_IRWXO) and special bits (S_ISUID, S_ISGID, S_ISVTX).
+ *   Only the bits covered by S_IALLUGO (07777 octal) are used; other bits in
+ *   @mode are ignored. The file's existing mode bits outside S_IALLUGO are
+ *   preserved.
+ *
+ *   Unlike fchmodat2(), this syscall does NOT accept a flags parameter and
+ *   ALWAYS follows symbolic links. To change permissions on a symbolic link
+ *   itself (which is not meaningful on Linux as symlink modes are ignored),
+ *   use fchmodat2() with AT_SYMLINK_NOFOLLOW. However, Linux returns -EOPNOTSUPP
+ *   for attempts to change symbolic link modes.
+ *
+ *   Permission requirements: The effective UID of the calling process must
+ *   match the owner of the file, or the caller must have CAP_FOWNER capability
+ *   in a user namespace with the file owner UID mapped. Root (CAP_FOWNER) can
+ *   change permissions of any file.
+ *
+ *   The set-group-ID bit (S_ISGID) is automatically cleared from @mode if the
+ *   caller is not the file owner or root AND the caller is not in the file's
+ *   group (and doesn't have CAP_FSETID). This prevents privilege escalation.
+ *
+ *   On network filesystems (NFS), if the file has been deleted or renamed on
+ *   the server (stale file handle), the syscall automatically retries once
+ *   with path revalidation before returning -ESTALE.
+ *
+ *   If the file has an NFS delegation held by another client, the kernel will
+ *   break the delegation and wait for the client to release it before
+ *   proceeding. This wait is interruptible by signals.
+ *
+ *   POSIX.1-2001 and POSIX.1-2008 compliant. Available since Linux 2.6.16.
+ *   The glibc wrapper function provides the POSIX-defined interface with a
+ *   flags argument, but the underlying kernel syscall does not have flags.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid directory file descriptor, the special value
+ *     AT_FDCWD (-100) for current working directory, or ignored if @filename
+ *     is an absolute path. When not AT_FDCWD and @filename is relative, @dfd
+ *     must refer to a directory (not a regular file or other file type).
+ *     O_PATH file descriptors are accepted if they refer to a directory.
+ *
+ * param: filename
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to a null-terminated
+ *     pathname string. Maximum path length is PATH_MAX (4096) bytes including
+ *     the null terminator. If relative, resolved from @dfd or cwd. Empty
+ *     string is not allowed (returns -ENOENT) as this syscall doesn't support
+ *     AT_EMPTY_PATH flag (use fchmodat2 for that).
+ *
+ * param: mode
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: S_ISUID | S_ISGID | S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO
+ *   constraint: Permission bits to set. Only the bits in S_IALLUGO (07777)
+ *     are used; other bits are silently ignored. Common values include:
+ *     S_IRWXU (0700) owner read/write/execute, S_IRWXG (0070) group r/w/x,
+ *     S_IRWXO (0007) other r/w/x, S_ISUID (04000) set-user-ID, S_ISGID (02000)
+ *     set-group-ID, S_ISVTX (01000) sticky bit. All combinations are valid.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *     The permission change is atomic with respect to other filesystem
+ *     operations on the same inode.
+ *
+ * error: ENOENT, File does not exist
+ *   desc: The file specified by @filename does not exist, or @filename is
+ *     an empty string (empty paths not supported without AT_EMPTY_PATH flag).
+ *     Also returned if a path component does not exist.
+ *
+ * error: EACCES, Permission denied for path traversal
+ *   desc: Search permission is denied on a component of the path prefix.
+ *     The calling process lacks execute (search) permission on a directory
+ *     in the path leading to the target file.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: @dfd is neither AT_FDCWD nor a valid file descriptor, or @dfd is
+ *     a valid file descriptor but does not refer to a directory when
+ *     @filename is a relative path.
+ *
+ * error: EFAULT, Bad address
+ *   desc: @filename points outside the process's accessible address space.
+ *     The kernel was unable to copy the pathname from user space.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The limit is typically MAXSYMLINKS (40) to prevent infinite loops.
+ *
+ * error: ENAMETOOLONG, Filename too long
+ *   desc: @filename or one of its path components exceeds the length limit.
+ *     PATH_MAX is 4096 bytes; individual components are limited to NAME_MAX
+ *     (typically 255 bytes).
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @filename is not actually a
+ *     directory, or @dfd refers to a non-directory file and @filename is
+ *     relative.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to complete the path lookup operation
+ *     or allocate internal structures. This is a transient error.
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: The file resides on a read-only filesystem. This includes
+ *     filesystems mounted read-only and filesystems that have been remounted
+ *     read-only due to errors (errors=remount-ro mount option).
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The effective UID of the calling process does not match the owner
+ *     of the file and the process does not have the CAP_FOWNER capability.
+ *     Also returned if the file has the immutable attribute set (chattr +i)
+ *     or the append-only attribute set (chattr +a), as mode changes are
+ *     blocked on such files regardless of ownership.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: Attempting to change the mode of a symbolic link. Linux does not
+ *     support changing the mode of symbolic links as their permissions are
+ *     not used during permission checking. This was historically inconsistent
+ *     across filesystems; as of Linux 6.6, it is uniformly blocked in the VFS.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from or writing to the
+ *     filesystem. This typically indicates hardware failure, network issues
+ *     on remote filesystems, or filesystem corruption.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle has become stale, typically on NFS when the file
+ *     was deleted or renamed on the server. The syscall automatically retries
+ *     once with path revalidation; this error is returned only if the retry
+ *     also fails.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The syscall was interrupted by a signal while waiting for the
+ *     inode lock or for an NFS delegation to be released. The operation
+ *     was not completed and can be retried. Since Linux 6.15, the inode
+ *     lock wait is killable (responds to fatal signals).
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired exclusively via inode_lock_killable() before modifying the
+ *     inode's mode. This serializes permission changes with other operations
+ *     that modify or depend on file attributes. The lock is held while calling
+ *     security hooks and the filesystem's setattr operation. Released before
+ *     waiting for delegation break and before return.
+ *
+ * lock: sb_writers (SB_FREEZE_WRITE level)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired via mnt_want_write() which calls sb_start_write() to
+ *     prevent filesystem freeze during the operation. This is a per-superblock
+ *     percpu read-write semaphore. Released via mnt_drop_write() after the
+ *     mode change completes.
+ *
+ * signal: fatal_signals
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for the inode lock
+ *   desc: Since Linux 6.15, inode_lock_killable() is used which allows fatal
+ *     signals (SIGKILL, SIGTERM, etc.) to interrupt the wait for the inode
+ *     lock. If interrupted, the syscall returns -EINTR (translated from
+ *     -ERESTARTSYS).
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * signal: any_signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for NFS delegation break
+ *   desc: When the file has an NFSv4 delegation held by another client, the
+ *     kernel must break the delegation and wait for acknowledgment. This wait
+ *     via break_deleg_wait() is interruptible by any signal. If interrupted,
+ *     returns -EINTR.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_MODIFY_STATE
+ *   target: File inode mode bits
+ *   desc: On success, the file's permission bits (i_mode & S_IALLUGO) are
+ *     changed to the value specified in @mode. The file type bits and other
+ *     flags in i_mode are preserved. This change is persisted to storage
+ *     synchronously or asynchronously depending on filesystem mount options.
+ *   condition: Operation succeeds (returns 0)
+ *   reversible: yes (via another chmod call)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode ctime
+ *   desc: The inode's change time (ctime) is updated to the current time
+ *     to reflect the metadata modification. This occurs even if the new
+ *     mode is identical to the old mode.
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: S_NOSEC inode flag
+ *   desc: If the new mode includes set-user-ID (S_ISUID) or set-group-ID
+ *     (S_ISGID) bits, the S_NOSEC flag is cleared from i_flags. This flag
+ *     is an optimization hint indicating the file needs no security checks
+ *     for clearing setuid/setgid on write; setting suid/sgid invalidates it.
+ *   condition: When S_ISUID or S_ISGID is set in @mode
+ *   reversible: no (automatically managed by kernel)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   desc: On successful completion, fsnotify_change() is called to generate
+ *     inotify IN_ATTRIB and fanotify FAN_ATTRIB events, notifying watchers
+ *     of the attribute change.
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass the permission check requiring the caller to be the file
+ *     owner. With CAP_FOWNER, the caller can change permissions on any file
+ *     accessible through the filesystem hierarchy.
+ *   without: The effective UID must match the file owner UID. Non-owners
+ *     without this capability receive -EPERM.
+ *   condition: Checked in inode_owner_or_capable() during setattr_prepare()
+ *     which is called from filesystem setattr handlers.
+ *
+ * capability: CAP_FSETID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Preserve the set-group-ID bit when changing mode, even if the
+ *     caller is not a member of the file's group.
+ *   without: The S_ISGID bit in @mode is automatically cleared if the caller
+ *     does not own the file and is not a member of the file's group. This
+ *     prevents non-group-members from creating set-group-ID executables.
+ *   condition: Checked in setattr_prepare() via in_group_or_capable().
+ *
+ * constraint: Immutable and Append-only Files
+ *   desc: Files with the immutable attribute (FS_IMMUTABLE_FL, set via
+ *     chattr +i) or append-only attribute (FS_APPEND_FL, set via chattr +a)
+ *     cannot have their mode changed. These attributes must be removed first
+ *     by the file owner or root using chattr.
+ *   expr: !(inode->i_flags & (S_IMMUTABLE | S_APPEND))
+ *
+ * constraint: Filesystem Must Be Mounted Writable
+ *   desc: The filesystem containing the file must be mounted read-write.
+ *     Files on read-only filesystems or filesystems that have been emergency
+ *     remounted read-only cannot have their permissions changed.
+ *
+ * constraint: Symbolic Links Cannot Be Changed
+ *   desc: Linux does not allow changing the mode of symbolic links. The
+ *     permission bits of symbolic links are ignored during access checks
+ *     (symlinks always show lrwxrwxrwx in ls). Attempting to chmod a symlink
+ *     returns -EOPNOTSUPP. This is enforced uniformly in the VFS since
+ *     Linux 6.6.
+ *
+ * constraint: LSM Hooks
+ *   desc: Linux Security Module hooks security_path_chmod() and
+ *     security_inode_setattr() are called and may deny the operation based
+ *     on security policy (SELinux, AppArmor, TOMOYO, etc.). The exact errors
+ *     depend on the LSM configuration.
+ *
+ * examples: fchmodat(AT_FDCWD, "file.txt", 0644);  // rw-r--r--
+ *   fchmodat(dirfd, "script.sh", 0755);  // rwxr-xr-x
+ *   fchmodat(AT_FDCWD, "/etc/shadow", 0600);  // rw------- (requires root)
+ *   fchmodat(dirfd, "data", S_IRUSR | S_IWUSR | S_IRGRP);  // rw-r-----
+ *
+ * notes: This syscall does not accept a flags parameter. The glibc wrapper
+ *   fchmodat() provides POSIX-compliant behavior by accepting a flags argument
+ *   but historically implemented AT_SYMLINK_NOFOLLOW in userspace using
+ *   workarounds. As of Linux 6.6, use fchmodat2() for flag support including
+ *   AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH.
+ *
+ *   On NFS, permission changes may not take effect immediately due to
+ *   attribute caching. The server is authoritative for permission checks.
+ *
+ *   Changing permissions on files in /proc, /sys, or other pseudo-filesystems
+ *   may silently fail or have no persistent effect, depending on the specific
+ *   filesystem implementation.
+ *
+ *   For the fchmodat2() variant with flags support, see the separate
+ *   specification above. For operating on open file descriptors, use fchmod().
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename,
 		umode_t, mode)
 {
