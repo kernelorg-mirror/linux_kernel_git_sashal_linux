@@ -580,6 +580,382 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
 	return -ENOIOCTLCMD;
 }
 
+/**
+ * sys_ioctl - Control device parameters and perform device-specific operations
+ * @fd: File descriptor to operate on
+ * @cmd: Device-specific request code encoding operation type and parameters
+ * @arg: Optional argument, interpretation depends on @cmd
+ *
+ * long-desc: The ioctl syscall is a general-purpose interface for performing
+ *   device-specific or file-specific operations that do not fit into the
+ *   standard UNIX I/O model. It acts as a multiplexer, dispatching requests
+ *   to appropriate handlers based on the file type and command code.
+ *
+ *   The @cmd parameter encodes the operation to perform using a conventional
+ *   32-bit structure: 2 bits for direction (none/read/write/read-write),
+ *   14 bits for argument size, 8 bits for type (magic number), and 8 bits
+ *   for serial number. Macros _IO(), _IOR(), _IOW(), and _IOWR() in
+ *   <asm/ioctl.h> construct these codes, though many legacy codes do not
+ *   follow this convention.
+ *
+ *   The syscall first invokes the LSM security hook security_file_ioctl()
+ *   which may deny the operation based on security policy (e.g., SELinux,
+ *   AppArmor). If permitted, do_vfs_ioctl() handles common VFS-level
+ *   commands. For unrecognized commands, vfs_ioctl() invokes the
+ *   file_operations->unlocked_ioctl callback, allowing device drivers and
+ *   filesystems to implement custom operations.
+ *
+ *   Common VFS-level ioctls handled by the kernel include:
+ *   - FIOCLEX/FIONCLEX: Set/clear close-on-exec flag on the file descriptor
+ *   - FIONBIO: Set/clear non-blocking I/O mode (O_NONBLOCK)
+ *   - FIOASYNC: Enable/disable async notification (FASYNC)
+ *   - FIOQSIZE: Get file size in bytes (regular files, directories, symlinks)
+ *   - FIONREAD: Get bytes available for reading
+ *   - FIFREEZE/FITHAW: Freeze/thaw filesystem for consistent snapshots
+ *   - FIGETBSZ: Get filesystem block size
+ *   - FICLONE/FICLONERANGE: Clone file data (copy-on-write)
+ *   - FIDEDUPERANGE: Deduplicate identical file ranges
+ *   - FS_IOC_FIEMAP: Get file extent map for files
+ *   - FS_IOC_GETFLAGS/SETFLAGS: Get/set inode flags (immutable, append, etc.)
+ *   - FS_IOC_FSGETXATTR/FSSETXATTR: Get/set extended attributes (XFS-style)
+ *   - FS_IOC_GETFSUUID: Get filesystem UUID
+ *   - FS_IOC_GETFSSYSFSPATH: Get sysfs path for filesystem
+ *
+ *   For regular files, additional ioctls are handled:
+ *   - FIBMAP: Map logical to physical block number (requires CAP_SYS_RAWIO)
+ *   - FS_IOC_RESVSP/RESVSP64: Reserve disk space (preallocation)
+ *   - FS_IOC_UNRESVSP/UNRESVSP64: Unreserve disk space (punch hole)
+ *   - FS_IOC_ZERO_RANGE: Zero a range of the file
+ *
+ *   The behavior and return value semantics are entirely command-dependent.
+ *   Some commands return 0 on success, others return positive values as
+ *   output (e.g., FIONREAD returns the number of available bytes). The @arg
+ *   parameter may be an integer value, a pointer to a user-space structure,
+ *   or unused, depending on the specific command.
+ *
+ *   Historically, ioctl has been described as an "uncontrolled entry point"
+ *   into the kernel due to the difficulty of auditing the vast number of
+ *   device-specific implementations. Security modules must handle the
+ *   complexity of ioctl command spaces. New code should prefer dedicated
+ *   syscalls, netlink, or configfs when possible.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid, open file descriptor. The descriptor type
+ *     (regular file, directory, block device, character device, socket, pipe,
+ *     etc.) determines which ioctl commands are available. Some commands work
+ *     only on specific file types; using an inappropriate command returns ENOTTY.
+ *
+ * param: cmd
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: The ioctl command code. Valid commands depend on the file type
+ *     underlying @fd. Commands are encoded using _IO/_IOR/_IOW/_IOWR macros or
+ *     legacy fixed values. The kernel does not validate the command before
+ *     dispatch; invalid commands return ENOTTY from the final handler.
+ *     Commands are typically defined in UAPI headers such as <linux/fs.h>,
+ *     <asm/ioctls.h>, <linux/termios.h>, and device-specific headers.
+ *
+ * param: arg
+ *   type: KAPI_TYPE_ULONG
+ *   flags: KAPI_PARAM_INOUT
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation is entirely command-dependent. May be: (1) an
+ *     integer value passed directly, (2) a pointer to a user-space input
+ *     structure, (3) a pointer to a user-space output buffer, (4) a pointer
+ *     to an input/output structure, or (5) ignored (for commands taking no
+ *     argument). When a pointer, must reference accessible user memory of
+ *     appropriate size for the command. NULL pointers cause EFAULT for
+ *     commands expecting valid pointers.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: >= 0
+ *   desc: Return value semantics are command-dependent. Most commands return
+ *     0 on success. Some return positive values as output (e.g., FIONREAD
+ *     returns bytes available). Device-specific ioctls may use return values
+ *     as output parameters. On error, returns a negative errno value.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The @fd argument is not a valid open file descriptor. This is
+ *     checked first via fd_empty() after obtaining the file reference using
+ *     the CLASS(fd, f) RAII wrapper which calls fdget().
+ *
+ * error: ENOTTY, Inappropriate ioctl for device
+ *   desc: The @cmd is not recognized or not applicable to the object that @fd
+ *     refers to. This is the catch-all error for unsupported commands. Occurs
+ *     when: (1) the file's f_op->unlocked_ioctl is NULL, (2) the driver/fs
+ *     ioctl handler returns -ENOIOCTLCMD (converted to -ENOTTY), or (3) the
+ *     command requires a specific file type (e.g., FIOQSIZE on a socket).
+ *     Legacy code may also return EINVAL for unrecognized commands.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @arg pointer (when interpreted as an address) points to memory
+ *     that is not accessible. Returned by copy_from_user(), copy_to_user(),
+ *     get_user(), or put_user() when they fail. Also returned if a structure
+ *     embedded pointer (e.g., in FIDEDUPERANGE) is invalid.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The @cmd or @arg contains invalid data. Common causes: (1) negative
+ *     block number for FIBMAP, (2) invalid whence value in preallocation,
+ *     (3) reserved fields not zeroed in structures (FIDEDUPERANGE),
+ *     (4) invalid flags in FS_IOC_SETFLAGS, (5) filesystem doesn't have a
+ *     block size (FIGETBSZ), (6) source not a regular file (FIDEDUPERANGE).
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The operation requires a privilege the caller lacks. Causes:
+ *     (1) FIBMAP requires CAP_SYS_RAWIO, (2) FIFREEZE/FITHAW require
+ *     CAP_SYS_ADMIN in the filesystem's user namespace, (3) FS_IOC_SETFLAGS
+ *     changing IMMUTABLE or APPEND flags requires CAP_LINUX_IMMUTABLE,
+ *     (4) FIDEDUPERANGE requires write permission or ownership or CAP_SYS_ADMIN,
+ *     (5) FS_IOC_FSSETXATTR requires inode ownership or appropriate capability.
+ *     Also returned by LSM security_file_ioctl() hook denials.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The operation is recognized but not implemented by this file/device.
+ *     Causes: (1) FS_IOC_FIEMAP on inode without i_op->fiemap callback,
+ *     (2) FIFREEZE on filesystem without freeze_fs or freeze_super ops,
+ *     (3) FICLONE/FIDEDUPERANGE on filesystem without remap_file_range,
+ *     (4) invalid xflags in FS_IOC_FSSETXATTR.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel memory allocation failed during the operation. Can occur in
+ *     FIDEDUPERANGE when allocating the file_dedupe_range structure via
+ *     memdup_user(), or in various filesystem-specific ioctl handlers.
+ *
+ * error: EBUSY, Resource busy
+ *   desc: The resource is temporarily unavailable. FIFREEZE returns this if
+ *     the filesystem is already frozen (and nesting is not allowed). Also
+ *     returned by some filesystems if the operation conflicts with ongoing
+ *     activity.
+ *
+ * error: EXDEV, Cross-device link
+ *   desc: FICLONE, FICLONERANGE, or FIDEDUPERANGE attempted to operate across
+ *     different filesystems. Both source and destination files must reside
+ *     on the same superblock for reflink/dedupe operations.
+ *
+ * error: EISDIR, Is a directory
+ *   desc: The operation is not valid on directories. FIDEDUPERANGE returns
+ *     this if the destination file descriptor refers to a directory. Clone
+ *     and dedupe operations work only on regular files.
+ *
+ * error: ERANGE, Result too large
+ *   desc: FIBMAP returns this when the mapped block number exceeds INT_MAX,
+ *     as the result must fit in an int. Large files on filesystems with
+ *     large block addresses may trigger this.
+ *
+ * error: EFBIG, File too big
+ *   desc: FS_IOC_FIEMAP returns this if the requested start offset exceeds
+ *     the filesystem's maximum file size (s_maxbytes). Also possible from
+ *     preallocation ioctls if the resulting file would exceed limits.
+ *
+ * error: EBADR, Invalid request descriptor
+ *   desc: FS_IOC_FIEMAP returns this if unsupported flags are passed in the
+ *     fiemap.fm_flags field. Only FIEMAP_FLAG_SYNC and filesystem-supported
+ *     flags are permitted.
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: Write operations (FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR, preallocation,
+ *     clone, dedupe) attempted on a read-only filesystem. Returned by
+ *     mnt_want_write_file() checks.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by set_close_on_exec() for FIOCLEX and FIONCLEX commands
+ *     to safely modify the close-on-exec flag in the file descriptor table.
+ *   condition: Only for FIOCLEX/FIONCLEX commands
+ *
+ * lock: filp->f_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by ioctl_fionbio() when modifying filp->f_flags for the
+ *     FIONBIO command. Protects concurrent access to file status flags.
+ *   condition: Only for FIONBIO command
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by vfs_fileattr_set() (via inode_lock) for FS_IOC_SETFLAGS
+ *     and FS_IOC_FSSETXATTR to serialize attribute modifications. Also
+ *     acquired by various other commands that modify inode state.
+ *   condition: For commands modifying inode attributes
+ *
+ * lock: sb->s_umount
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired exclusively by freeze_super() for FIFREEZE and
+ *     thaw_super() for FITHAW. Prevents concurrent mount/unmount operations
+ *     and other freeze/thaw requests during filesystem freeze transitions.
+ *   condition: Only for FIFREEZE/FITHAW commands
+ *
+ * lock: file_start_write/file_end_write
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: true
+ *   released: true
+ *   desc: sb_start_write()/sb_end_write() protection acquired via
+ *     file_start_write() for write operations like FICLONE, FICLONERANGE,
+ *     and preallocation ioctls. Prevents freeze during write operations.
+ *   condition: For commands that modify file data
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked in filesystem operations
+ *   desc: Many ioctl operations can sleep waiting for I/O or locks. Most
+ *     filesystem operations are interruptible by fatal signals. The exact
+ *     signal handling depends on the specific command and filesystem
+ *     implementation. Some operations use interruptible waits and can
+ *     return -EINTR or -ERESTARTSYS.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_BLOCKING
+ *   restartable: command-dependent
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File descriptor flags
+ *   desc: FIOCLEX sets and FIONCLEX clears the close-on-exec flag (FD_CLOEXEC)
+ *     for the file descriptor @fd. This flag is per-descriptor, not per-file.
+ *   condition: FIOCLEX or FIONCLEX command
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File status flags (O_NONBLOCK)
+ *   desc: FIONBIO modifies the O_NONBLOCK flag on the file based on the
+ *     integer value pointed to by @arg. Non-zero sets non-blocking mode,
+ *     zero clears it. Affects all processes sharing this file description.
+ *   condition: FIONBIO command with valid int pointer at @arg
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File async notification (FASYNC flag)
+ *   desc: FIOASYNC enables or disables SIGIO/SIGURG delivery when I/O becomes
+ *     possible. Calls the file's fasync() operation to register or unregister
+ *     the async notification. Modifies filp->f_flags FASYNC bit.
+ *   condition: FIOASYNC command with file supporting fasync
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Filesystem state
+ *   desc: FIFREEZE freezes the filesystem, blocking all writes and flushing
+ *     dirty data for a consistent snapshot. FITHAW reverses this, allowing
+ *     writes to resume. The filesystem remains frozen until all freeze holders
+ *     (userspace and kernel) have released it.
+ *   condition: FIFREEZE or FITHAW command with appropriate privilege
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File data and metadata
+ *   desc: FICLONE, FICLONERANGE create copy-on-write clones of file data.
+ *     FS_IOC_RESVSP/UNRESVSP modify file preallocation. FS_IOC_ZERO_RANGE
+ *     zeroes file content. These operations modify file data, metadata, and
+ *     potentially allocate or free disk blocks.
+ *   condition: Clone/preallocation commands on supporting filesystems
+ *   reversible: partially
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode flags and attributes
+ *   desc: FS_IOC_SETFLAGS modifies inode flags (FS_IMMUTABLE_FL, FS_APPEND_FL,
+ *     FS_NODUMP_FL, etc.). FS_IOC_FSSETXATTR modifies extended attributes
+ *     including project ID, extent size hints, and xflags.
+ *   condition: Flag/attribute modification commands
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_RAWIO
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Use of FIBMAP ioctl to query physical block mapping
+ *   without: FIBMAP returns -EPERM
+ *   condition: FIBMAP command
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Filesystem freeze (FIFREEZE) and thaw (FITHAW) operations
+ *   without: FIFREEZE/FITHAW return -EPERM
+ *   condition: FIFREEZE or FITHAW command; checked in fs user namespace
+ *
+ * capability: CAP_LINUX_IMMUTABLE
+ *   type: KAPI_CAP_OVERRIDE_RESTRICTION
+ *   allows: Changing immutable (FS_IMMUTABLE_FL) and append-only (FS_APPEND_FL)
+ *     inode flags via FS_IOC_SETFLAGS or FS_IOC_FSSETXATTR
+ *   without: Cannot modify immutable/append-only flags; returns -EPERM
+ *   condition: FS_IOC_SETFLAGS or FS_IOC_FSSETXATTR changing protected flags
+ *
+ * constraint: LSM Security Hooks
+ *   desc: security_file_ioctl() is invoked before any command processing,
+ *     allowing SELinux, AppArmor, Smack, or other LSMs to deny the operation.
+ *     Each LSM may have different policies for different ioctl commands.
+ *     The @arg parameter is passed to the hook but should not be dereferenced
+ *     as it may be an integer rather than a pointer.
+ *
+ * constraint: File Type Restrictions
+ *   desc: Many commands are restricted to specific file types. FIBMAP and
+ *     preallocation work only on regular files. FIOQSIZE works on regular
+ *     files, directories, and symlinks. FIFREEZE/FITHAW work on any file
+ *     on a freezable filesystem. Clone and dedupe work only on regular files.
+ *     Using a command on an unsupported file type returns ENOTTY or EINVAL.
+ *
+ * constraint: Read-Only Mount
+ *   desc: Operations that modify file content or metadata (FS_IOC_SETFLAGS,
+ *     FS_IOC_FSSETXATTR, preallocation, clone, dedupe) fail with EROFS on
+ *     read-only mounted filesystems. This is checked via mnt_want_write_file().
+ *
+ * constraint: Command-Specific Structure Layout
+ *   desc: Many commands expect @arg to point to specific structures with
+ *     particular layouts and alignment. Structure definitions are in UAPI
+ *     headers and may differ between 32-bit and 64-bit userspace. The compat
+ *     ioctl handler (compat_sys_ioctl) handles some translations.
+ *
+ * examples: ioctl(fd, FIOCLEX);  // Set close-on-exec
+ *   int nb = 1; ioctl(fd, FIONBIO, &nb);  // Enable non-blocking I/O
+ *   int avail; ioctl(fd, FIONREAD, &avail);  // Get bytes available
+ *   ioctl(fd, FIFREEZE);  // Freeze filesystem (requires CAP_SYS_ADMIN)
+ *   ioctl(destfd, FICLONE, srcfd);  // Clone file via reflink
+ *
+ * notes: The ioctl() interface predates POSIX and is not standardized,
+ *   though individual commands may have POSIX equivalents (e.g., FIONREAD
+ *   approximates what poll() provides differently).
+ *
+ *   ioctl commands are inherently device and filesystem-specific. The VFS
+ *   layer handles only generic file operations; all other commands are
+ *   dispatched to the file's f_op->unlocked_ioctl or f_op->compat_ioctl.
+ *   There are thousands of ioctl commands defined across the kernel for
+ *   block devices, character devices, network interfaces, TTYs, etc.
+ *
+ *   32-bit compatibility: The compat_sys_ioctl() entry point handles 32-bit
+ *   processes on 64-bit kernels. It translates some common commands and
+ *   delegates to f_op->compat_ioctl for device-specific translation.
+ *   Structures passed via @arg may have different layouts (alignment, size)
+ *   between 32 and 64-bit userspace.
+ *
+ *   Security considerations: ioctl has historically been a source of kernel
+ *   vulnerabilities due to: (1) the vast number of implementations across
+ *   drivers, (2) complex structure handling with user pointers, (3) lack of
+ *   centralized validation. New driver code should carefully validate all
+ *   inputs, use copy_from_user/copy_to_user safely, and avoid embedding
+ *   user pointers in structures where possible.
+ *
+ *   The -ENOIOCTLCMD return value is internal to the kernel and converted
+ *   to -ENOTTY before returning to userspace. Drivers should return
+ *   -ENOIOCTLCMD for unrecognized commands to allow fallback handling,
+ *   or -ENOTTY to definitively reject the command.
+ *
+ *   Restartability: Whether an ioctl is automatically restarted after signal
+ *   interruption depends on the specific implementation and SA_RESTART flag.
+ *   Most VFS-level ioctls complete quickly and are not interruptible.
+ *   Device-specific ioctls that block may be interruptible.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
 {
 	CLASS(fd, f)(fd);
