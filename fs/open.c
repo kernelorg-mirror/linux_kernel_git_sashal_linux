@@ -2193,6 +2193,355 @@ out:
 	return error;
 }
 
+/**
+ * sys_fchownat - change file ownership relative to a directory file descriptor
+ * @dfd: directory file descriptor for relative path resolution
+ * @filename: pathname of the file to change ownership
+ * @user: new owner user ID, or (uid_t)-1 to leave unchanged
+ * @group: new owner group ID, or (gid_t)-1 to leave unchanged
+ * @flag: flags controlling pathname resolution (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH)
+ *
+ * long-desc: Changes the owner and/or group of the file specified by @filename.
+ *   This syscall is part of the \*at() family introduced in Linux 2.6.16 to
+ *   enable race-free directory traversal and per-thread working directories.
+ *
+ *   Path resolution: If @filename is a relative path (does not start with '/'),
+ *   it is interpreted relative to the directory referred to by @dfd. If @dfd is
+ *   the special value AT_FDCWD, the path is interpreted relative to the current
+ *   working directory. If @filename is an absolute path, @dfd is ignored.
+ *
+ *   The @user and @group parameters specify the new owner and group. Passing
+ *   the special value (uid_t)-1 for @user or (gid_t)-1 for @group leaves that
+ *   attribute unchanged. This allows changing only the owner or only the group.
+ *
+ *   Flag handling: The @flag parameter controls pathname resolution:
+ *   - AT_SYMLINK_NOFOLLOW (0x100): Do not dereference symbolic links. Operate
+ *     on the symbolic link itself rather than the file it points to. This is
+ *     equivalent to the lchown() syscall behavior.
+ *   - AT_EMPTY_PATH (0x1000): If @filename is an empty string, operate on the
+ *     file referred to by @dfd. This allows changing ownership of a file
+ *     identified by an open file descriptor without needing the path.
+ *
+ *   Permission requirements: Only privileged processes (those with CAP_CHOWN in
+ *   a user namespace where the file's uid/gid are mapped) can change a file's
+ *   owner to an arbitrary value. Unprivileged users can only change the group
+ *   of files they own to a group they are a member of.
+ *
+ *   Setuid/setgid handling: When ownership is changed by a non-privileged user,
+ *   the set-user-ID and set-group-ID bits are automatically cleared from
+ *   regular files to prevent security issues. The kernel also clears file
+ *   capabilities (via ATTR_KILL_PRIV) on ownership changes for non-directories.
+ *
+ *   For network filesystems (NFS), if the file has been deleted or renamed on
+ *   the server (stale file handle), the syscall automatically retries once with
+ *   path revalidation before returning -ESTALE. If the file has an NFS delegation
+ *   held by another client, the kernel will break the delegation and wait for
+ *   the client to release it before proceeding.
+ *
+ *   POSIX.1-2008 compliant. The uid_t and gid_t parameters are 32-bit unsigned
+ *   integers with (uid_t)-1 and (gid_t)-1 having special "no change" meaning.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid directory file descriptor, the special value
+ *     AT_FDCWD (-100) for current working directory, or ignored if @filename
+ *     is an absolute path. When not AT_FDCWD and @filename is relative, @dfd
+ *     must refer to a directory (not a regular file or other file type).
+ *     O_PATH file descriptors are accepted if they refer to a directory.
+ *     With AT_EMPTY_PATH flag and empty @filename, @dfd can refer to any
+ *     file type and identifies the target file directly.
+ *
+ * param: filename
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to a null-terminated
+ *     pathname string. Maximum path length is PATH_MAX (4096) bytes including
+ *     the null terminator. If relative, resolved from @dfd or cwd. Empty
+ *     string is only allowed when AT_EMPTY_PATH flag is set; otherwise returns
+ *     -ENOENT. With AT_EMPTY_PATH, empty string causes operation on the file
+ *     referred to by @dfd.
+ *
+ * param: user
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: New owner user ID, or the special value (uid_t)-1 (0xFFFFFFFF)
+ *     to leave the owner unchanged. The uid must be valid in the caller's user
+ *     namespace and must map to a valid uid in the filesystem's user namespace.
+ *     Changing to an arbitrary uid requires CAP_CHOWN capability.
+ *
+ * param: group
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: New owner group ID, or the special value (gid_t)-1 (0xFFFFFFFF)
+ *     to leave the group unchanged. The gid must be valid in the caller's user
+ *     namespace and must map to a valid gid in the filesystem's user namespace.
+ *     Unprivileged users can only change to a group they are a member of.
+ *
+ * param: flag
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH
+ *   constraint: Bitwise OR of flags controlling pathname resolution. Zero for
+ *     default behavior (follow symlinks, non-empty path required). Invalid flag
+ *     combinations return -EINVAL. AT_SYMLINK_NOFOLLOW (0x100) prevents symlink
+ *     dereferencing; AT_EMPTY_PATH (0x1000) allows empty @filename with @dfd
+ *     identifying the target.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *     The ownership change is atomic with respect to other filesystem
+ *     operations on the same inode.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flag argument contains bits other than AT_SYMLINK_NOFOLLOW and
+ *     AT_EMPTY_PATH. Also returned if @user or @group cannot be converted to
+ *     a valid kernel uid/gid (invalid in caller's user namespace).
+ *
+ * error: ENOENT, File does not exist
+ *   desc: The file specified by @filename does not exist, or @filename is an
+ *     empty string and AT_EMPTY_PATH flag was not specified. Also returned if
+ *     a path component does not exist.
+ *
+ * error: EACCES, Permission denied for path traversal
+ *   desc: Search permission is denied on a component of the path prefix.
+ *     The calling process lacks execute (search) permission on a directory
+ *     in the path leading to the target file.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: @dfd is neither AT_FDCWD nor a valid file descriptor, or @dfd is
+ *     a valid file descriptor but does not refer to a directory when
+ *     @filename is a non-empty relative path.
+ *
+ * error: EFAULT, Bad address
+ *   desc: @filename points outside the process's accessible address space.
+ *     The kernel was unable to copy the pathname from user space.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The limit is typically MAXSYMLINKS (40) to prevent infinite loops.
+ *     Not returned when AT_SYMLINK_NOFOLLOW is set (symlinks not followed).
+ *
+ * error: ENAMETOOLONG, Filename too long
+ *   desc: @filename or one of its path components exceeds the length limit.
+ *     PATH_MAX is 4096 bytes; individual components are limited to NAME_MAX
+ *     (typically 255 bytes).
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @filename is not actually a
+ *     directory, or @dfd refers to a non-directory file and @filename is
+ *     a non-empty relative path.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to complete the path lookup operation
+ *     or allocate internal structures. This is a transient error.
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: The file resides on a read-only filesystem. This includes
+ *     filesystems mounted read-only and filesystems that have been remounted
+ *     read-only due to errors (errors=remount-ro mount option).
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The calling process does not have permission to change ownership.
+ *     This occurs when: (1) changing uid without CAP_CHOWN and not the file
+ *     owner changing to same uid, (2) changing gid without CAP_CHOWN and the
+ *     caller is not the file owner or not a member of the target group,
+ *     (3) the file has the immutable (chattr +i) or append-only (chattr +a)
+ *     attribute set.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The @user or @group value cannot be represented in the target
+ *     filesystem's user namespace. This occurs when the uid/gid mapping
+ *     doesn't exist between the mount's idmap and the filesystem's user
+ *     namespace. Also returned if the file's current uid/gid is unmapped
+ *     and is not being changed to a valid value.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from or writing to the
+ *     filesystem. This typically indicates hardware failure, network issues
+ *     on remote filesystems, or filesystem corruption.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle has become stale, typically on NFS when the file
+ *     was deleted or renamed on the server. The syscall automatically retries
+ *     once with path revalidation; this error is returned only if the retry
+ *     also fails.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The syscall was interrupted by a signal while waiting for the
+ *     inode lock or for an NFS delegation to be released. The operation
+ *     was not completed and can be retried.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired exclusively via inode_lock_killable() before modifying the
+ *     inode's ownership. This serializes ownership changes with other operations
+ *     that modify or depend on file attributes. The lock is held while calling
+ *     security hooks, clearing setuid/setgid bits, and the filesystem's setattr
+ *     operation. Released before waiting for delegation break and before return.
+ *
+ * lock: sb_writers (SB_FREEZE_WRITE level)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired via mnt_want_write() which calls sb_start_write() to
+ *     prevent filesystem freeze during the operation. This is a per-superblock
+ *     percpu read-write semaphore. Released via mnt_drop_write() after the
+ *     ownership change completes.
+ *
+ * signal: fatal_signals
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for the inode lock
+ *   desc: The inode_lock_killable() function allows fatal signals (SIGKILL,
+ *     SIGTERM, etc.) to interrupt the wait for the inode lock. If interrupted,
+ *     the syscall returns -EINTR (translated from -ERESTARTSYS).
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * signal: any_signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for NFS delegation break
+ *   desc: When the file has an NFSv4 delegation held by another client, the
+ *     kernel must break the delegation and wait for acknowledgment. This wait
+ *     via break_deleg_wait() is interruptible by any signal. If interrupted,
+ *     returns -EINTR.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_MODIFY_STATE
+ *   target: File inode uid/gid
+ *   desc: On success, the file's owner (i_uid) and/or group (i_gid) are changed
+ *     to the values specified in @user and @group (unless -1 was passed for
+ *     either). This change is persisted to storage synchronously or
+ *     asynchronously depending on filesystem mount options.
+ *   condition: Operation succeeds and @user/@group are not -1
+ *   reversible: yes (via another chown call)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode ctime
+ *   desc: The inode's change time (ctime) is updated to the current time to
+ *     reflect the metadata modification. This occurs even if @user and @group
+ *     are both -1 (no actual ownership change).
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Set-user-ID and set-group-ID bits
+ *   desc: For non-directory files, the set-user-ID (S_ISUID) bit is always
+ *     cleared on ownership change. The set-group-ID (S_ISGID) bit is cleared
+ *     if the file is group-executable and the caller lacks CAP_FSETID, or if
+ *     the file is not group-executable and the caller is not in the file's
+ *     group. This prevents security issues with setuid/setgid executables
+ *     after ownership changes.
+ *   condition: For regular files when ownership changes
+ *   reversible: yes (via chmod)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File capabilities (security.capability xattr)
+ *   desc: File capabilities are cleared via ATTR_KILL_PRIV mechanism when
+ *     ownership changes on non-directory files. This is handled by the
+ *     security_inode_killpriv() hook which removes the security.capability
+ *     extended attribute.
+ *   condition: For non-directory files with file capabilities
+ *   reversible: no (capabilities must be re-set manually)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   desc: On successful completion, fsnotify_change() is called to generate
+ *     inotify IN_ATTRIB and fanotify FAN_ATTRIB events, notifying watchers
+ *     of the attribute change.
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * capability: CAP_CHOWN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Change the owner (uid) of any file to any value. Change the group
+ *     (gid) of any file to any value. Without this capability, users can only
+ *     change ownership in limited ways.
+ *   without: Users can only: (1) keep the current uid unchanged, (2) change
+ *     the gid of files they own to a group they are a member of. Attempting
+ *     to change uid or change gid to a non-member group returns -EPERM.
+ *   condition: Checked in chown_ok() and chgrp_ok() via capable_wrt_inode_uidgid()
+ *     during setattr_prepare(). The capability must be effective in a user
+ *     namespace where the file's uid/gid are mapped.
+ *
+ * capability: CAP_FSETID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Preserve set-group-ID bit on ownership change when the caller is
+ *     not a member of the file's new group.
+ *   without: The S_ISGID bit is cleared if the file is group-executable and
+ *     the caller is not in the file's group, preventing creation of setgid
+ *     executables with unexpected group ownership.
+ *   condition: Checked via capable() in setattr_should_drop_suidgid() and
+ *     in_group_or_capable() during attribute copying.
+ *
+ * constraint: Immutable and Append-only Files
+ *   desc: Files with the immutable attribute (FS_IMMUTABLE_FL, set via
+ *     chattr +i) or append-only attribute (FS_APPEND_FL, set via chattr +a)
+ *     cannot have their ownership changed. These attributes must be removed
+ *     first by root using chattr.
+ *   expr: !(inode->i_flags & (S_IMMUTABLE | S_APPEND))
+ *
+ * constraint: Filesystem Must Be Mounted Writable
+ *   desc: The filesystem containing the file must be mounted read-write.
+ *     Files on read-only filesystems or filesystems that have been emergency
+ *     remounted read-only cannot have their ownership changed.
+ *
+ * constraint: UID/GID Namespace Mapping
+ *   desc: The @user and @group values must be valid in the caller's user
+ *     namespace and must map to valid values in the filesystem's user namespace.
+ *     On idmapped mounts, the mount's idmap is also applied. Invalid or unmapped
+ *     IDs result in -EINVAL or -EOVERFLOW.
+ *
+ * constraint: LSM Hooks
+ *   desc: Linux Security Module hooks security_path_chown() and
+ *     security_inode_setattr() are called and may deny the operation based
+ *     on security policy (SELinux, AppArmor, TOMOYO, etc.). The exact errors
+ *     depend on the LSM configuration.
+ *
+ * examples: fchownat(AT_FDCWD, "file.txt", 1000, 1000, 0);  // Change owner and group
+ *   fchownat(dirfd, "file", 0, -1, 0);  // Change owner to root, keep group
+ *   fchownat(AT_FDCWD, "link", 1000, 1000, AT_SYMLINK_NOFOLLOW);  // chown symlink
+ *   fchownat(fd, "", 1000, 1000, AT_EMPTY_PATH);  // chown file referred to by fd
+ *   fchownat(AT_FDCWD, "/abs/path", -1, 100, 0);  // Change group only
+ *
+ * notes: The chown() syscall is equivalent to fchownat(AT_FDCWD, path, uid, gid, 0).
+ *   The lchown() syscall is equivalent to fchownat(AT_FDCWD, path, uid, gid,
+ *   AT_SYMLINK_NOFOLLOW). The fchown() syscall operates on an open file descriptor
+ *   directly without path resolution.
+ *
+ *   On NFS, ownership changes may be subject to root squashing where the server
+ *   maps root operations to an unprivileged user. This can cause unexpected
+ *   permission denials.
+ *
+ *   Changing ownership of symbolic links via AT_SYMLINK_NOFOLLOW is allowed but
+ *   may have no practical effect on some filesystems where symbolic link
+ *   ownership is not stored or used.
+ *
+ *   The special values (uid_t)-1 and (gid_t)-1 are 0xFFFFFFFF. These are
+ *   distinct from uid/gid 65534 which is often used for "nobody".
+ *
+ *   For files with POSIX ACLs, ownership changes may affect the interpretation
+ *   of ACL entries and could require ACL updates for proper access control.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
 		gid_t, group, int, flag)
 {
