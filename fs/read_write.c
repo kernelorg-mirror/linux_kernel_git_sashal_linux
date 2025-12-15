@@ -3648,6 +3648,455 @@ SYSCALL_DEFINE6(preadv2, unsigned long, fd, const struct iovec __user *, vec,
 	return do_preadv(fd, vec, vlen, pos, flags);
 }
 
+/**
+ * sys_pwritev - Write data from multiple buffers to a file at a given offset
+ * @fd: File descriptor to write to
+ * @vec: Pointer to array of iovec structures describing source buffers
+ * @vlen: Number of iovec structures in the array
+ * @pos_l: Low 32 bits of the file offset at which to begin writing
+ * @pos_h: High 32 bits of the file offset (combined with pos_l for 64-bit offset)
+ *
+ * long-desc: Performs positioned gather output by writing data from multiple
+ *   buffers specified by the iovec array vec to the file descriptor fd at the
+ *   specified offset. This syscall combines the functionality of pwrite(2)
+ *   (positioned write) and writev(2) (gather I/O), allowing vectored I/O at an
+ *   explicit file position.
+ *
+ *   The file offset argument is split into two 32-bit parts (pos_l and pos_h)
+ *   which are combined to form a 64-bit offset: ((pos_h << 32) | pos_l) on
+ *   64-bit architectures, or ((pos_h << HALF_LONG_BITS) << HALF_LONG_BITS) | pos_l
+ *   on 32-bit architectures. This encoding allows 64-bit offsets to be passed
+ *   through the syscall interface on all architectures.
+ *
+ *   The buffers are processed in array order: vec[0] is completely written
+ *   before vec[1], and so on. Each iovec structure specifies a base address
+ *   (iov_base) and length (iov_len) for one buffer. The data transfer is atomic
+ *   with respect to other processes: the data written appears as a contiguous
+ *   block that is not intermingled with writes from other processes.
+ *
+ *   Unlike writev(), pwritev() does NOT update the file offset (f_pos). The
+ *   write occurs at the specified position, and the current file position
+ *   remains unchanged. This makes pwritev() inherently thread-safe: multiple
+ *   threads can write to different positions in the same file descriptor
+ *   concurrently without interfering with each other.
+ *
+ *   The file referred to by fd must support positioned writes (FMODE_PWRITE
+ *   flag). Regular files, block devices, and most character devices support
+ *   this. Pipes, FIFOs, sockets, and terminals do NOT support positioned writes
+ *   and return ESPIPE. For such files, use writev() instead.
+ *
+ *   On Linux, pwritev() transfers at most MAX_RW_COUNT (approximately 2GB minus
+ *   one page) bytes per call, regardless of the total length specified in the
+ *   iovec array. Individual iov_len values are clamped to ensure the total
+ *   does not exceed this limit. This is transparent to the caller.
+ *
+ *   The number of bytes written may be less than the total requested if disk
+ *   space runs out, a resource limit is reached, the write was interrupted
+ *   by a signal after some data was transferred, or the underlying file type
+ *   does not guarantee full writes.
+ *
+ *   pwritev() was introduced in Linux 2.6.30 and is not part of POSIX, though
+ *   it is available on BSD systems. For additional per-operation control flags,
+ *   use pwritev2() which extends pwritev() with a flags argument.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Must be a valid, open file descriptor with write permission.
+ *     The file must have been opened with O_WRONLY or O_RDWR. Additionally,
+ *     the file must support positioned writes (FMODE_PWRITE flag set). Regular
+ *     files and block devices support positioned writes; pipes, FIFOs, sockets,
+ *     and terminals do not. File descriptors opened with O_RDONLY, O_PATH, or
+ *     that have been closed return EBADF. Standard file descriptors 0 (stdin),
+ *     1 (stdout), 2 (stderr) are valid if open and writable, though stdout may
+ *     not support pwritev if connected to a terminal or pipe. AT_FDCWD and other
+ *     special directory values are not valid. Despite being unsigned long,
+ *     values > INT_MAX may fail fdget().
+ *
+ * param: vec
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, readable user-space array of struct
+ *     iovec containing vlen elements. Each iovec structure contains:
+ *     - iov_base: pointer to a readable user-space buffer containing data
+ *     - iov_len: size of the buffer (must be non-negative when cast to ssize_t)
+ *     NULL is valid only when vlen is 0 (returns 0 immediately). Each iov_base
+ *     must pass access_ok() validation; invalid addresses return EFAULT.
+ *     On compat syscalls (32-bit process on 64-bit kernel), the iovec structure
+ *     uses compat_uptr_t and compat_size_t for its members.
+ *
+ * param: vlen
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UIO_MAXIOV
+ *   constraint: Number of iovec structures in vec array. Must be <= UIO_MAXIOV
+ *     (1024); values > 1024 return EINVAL. A value of 0 returns 0 immediately
+ *     without writing any data or accessing the file (but fd must still be
+ *     valid). For vlen <= UIO_FASTIOV (8), the iovec array is copied to a
+ *     stack buffer; larger arrays require heap allocation which may fail with
+ *     ENOMEM under memory pressure.
+ *
+ * param: pos_l
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Low bits of the 64-bit file offset. On 64-bit systems, this is
+ *     the lower half of the 64-bit offset (bits 0-31). On 32-bit systems with
+ *     HALF_LONG_BITS=16, this is the lower 32 bits. Combined with pos_h to form
+ *     the complete offset. When the combined offset is negative, EINVAL is
+ *     returned.
+ *
+ * param: pos_h
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: High bits of the 64-bit file offset. On 64-bit systems, this is
+ *     the upper half of the 64-bit offset (bits 32-63). On 32-bit systems, this
+ *     is shifted by HALF_LONG_BITS twice. The combined offset (pos_h, pos_l)
+ *     must result in a non-negative loff_t value; if the combined value is
+ *     negative when interpreted as a signed 64-bit integer, EINVAL is returned.
+ *     For most use cases, pos_h should be 0 unless writing beyond 4GB offset.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes written (non-negative). Zero
+ *     indicates that either no data was available to write, the total iov_len
+ *     was 0, vlen was 0, or RLIMIT_FSIZE was reached at the current position.
+ *     The return value may be less than the total requested if disk space runs
+ *     out, resource limits are hit, a non-blocking operation would block, or a
+ *     signal interrupts after partial write. Partial writes are not errors; the
+ *     caller should retry with adjusted buffers. On error, returns a negative
+ *     error code.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid file descriptor, or fd was not opened for writing.
+ *     This includes file descriptors opened with O_RDONLY, O_PATH, or file
+ *     descriptors that have been closed. Also returned if the file structure
+ *     does not have FMODE_WRITE set.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) The combined offset (pos_l, pos_h)
+ *     results in a negative value. (2) vlen exceeds UIO_MAXIOV (1024).
+ *     (3) An iov_len value, when cast to ssize_t, is negative (indicating the
+ *     user passed an excessively large unsigned value). (4) The file does not
+ *     support writing (FMODE_CAN_WRITE not set). (5) The file was opened with
+ *     O_DIRECT and alignment requirements are not met. (6) The position plus
+ *     total count would overflow for files without unsigned offset support.
+ *
+ * error: ESPIPE, Illegal seek
+ *   desc: The file descriptor refers to a file type that does not support
+ *     positioned writes (FMODE_PWRITE flag not set). This includes pipes, FIFOs,
+ *     sockets, and terminal devices. Use writev() instead for these file types.
+ *     This error is checked early, before any buffer validation.
+ *
+ * error: EFAULT, Bad address
+ *   desc: vec points outside the accessible address space, or one of the
+ *     iov_base pointers in the iovec array points to invalid memory. The
+ *     validation occurs via access_ok() in import_iovec() before any write
+ *     operation. Can also occur if copy_from_user() fails when reading the
+ *     iovec array itself, or copy_from_user() fails during data transfer.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed when vlen > UIO_FASTIOV (8). For small
+ *     iovec arrays (<= 8 elements), a stack-allocated buffer is used, avoiding
+ *     this error. Larger arrays require kmalloc_array() which can fail under
+ *     memory pressure. Can also occur during page cache allocation for
+ *     buffered writes.
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: The file position plus total count would exceed LLONG_MAX, causing
+ *     arithmetic overflow. This is checked in rw_verify_area() before the write
+ *     begins. For files without FOP_UNSIGNED_OFFSET, this also applies if the
+ *     position alone would cause issues.
+ *
+ * error: EFBIG, File too large
+ *   desc: An attempt was made to write at a position that exceeds the
+ *     implementation-defined maximum file size (s_maxbytes), the process's file
+ *     size limit (RLIMIT_FSIZE), or MAX_NON_LFS for files not opened with
+ *     O_LARGEFILE. When RLIMIT_FSIZE is exceeded, SIGXFSZ is sent before
+ *     returning this error.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The device containing the file has no room for the data. For regular
+ *     files, this indicates the filesystem is full. For tmpfs/ramfs, this
+ *     indicates memory exhaustion. Partial writes may have occurred before
+ *     hitting this condition; check the return value.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's disk quota for the filesystem has been exhausted. This
+ *     can occur even if the filesystem has free space. Quota limits are
+ *     per-user or per-group depending on filesystem configuration.
+ *
+ * error: EPIPE, Broken pipe
+ *   desc: fd refers to a pipe or socket whose reading end has been closed.
+ *     When this occurs, SIGPIPE is also sent to the calling process unless
+ *     SIGPIPE is blocked. Note that pwritev() cannot be used on pipes (returns
+ *     ESPIPE), so this error is primarily relevant when the underlying VFS
+ *     layer reports it for special files.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: fd refers to a file (device, network filesystem) that is marked
+ *     non-blocking (O_NONBLOCK) and the write would block because the output
+ *     buffer is full or the resource is temporarily unavailable. Equivalent
+ *     to EWOULDBLOCK. The application should retry later or use select/poll/
+ *     epoll to wait for write availability.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The call was interrupted by a signal before any data was written.
+ *     This only occurs if no data has been transferred; if some data was
+ *     written before the signal, the call returns the number of bytes written.
+ *     The caller should typically check for this error and restart the write.
+ *
+ * error: EIO, Input/output error
+ *   desc: A low-level I/O error occurred while modifying the inode or writing
+ *     data. For regular files, this typically indicates a hardware error on the
+ *     storage device, filesystem corruption, or network filesystem timeout.
+ *     Some data may have been written before the error occurred.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The filesystem containing the file is mounted read-only. This can
+ *     happen if the filesystem was remounted read-only after the file was
+ *     opened, or for inherently read-only filesystems.
+ *
+ * error: ETXTBSY, Text file busy
+ *   desc: An attempt was made to write to a file that is currently being used
+ *     as a swap file. This is a specialized check to prevent corruption of
+ *     active swap space.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The security subsystem (LSM such as SELinux or AppArmor) denied
+ *     the write operation via security_file_permission(). This can occur even
+ *     if the file was successfully opened, as LSM policies may enforce per-
+ *     operation checks. The specific policy that denied access may be logged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned in several cases: (1) fanotify permission events when a
+ *     user-space listener denies the write via fsnotify_file_area_perm().
+ *     (2) Attempting to write to a file with the immutable attribute (chattr +i).
+ *     (3) Writing to a file sealed with F_SEAL_WRITE or F_SEAL_FUTURE_WRITE.
+ *
+ * error: ERESTARTSYS, Restart system call (internal)
+ *   desc: Internal error code indicating the syscall should be restarted. This
+ *     is typically translated to EINTR if SA_RESTART is not set on the signal
+ *     handler, or the syscall is transparently restarted if SA_RESTART is set.
+ *     User space should not see this error code directly.
+ *
+ * lock: sb_writers (freeze protection)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: conditional
+ *   released: true
+ *   desc: For regular files, file_start_write() acquires the superblock's write
+ *     freeze protection (SB_FREEZE_WRITE level) via sb_start_write(). This
+ *     prevents the filesystem from being frozen while a write is in progress.
+ *     Released by file_end_write() after the write completes. Not acquired for
+ *     non-regular files (pipes, sockets, devices, directories).
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's write_iter method typically acquires the inode's
+ *     i_rwsem for exclusive access during writes. For generic_file_write_iter(),
+ *     this is acquired via inode_lock(). Provides serialization against other
+ *     writes and certain reads (e.g., direct I/O). Some filesystems may use
+ *     different locking strategies.
+ *
+ * lock: Filesystem-specific locks
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's write_iter or write method may acquire additional
+ *     locks. For ext4, the i_data_sem may be acquired for extent manipulation.
+ *     For btrfs, extent locks and tree locks are used. These locks are internal
+ *     to the file operation and released before return.
+ *
+ * lock: RCU read-side
+ *   type: KAPI_LOCK_RCU
+ *   acquired: conditional
+ *   released: true
+ *   desc: Used during file descriptor lookup via fdget() (called through the
+ *     CLASS(fd, f) macro). RCU read lock protects access to the file descriptor
+ *     table. Released by fdput() at the end of the CLASS scope.
+ *
+ * signal: SIGXFSZ
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: When write would exceed RLIMIT_FSIZE
+ *   desc: If the write would cause the file to exceed the process's file size
+ *     limit (RLIMIT_FSIZE), the kernel sends SIGXFSZ to the process before
+ *     returning EFBIG. The default action is to terminate the process. If the
+ *     signal is caught or ignored, the syscall returns EFBIG.
+ *   timing: KAPI_SIGNAL_TIME_BEFORE
+ *
+ * signal: Any signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked waiting for buffer space or locks
+ *   desc: The syscall may be interrupted by signals while waiting for buffer
+ *     space, waiting for locks, or during slow I/O. If interrupted before any
+ *     data is written, returns -EINTR or -ERESTARTSYS. If data has already
+ *     been written, returns the number of bytes written instead of an error.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode timestamps (mtime, ctime)
+ *   condition: When write succeeds and modifies file content
+ *   desc: Updates the file's modification time (mtime) and change time (ctime)
+ *     via file_update_time(). The update may be delayed by lazytime mount
+ *     option or filesystem-specific behaviors.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode SUID/SGID bits
+ *   condition: When writing to a setuid/setgid file by non-root
+ *   desc: For security, writing to a file clears its setuid bit and (if the
+ *     writer is not in the file's group) the setgid bit via file_remove_privs().
+ *     This prevents creating setuid/setgid executables through modification.
+ *     The check uses dentry_needs_remove_privs() and notify_change().
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task I/O accounting
+ *   condition: Always (after write attempt)
+ *   desc: Updates the current task's I/O accounting statistics. The wchar field
+ *     (write characters) is incremented by bytes written via add_wchar(). The
+ *     syscw field (syscall write count) is incremented via inc_syscw(). These
+ *     statistics are visible in /proc/[pid]/io. Updated regardless of success
+ *     or failure (syscw always incremented, wchar only on successful writes).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   condition: When write returns > 0
+ *   desc: Generates an FS_MODIFY fsnotify event via fsnotify_modify() allowing
+ *     inotify, fanotify, and dnotify watchers to be notified of the write. This
+ *     occurs after data transfer completes successfully.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: file content and size
+ *   condition: When write succeeds
+ *   desc: The file's content is modified with the data from the iovec buffers
+ *     at the specified position. If writing beyond the current end-of-file,
+ *     the file size is extended. For buffered I/O, data may be written to page
+ *     cache first and flushed later. For O_DIRECT or O_SYNC files, data is
+ *     written synchronously.
+ *   reversible: no
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control on write permission
+ *   without: Standard DAC checks are enforced
+ *   condition: Checked via security_file_permission() during rw_verify_area()
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass permission checks for file modification operations
+ *   without: Must be file owner for certain operations
+ *   condition: Checked when clearing SUID/SGID bits via file_remove_privs()
+ *
+ * constraint: UIO_MAXIOV limit
+ *   desc: The vlen parameter must not exceed UIO_MAXIOV (1024). This limit is
+ *     defined by POSIX (IOV_MAX) and prevents excessive memory allocation for
+ *     the iovec array. Historical Linux kernels (2.0) had a limit of 16.
+ *   expr: vlen <= 1024
+ *
+ * constraint: MAX_RW_COUNT limit
+ *   desc: The total bytes to write (sum of all iov_len values) is clamped to
+ *     MAX_RW_COUNT (INT_MAX & PAGE_MASK, approximately 2GB minus one page) to
+ *     prevent integer overflow in internal calculations. This is transparent
+ *     to the caller; individual iov_len values are truncated as needed.
+ *   expr: actual_total = min(sum(iov_len), MAX_RW_COUNT)
+ *
+ * constraint: RLIMIT_FSIZE limit
+ *   desc: The write is limited by the process's soft RLIMIT_FSIZE resource
+ *     limit. If the position plus bytes to write exceeds this limit, the write
+ *     is truncated to the limit boundary and SIGXFSZ may be sent. If the
+ *     position already exceeds the limit, EFBIG is returned immediately with
+ *     SIGXFSZ sent.
+ *   expr: pos + count <= rlimit(RLIMIT_FSIZE) || rlimit(RLIMIT_FSIZE) == RLIM_INFINITY
+ *
+ * constraint: File must be open for writing
+ *   desc: The file descriptor must have been opened with O_WRONLY or O_RDWR.
+ *     Files opened with O_RDONLY or O_PATH cannot be written and return EBADF.
+ *     The file must have both FMODE_WRITE and FMODE_CAN_WRITE flags set.
+ *   expr: (file->f_mode & FMODE_WRITE) && (file->f_mode & FMODE_CAN_WRITE)
+ *
+ * constraint: File must support positioned writes
+ *   desc: The file must have FMODE_PWRITE flag set, indicating it supports
+ *     writing at arbitrary positions. Regular files and block devices have
+ *     this flag set by default. Pipes, FIFOs, sockets, and terminals do not.
+ *     Some device drivers may or may not support positioned writes.
+ *   expr: file->f_mode & FMODE_PWRITE
+ *
+ * constraint: Non-negative position
+ *   desc: The combined file offset (pos_h << 32 | pos_l) must be non-negative
+ *     when interpreted as a signed 64-bit integer (loff_t). Negative offsets
+ *     are invalid and return EINVAL.
+ *   expr: pos >= 0
+ *
+ * examples: n = pwritev(fd, iov, 3, 4096);  // Write at offset 4096 from 3 buffers
+ *   struct iovec iov[2] = {{header, hdr_len}, {payload, payload_len}};
+ *   n = pwritev(fd, iov, 2, record_offset);  // Write record at specific offset
+ *   n = pwritev(fd, iov, iovcnt, pos_l, pos_h);  // 64-bit offset via split args
+ *
+ * notes: pwritev() is particularly useful in multi-threaded applications where
+ *   multiple threads need to write to different positions in the same file
+ *   without interfering with each other. Unlike writev() followed by lseek(),
+ *   pwritev() is atomic with respect to the file position.
+ *
+ *   Key differences from writev():
+ *   - Does NOT update the file position (f_pos) - the specified offset is used
+ *   - Requires the file to support positioned writes (FMODE_PWRITE)
+ *   - No f_pos_lock contention between concurrent pwritev() calls
+ *
+ *   Common use cases include:
+ *
+ *   - Database systems: Writing records at known offsets without position
+ *     tracking, enabling concurrent writes from multiple threads
+ *
+ *   - Parallel file processing: Multiple threads writing different regions
+ *     of a file simultaneously
+ *
+ *   - Log file management: Writing log entries at specific positions for
+ *     circular buffers or structured logs
+ *
+ *   - File format construction: Writing headers, metadata, and data sections
+ *     at their designated offsets
+ *
+ *   The split offset encoding (pos_l, pos_h) is necessary because some 32-bit
+ *   architectures (MIPS, PARISC, ARM, PowerPC) require 64-bit arguments to be
+ *   passed in aligned register pairs. The glibc wrapper typically handles this
+ *   encoding transparently, providing a single off_t parameter to applications.
+ *
+ *   For per-call behavior modifications (e.g., RWF_DSYNC for data sync,
+ *   RWF_SYNC for full sync, RWF_APPEND, RWF_NOWAIT for non-blocking attempts,
+ *   RWF_ATOMIC for atomic writes), use pwritev2() which adds a flags parameter.
+ *   Note that pwritev2() with a position of -1 falls back to writev() semantics
+ *   (using and updating the current file position).
+ *
+ *   Unlike pwrite(), which writes from a single buffer, pwritev() can write
+ *   from multiple non-contiguous buffers atomically, making it ideal for
+ *   writing structured data with separate header and payload regions.
+ *
+ *   Unlike writev(), pwritev() does not acquire the f_pos_lock mutex because
+ *   it does not access or modify the file position. This reduces contention
+ *   in multithreaded scenarios.
+ *
+ * since-version: 2.6.30
+ */
 SYSCALL_DEFINE5(pwritev, unsigned long, fd, const struct iovec __user *, vec,
 		unsigned long, vlen, unsigned long, pos_l, unsigned long, pos_h)
 {
