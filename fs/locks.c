@@ -2169,19 +2169,268 @@ int locks_lock_inode_wait(struct inode *inode, struct file_lock *fl)
 EXPORT_SYMBOL(locks_lock_inode_wait);
 
 /**
- *	sys_flock: - flock() system call.
- *	@fd: the file descriptor to lock.
- *	@cmd: the type of lock to apply.
+ * sys_flock - Apply or remove an advisory lock on an open file
+ * @fd: File descriptor referring to the file to lock
+ * @cmd: Lock operation to perform (LOCK_SH, LOCK_EX, LOCK_UN, optionally ORed
+ *   with LOCK_NB)
  *
- *	Apply a %FL_FLOCK style lock to an open file descriptor.
- *	The @cmd can be one of:
+ * long-desc: Applies or removes an advisory BSD-style lock on the file
+ *   referred to by file descriptor @fd. Advisory locks are cooperative: they
+ *   do not prevent other processes from reading or writing the file, but
+ *   only prevent other cooperating processes from acquiring conflicting locks.
  *
- *	- %LOCK_SH -- a shared lock.
- *	- %LOCK_EX -- an exclusive lock.
- *	- %LOCK_UN -- remove an existing lock.
- *	- %LOCK_MAND -- a 'mandatory' flock. (DEPRECATED)
+ *   Flock locks are associated with open file descriptions (struct file), not
+ *   file descriptors or processes. This has several important implications:
+ *   (1) If a file descriptor is duplicated via dup(), dup2(), fork(), or
+ *   fcntl(F_DUPFD), all the duplicates refer to the same lock. (2) The lock
+ *   is released either by an explicit LOCK_UN operation on any of these
+ *   duplicate descriptors, or when all file descriptors referring to the
+ *   open file description are closed. (3) A process may hold only one type
+ *   of lock (shared or exclusive) on a file via the same open file
+ *   description; subsequent flock() calls convert the lock type.
  *
- *	%LOCK_MAND support has been removed from the kernel.
+ *   Shared locks (LOCK_SH) allow multiple processes to hold locks
+ *   simultaneously, enabling concurrent read access. Exclusive locks
+ *   (LOCK_EX) allow only one holder at a time, suitable for write operations.
+ *   An exclusive lock cannot coexist with any other lock on the file, while
+ *   multiple shared locks can coexist but not with an exclusive lock.
+ *
+ *   Lock conversion (upgrading from shared to exclusive or downgrading from
+ *   exclusive to shared) is NOT atomic. The existing lock is removed first,
+ *   then the new lock is acquired. This means another process may acquire
+ *   the lock during the conversion window.
+ *
+ *   By default, if a conflicting lock is held by another process, flock()
+ *   blocks until the lock can be acquired. The LOCK_NB flag causes the call
+ *   to return immediately with EWOULDBLOCK (EAGAIN) if a conflicting lock
+ *   would block. Blocking calls can be interrupted by signals.
+ *
+ *   Flock locks persist across execve() but are released on fork() for the
+ *   child process's copy of the file descriptor (since fork creates a new
+ *   open file description for duplicated descriptors with CLOEXEC semantics).
+ *   Actually, fork() shares the same open file description, so locks ARE
+ *   shared with the child.
+ *
+ *   On NFS (since Linux 2.6.12), flock() is emulated using fcntl() byte-range
+ *   locks on the entire file. This means NFS flock locks interact with
+ *   fcntl() locks and may have different semantics than local filesystem
+ *   locks. For exclusive locks on NFS, the file must be opened for writing.
+ *
+ *   On CIFS/SMB (since Linux 5.5), flock() is emulated using SMB byte-range
+ *   locks. These locks become mandatory (not advisory) and interact with
+ *   fcntl() locks.
+ *
+ *   LOCK_MAND (mandatory flock) support was removed in Linux 5.15. Calls
+ *   with LOCK_MAND set are now silently ignored (return 0) with a warning
+ *   printed to the kernel log.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid open file descriptor. For LOCK_SH or LOCK_EX
+ *     operations, the file must be open for reading or writing (O_RDONLY,
+ *     O_WRONLY, or O_RDWR). LOCK_UN operations succeed regardless of the file
+ *     access mode. Files opened with O_PATH are not valid for locking as they
+ *     have neither FMODE_READ nor FMODE_WRITE set.
+ *
+ * param: cmd
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: LOCK_SH | LOCK_EX | LOCK_UN | LOCK_NB
+ *   constraint: Must be one of LOCK_SH (1), LOCK_EX (2), or LOCK_UN (8),
+ *     optionally combined with LOCK_NB (4) using bitwise OR. Only one of
+ *     LOCK_SH, LOCK_EX, or LOCK_UN may be specified. LOCK_NB is only
+ *     meaningful with LOCK_SH or LOCK_EX; it is ignored with LOCK_UN. If
+ *     LOCK_MAND (32) is set, the call returns 0 immediately without acquiring
+ *     any lock (deprecated behavior preserved for compatibility). Invalid
+ *     combinations (e.g., LOCK_SH | LOCK_EX, or value 0) return EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. For LOCK_SH or LOCK_EX, the lock has been
+ *     acquired (or upgraded/downgraded if a different lock was held). For
+ *     LOCK_UN, any existing lock has been released. If LOCK_MAND was set,
+ *     returns 0 but no lock operation was performed.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The file descriptor @fd is not valid. This occurs when @fd is
+ *     negative, exceeds the process's file descriptor limit, or refers to
+ *     a closed file descriptor. Also returned for LOCK_SH or LOCK_EX if
+ *     the file is not open for reading or writing (e.g., opened with O_PATH).
+ *
+ * error: EINVAL, Invalid lock operation
+ *   desc: The @cmd argument (after masking off LOCK_NB) is not one of LOCK_SH,
+ *     LOCK_EX, or LOCK_UN. This occurs with invalid values like 0, 3
+ *     (LOCK_SH | LOCK_EX), or any value other than 1, 2, or 8 in the low bits.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: The call was blocking (LOCK_NB not set), waiting for a conflicting
+ *     lock to be released, when a signal was delivered to the calling process.
+ *     The signal handler was invoked. The lock was NOT acquired. If SA_RESTART
+ *     is set for the signal, the syscall may be automatically restarted. The
+ *     wait is implemented via wait_event_interruptible() which returns
+ *     -ERESTARTSYS, translated to EINTR for user space.
+ *
+ * error: EWOULDBLOCK, Lock would block (non-blocking mode)
+ *   desc: LOCK_NB was specified and the lock cannot be acquired immediately
+ *     because a conflicting lock is held by another open file description.
+ *     EWOULDBLOCK is equivalent to EAGAIN (both have the same value on Linux).
+ *     The caller should retry later or wait using poll/select on another
+ *     mechanism if the lock holder provides such notification.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory for the lock structure
+ *     (struct file_lock) or the lock context (struct file_lock_context).
+ *     This is rare and indicates severe memory pressure. For LOCK_UN, this
+ *     error does not occur if no lock context exists (unlocking succeeds
+ *     trivially).
+ *
+ * error: EACCES, Permission denied by security module
+ *   desc: A Linux Security Module (SELinux, Smack, etc.) denied the lock
+ *     operation. SELinux checks the FILE__LOCK permission on the file.
+ *     This check occurs after the file descriptor is validated but before
+ *     attempting to acquire the lock.
+ *
+ * error: ENOLCK, Filesystem does not support locking
+ *   desc: Returned by some filesystems (NFS, CIFS) when the file_operations
+ *     flock handler encounters an error. On NFS, this can occur if the server
+ *     does not support locking or if the lock type is not FL_FLOCK. On CIFS,
+ *     this may occur in certain configurations.
+ *
+ * lock: file_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: A per-CPU read-write semaphore protecting the global file lock
+ *     lists. Acquired for reading via percpu_down_read() during lock
+ *     operations in flock_lock_inode(). This serializes modifications to
+ *     lock state across all files. Held while manipulating the lock lists
+ *     and released before returning.
+ *
+ * lock: ctx->flc_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-inode spinlock protecting the file_lock_context lists
+ *     (flc_flock, flc_posix, flc_lease). Acquired via spin_lock() within
+ *     flock_lock_inode() after taking file_rwsem. Protects the per-inode
+ *     lists of flock, POSIX, and lease locks. Held while searching for
+ *     conflicts, inserting/removing locks, and modifying lock state.
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocking without LOCK_NB and waiting for lock acquisition
+ *   desc: While waiting for a conflicting lock to be released, the process
+ *     sleeps in an interruptible state. Any signal (except SIGKILL/SIGSTOP
+ *     which cannot be caught) will wake the process. The wait uses
+ *     wait_event_interruptible() which returns -ERESTARTSYS when a signal
+ *     is pending. If the signal handler was installed with SA_RESTART, the
+ *     syscall may be automatically restarted by the kernel.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: flock lock (struct file_lock)
+ *   desc: When acquiring a new lock (LOCK_SH or LOCK_EX) on a file that
+ *     doesn't already have a flock from this open file description, a new
+ *     file_lock structure is allocated from the filelock_cache slab and
+ *     added to the inode's flc_flock list. The lock is owned by the open
+ *     file description, not the process.
+ *   condition: LOCK_SH or LOCK_EX when no existing lock from same file
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: flock lock (struct file_lock)
+ *   desc: When releasing a lock (LOCK_UN) or when converting a lock type,
+ *     the existing lock structure is removed from the inode's flc_flock list
+ *     and freed to the filelock_cache slab via locks_dispose_list().
+ *   condition: LOCK_UN or lock type conversion
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode lock context (struct file_lock_context)
+ *   desc: On first lock acquisition for an inode, a file_lock_context is
+ *     allocated and attached to the inode via inode->i_flctx. This context
+ *     persists until the inode is evicted. The context contains the lists
+ *     for flock, POSIX, and lease locks.
+ *   condition: First lock on inode
+ *   reversible: no
+ *
+ * state-trans: file_lock
+ *   from: none (no lock held)
+ *   to: LOCK_SH or LOCK_EX (lock acquired)
+ *   condition: Successful LOCK_SH or LOCK_EX when no lock previously held
+ *   desc: A new file_lock structure is created with flc_type set to F_RDLCK
+ *     (for LOCK_SH) or F_WRLCK (for LOCK_EX), flc_flags including FL_FLOCK,
+ *     and flc_owner/flc_file pointing to the struct file.
+ *
+ * state-trans: file_lock
+ *   from: LOCK_SH (shared lock)
+ *   to: LOCK_EX (exclusive lock)
+ *   condition: LOCK_EX when LOCK_SH previously held (upgrade)
+ *   desc: The existing shared lock is removed and a new exclusive lock is
+ *     acquired. This is NOT atomic - another process may acquire the lock
+ *     between removal and acquisition.
+ *
+ * state-trans: file_lock
+ *   from: LOCK_EX (exclusive lock)
+ *   to: LOCK_SH (shared lock)
+ *   condition: LOCK_SH when LOCK_EX previously held (downgrade)
+ *   desc: The existing exclusive lock is removed and a new shared lock is
+ *     acquired. Like upgrades, this is not atomic.
+ *
+ * state-trans: file_lock
+ *   from: LOCK_SH or LOCK_EX (lock held)
+ *   to: none (lock released)
+ *   condition: LOCK_UN or close of all file descriptors
+ *   desc: The lock is removed from the inode's flc_flock list and freed.
+ *     Any processes blocked waiting for this lock are woken up.
+ *
+ * examples: ret = flock(fd, LOCK_EX);  // Acquire exclusive lock (blocking)
+ *   ret = flock(fd, LOCK_SH | LOCK_NB);  // Try shared lock (non-blocking)
+ *   ret = flock(fd, LOCK_UN);  // Release lock
+ *   if (ret == -1 && errno == EWOULDBLOCK) { ... }  // lock held by another
+ *
+ * notes: flock() was originally a BSD system call. Before Linux 2.0, it was
+ *   emulated in the C library using fcntl() byte-range locks. Since Linux
+ *   2.0, flock() is implemented as a native system call, and flock locks do
+ *   NOT interact with fcntl() POSIX locks - they are independent.
+ *
+ *   The distinction between flock() and fcntl() locks is crucial: flock()
+ *   locks are per-open-file-description while fcntl() locks are per-process.
+ *   This means flock() locks behave intuitively across dup() and fork(),
+ *   while fcntl() locks have surprising semantics (any close releases all
+ *   locks, regardless of which descriptor is closed).
+ *
+ *   Deadlock detection is NOT performed for flock() locks (unlike POSIX
+ *   fcntl() locks). If process A holds an exclusive lock on file X and waits
+ *   for a lock on file Y, while process B holds an exclusive lock on file Y
+ *   and waits for a lock on file X, both will block indefinitely.
+ *
+ *   File locking on NFS and CIFS has historically been unreliable. On NFS,
+ *   flock() is emulated using fcntl() byte-range locks since Linux 2.6.12.
+ *   This emulation means NFS flock() locks interact with fcntl() locks,
+ *   unlike local filesystems. Always test locking behavior on network
+ *   filesystems before relying on it.
+ *
+ *   When a filesystem implements the flock file_operation callback, that
+ *   implementation handles the lock rather than the generic VFS code. Check
+ *   filesystem-specific documentation for behavioral differences.
+ *
+ *   Flock locks are associated with the struct file (open file description),
+ *   not with the file descriptor number. The kernel identifies locks by
+ *   comparing flc_file pointers. This means locks cannot be "stolen" by
+ *   closing and reopening a file with the same descriptor number.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE2(flock, unsigned int, fd, unsigned int, cmd)
 {
