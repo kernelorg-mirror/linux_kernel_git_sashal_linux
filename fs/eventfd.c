@@ -411,6 +411,188 @@ static int do_eventfd(unsigned int count, int flags)
 	return fd_publish(fdf);
 }
 
+/**
+ * sys_eventfd2 - Create an event notification file descriptor
+ * @count: Initial value for the eventfd counter
+ * @flags: Bitmask of flags modifying the eventfd behavior
+ *
+ * long-desc: Creates an "eventfd object" that provides a kernel-supported
+ *   mechanism for event wait/notify between userspace applications or between
+ *   the kernel and userspace. The syscall returns a new file descriptor that
+ *   refers to the eventfd object, which contains a 64-bit unsigned integer
+ *   (uint64_t) counter maintained by the kernel.
+ *
+ *   The counter is initialized with the value specified in @count. The eventfd
+ *   file descriptor supports read(2), write(2), poll(2)/select(2)/epoll(7),
+ *   and close(2) operations:
+ *
+ *   - read(2): If the counter is nonzero, read returns 8 bytes containing the
+ *     counter value (or 1 if EFD_SEMAPHORE is set), and resets (or decrements)
+ *     the counter. If zero, blocks until counter becomes nonzero (or returns
+ *     EAGAIN if O_NONBLOCK is set).
+ *
+ *   - write(2): Adds an 8-byte integer value to the counter. If the addition
+ *     would cause overflow (counter would exceed ULLONG_MAX-1), blocks (or
+ *     returns EAGAIN if O_NONBLOCK). Writing the value 0xffffffffffffffff
+ *     returns EINVAL.
+ *
+ *   - poll/select/epoll: The file descriptor is readable (POLLIN) when the
+ *     counter is greater than zero. It is writable (POLLOUT) when writing at
+ *     least the value 1 would not block. POLLERR is returned if the counter
+ *     value overflows (reaches ULLONG_MAX).
+ *
+ *   eventfd provides a more lightweight alternative to pipes for event
+ *   notification, requiring only one file descriptor (versus two for a pipe)
+ *   and having lower kernel overhead. It is commonly used for signal-safe IPC,
+ *   integration with event loops, and kernel-to-userspace notification (e.g.,
+ *   with KVM, VFIO, io_uring, and AIO).
+ *
+ *   The file descriptor is automatically inherited across fork(2). The child
+ *   gets a copy referring to the same eventfd object, allowing parent-child
+ *   communication. The file descriptor is preserved across execve(2) unless
+ *   EFD_CLOEXEC is specified.
+ *
+ *   The eventfd2 syscall was introduced in Linux 2.6.27 to add flags support.
+ *   The older eventfd(2) syscall is equivalent to eventfd2(count, 0).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: count
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UINT_MAX
+ *   constraint: Initial counter value. Any unsigned 32-bit integer is valid.
+ *     The counter itself is stored as a 64-bit value internally, so subsequent
+ *     writes can increase it beyond the initial value up to 0xfffffffffffffffe.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE
+ *   constraint: Bitmask of zero or more of: EFD_CLOEXEC (set close-on-exec flag
+ *     on the new fd), EFD_NONBLOCK (set O_NONBLOCK on the file, making read/write
+ *     non-blocking), EFD_SEMAPHORE (provide semaphore-like semantics where read
+ *     returns 1 and decrements counter by 1, rather than returning full counter
+ *     and resetting to zero). Any bits outside this mask cause EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns a new file descriptor referring to the eventfd
+ *     object. The file descriptor will be the lowest-numbered available fd.
+ *     The returned fd should be closed with close(2) when no longer needed.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flags argument contains bits other than EFD_CLOEXEC, EFD_NONBLOCK,
+ *     and EFD_SEMAPHORE. The kernel validates flags against EFD_FLAGS_SET mask
+ *     (defined as EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE) before any resource
+ *     allocation. This error is returned early, before any memory is allocated.
+ *
+ * error: EMFILE, Per-process fd limit exceeded
+ *   desc: The per-process limit on the number of open file descriptors has been
+ *     reached. This limit is controlled by RLIMIT_NOFILE (typically 1024 soft,
+ *     higher hard limit) and can be viewed/modified with getrlimit/setrlimit or
+ *     ulimit -n. The kernel checks this in get_unused_fd_flags() -> alloc_fd().
+ *
+ * error: ENFILE, System-wide fd limit exceeded
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is controlled by /proc/sys/fs/file-max. Processes
+ *     with CAP_SYS_ADMIN capability can exceed this limit. This error is
+ *     returned from alloc_empty_file() during struct file allocation.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available to allocate the eventfd_ctx
+ *     structure (from kmalloc), the struct file (from kmem_cache_alloc), or
+ *     the dentry for the anonymous inode (from d_alloc_pseudo). The eventfd_ctx
+ *     is approximately 64 bytes; total memory for an eventfd is several hundred
+ *     bytes including all associated kernel structures.
+ *
+ * error: ENODEV, Anonymous inode mount failed
+ *   desc: The internal anonymous inode filesystem could not be accessed. This
+ *     is an extremely rare error that can only occur if the anon_inode_inode
+ *     initialization failed during kernel boot (which would cause a panic) or
+ *     if there is severe kernel memory corruption. Under normal operation,
+ *     this error should never be returned to userspace.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: eventfd_ctx structure, struct file, dentry
+ *   desc: Allocates an eventfd_ctx structure (~64 bytes) containing the counter,
+ *     flags, wait queue head, and reference count. Also allocates a struct file
+ *     and associated dentry for the anonymous inode. All memory is freed when
+ *     the last reference to the file descriptor is released (via close or
+ *     process exit).
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor
+ *   desc: Allocates a new file descriptor in the calling process's file
+ *     descriptor table. The fd number is chosen as the lowest available value.
+ *     The file descriptor remains valid until explicitly closed or the process
+ *     exits.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: eventfd identifier
+ *   desc: Allocates a unique ID from the eventfd_ida IDA allocator. This ID is
+ *     visible in /proc/[pid]/fdinfo/[fd] as "eventfd-id:" and can be used to
+ *     correlate eventfd instances across different processes or for debugging.
+ *     The ID is freed when the eventfd is destroyed.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Exceeding the system-wide file-max limit
+ *   without: Returns ENFILE if system-wide file limit is reached
+ *   condition: Checked in alloc_empty_file() when nr_files >= files_stat.max_files
+ *
+ * constraint: File Descriptor Limits
+ *   desc: The calling process must not have exhausted its per-process file
+ *     descriptor limit (RLIMIT_NOFILE). The system must not have exhausted its
+ *     system-wide file limit (/proc/sys/fs/file-max) unless caller has
+ *     CAP_SYS_ADMIN.
+ *
+ * constraint: Memory Availability
+ *   desc: Sufficient kernel memory must be available for allocation of the
+ *     eventfd context and associated structures. Allocation uses GFP_KERNEL
+ *     which allows the kernel to reclaim memory and sleep if necessary.
+ *
+ * examples: fd = eventfd2(0, 0);  // Basic eventfd with counter=0
+ *   fd = eventfd2(1, EFD_CLOEXEC);  // Initial count=1, close-on-exec
+ *   fd = eventfd2(0, EFD_NONBLOCK | EFD_SEMAPHORE);  // Non-blocking semaphore
+ *   fd = eventfd2(100, EFD_CLOEXEC | EFD_NONBLOCK);  // All common flags
+ *
+ * notes: The eventfd2 syscall was introduced to allow specifying flags. The
+ *   original eventfd() syscall (Linux 2.6.22) is equivalent to eventfd2(count, 0).
+ *   glibc's eventfd() wrapper uses eventfd2() when available (since glibc 2.9).
+ *
+ *   The counter maximum value is 0xfffffffffffffffe (ULLONG_MAX - 1). Attempting
+ *   to write the value 0xffffffffffffffff returns EINVAL. This design allows
+ *   overflow detection via POLLERR when the counter reaches ULLONG_MAX.
+ *
+ *   For semaphore mode (EFD_SEMAPHORE), the counter effectively acts as a
+ *   counting semaphore where each read decrements by 1 and returns 1. This
+ *   allows multiple waiters to be woken one at a time. Without EFD_SEMAPHORE,
+ *   a single read consumes the entire counter value.
+ *
+ *   When using eventfd with fork(), both parent and child share the same
+ *   underlying eventfd object. Writes by either process are visible to both.
+ *   This is useful for parent-child synchronization. For thread synchronization
+ *   within a single process, the same fd can be shared directly.
+ *
+ *   The file descriptor supports the following fdinfo fields visible in
+ *   /proc/[pid]/fdinfo/[fd]: eventfd-count (current counter in hex),
+ *   eventfd-id (unique id), eventfd-semaphore (1 if EFD_SEMAPHORE set).
+ *
+ *   Historical note: The underflow bug (commit 758b492047816) was fixed in
+ *   kernel 6.5 where reading from an EFD_SEMAPHORE eventfd with count=0
+ *   would cause underflow to ULLONG_MAX. The fix ensures the semaphore
+ *   decrement only occurs when count > 0.
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE2(eventfd2, unsigned int, count, int, flags)
 {
 	return do_eventfd(count, flags);
