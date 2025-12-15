@@ -2325,6 +2325,313 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 	return ret;
 }
 
+/**
+ * sys_waitid - Wait for a child process to change state
+ * @which: Type of identifier to wait for (P_PID, P_PIDFD, P_PGID, or P_ALL)
+ * @upid: Process identifier, process group ID, or pidfd depending on @which
+ * @infop: Pointer to siginfo_t structure to receive child information
+ * @options: Wait options specifying which state changes to wait for
+ * @ru: Optional pointer to receive child resource usage information
+ *
+ * long-desc: Waits for a child process to change state and retrieves
+ *   information about the child whose state changed. This is a more flexible
+ *   and POSIX-compliant alternative to wait(2), waitpid(2), and wait4(2).
+ *
+ *   The @which parameter specifies how to interpret @upid:
+ *   - P_PID (1): Wait for the child whose PID equals @upid
+ *   - P_PIDFD (3): Wait for the child referred to by the pidfd @upid (Linux 5.4+)
+ *   - P_PGID (2): Wait for any child in process group @upid; if @upid is 0,
+ *     wait for any child in the caller's process group
+ *   - P_ALL (0): Wait for any child; @upid is ignored
+ *
+ *   The @options parameter is a bitmask that must include at least one of:
+ *   - WEXITED (0x04): Wait for children that have terminated
+ *   - WSTOPPED (0x02): Wait for children that have been stopped by a signal
+ *   - WCONTINUED (0x08): Wait for previously stopped children that have
+ *     been resumed by SIGCONT
+ *
+ *   Additional modifier flags can be OR'd with the above:
+ *   - WNOHANG (0x01): Return immediately if no child has changed state
+ *   - WNOWAIT (0x01000000): Leave the child in a waitable state; a later
+ *     wait call can be used to retrieve the same information again
+ *
+ *   Linux-specific flags (not in POSIX):
+ *   - __WNOTHREAD (0x20000000): Do not wait for children of other threads
+ *     in the same thread group
+ *   - __WALL (0x40000000): Wait for all children regardless of type
+ *   - __WCLONE (0x80000000): Wait only for "clone" children (those using
+ *     a termination signal other than SIGCHLD)
+ *
+ *   On success, the siginfo_t structure pointed to by @infop is filled with:
+ *   - si_signo: Always SIGCHLD
+ *   - si_errno: Always 0
+ *   - si_code: One of CLD_EXITED, CLD_KILLED, CLD_DUMPED, CLD_STOPPED,
+ *     CLD_TRAPPED, or CLD_CONTINUED
+ *   - si_pid: The child's process ID
+ *   - si_uid: The child's real user ID
+ *   - si_status: The exit status (if CLD_EXITED) or signal number
+ *
+ *   If WNOHANG is specified and no child has changed state, si_signo and
+ *   si_pid are set to 0 (per POSIX.1-2008 Technical Corrigendum 1).
+ *
+ *   The @ru parameter is a Linux extension not present in POSIX. When
+ *   non-NULL, it receives resource usage information for the child.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   valid-mask: P_PID | P_PIDFD | P_PGID | P_ALL
+ *   constraint: Must be one of: P_ALL (0), P_PID (1), P_PGID (2), or
+ *     P_PIDFD (3). Any other value returns -EINVAL.
+ *
+ * param: upid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation depends on @which: For P_PID, must be > 0.
+ *     For P_PGID, must be >= 0 (0 means caller's process group). For P_PIDFD,
+ *     must be >= 0 and refer to a valid pidfd. For P_ALL, ignored. Invalid
+ *     values return -EINVAL, except P_PIDFD with invalid fd returns -EBADF.
+ *
+ * param: infop
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: May be NULL if caller does not need child information.
+ *     If non-NULL, must point to a writable siginfo_t structure. Invalid
+ *     pointer returns -EFAULT.
+ *
+ * param: options
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: WNOHANG | WNOWAIT | WEXITED | WSTOPPED | WCONTINUED |
+ *     __WNOTHREAD | __WALL | __WCLONE
+ *   constraint: Must have at least one of WEXITED, WSTOPPED, or WCONTINUED
+ *     set. Any bits outside the valid mask cause -EINVAL. Zero options or
+ *     missing required flags returns -EINVAL.
+ *
+ * param: ru
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: May be NULL if resource usage is not needed. If non-NULL,
+ *     must point to a writable struct rusage. Invalid pointer returns -EFAULT.
+ *     This is a Linux extension not in POSIX.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. If WNOHANG is specified and no child has
+ *     changed state, also returns 0 but with si_signo and si_pid set to 0
+ *     in the siginfo_t structure.
+ *
+ * error: EINVAL, Invalid which parameter or options
+ *   desc: Returned when @which is not P_ALL, P_PID, P_PGID, or P_PIDFD; when
+ *     @options has invalid bits set; when @options does not include at least
+ *     one of WEXITED, WSTOPPED, or WCONTINUED; when P_PID is used with
+ *     upid <= 0; or when P_PGID or P_PIDFD is used with upid < 0.
+ *
+ * error: ECHILD, No matching child process
+ *   desc: No child process matches the wait criteria. For P_PID, the specified
+ *     process either does not exist or is not a child of the caller. For P_PGID
+ *     or P_ALL, no children exist in the specified scope. Also returned if
+ *     children exist but all are being traced by another process.
+ *
+ * error: EFAULT, Invalid user space pointer
+ *   desc: Either @infop or @ru is non-NULL but points to an invalid memory
+ *     address that cannot be written to by the kernel.
+ *
+ * error: EBADF, Invalid pidfd
+ *   desc: When @which is P_PIDFD, the @upid value is not a valid file
+ *     descriptor, or the file descriptor does not refer to a pidfd.
+ *
+ * error: EAGAIN, Nonblocking pidfd and child not yet terminated
+ *   desc: When @which is P_PIDFD and the pidfd was opened with O_NONBLOCK
+ *     (or PIDFD_NONBLOCK), but the child process has not yet changed to a
+ *     waitable state. The caller should retry later.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: The wait was interrupted by a signal before a child changed state.
+ *     Returned only when WNOHANG is not set. This error does not occur when
+ *     WNOHANG is set since the call returns immediately.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired for reading in __do_wait() to traverse the list of
+ *     children and ptraced tasks. Released before returning from any of the
+ *     wait_task_* functions that find a matching child. Also released before
+ *     sleeping when no child is immediately available.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired with interrupts disabled in wait_task_stopped() and
+ *     wait_task_continued() to safely read and potentially clear the child's
+ *     stop/continue state. The lock protects access to the child's exit_code
+ *     and signal flags (SIGNAL_STOP_CONTINUED).
+ *
+ * lock: psig->stats_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired for writing in wait_task_zombie() when reaping a zombie
+ *     and the child is the thread group leader. Used to update the parent's
+ *     cumulative child resource statistics (cutime, cstime, etc.) atomically.
+ *
+ * lock: current->signal->wait_chldexit
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: true
+ *   released: true
+ *   desc: The calling process is added to this wait queue in do_wait() to
+ *     receive wakeups when children change state. The wait queue entry uses
+ *     a custom callback (child_wait_callback) that filters wakeups based on
+ *     the wait criteria.
+ *
+ * signal: Generic
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When WNOHANG is not set and no child is immediately available
+ *   desc: The syscall sleeps in TASK_INTERRUPTIBLE state and can be
+ *     interrupted by any signal. When interrupted, returns -EINTR (or
+ *     -ERESTARTSYS internally, which libc converts to EINTR for non-restartable
+ *     signals). If the signal handler has SA_RESTART set, the syscall is
+ *     automatically restarted.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Child process exit_state
+ *   desc: When a zombie child is reaped (WEXITED without WNOWAIT), its
+ *     exit_state transitions from EXIT_ZOMBIE to EXIT_DEAD. The child's
+ *     task_struct is then released via release_task(), freeing all remaining
+ *     kernel resources associated with the terminated child.
+ *   condition: WEXITED set and WNOWAIT not set
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Child stopped state (exit_code)
+ *   desc: When waiting for a stopped child (WSTOPPED without WNOWAIT), the
+ *     child's exit_code is cleared to 0 after the wait completes. This
+ *     ensures the stop event is only reported once.
+ *   condition: WSTOPPED set and WNOWAIT not set
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Child continued state (SIGNAL_STOP_CONTINUED flag)
+ *   desc: When waiting for a continued child (WCONTINUED without WNOWAIT),
+ *     the SIGNAL_STOP_CONTINUED flag is cleared from the child's signal
+ *     structure. This ensures the continue event is only reported once.
+ *   condition: WCONTINUED set and WNOWAIT not set
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Parent cumulative resource usage
+ *   desc: When reaping a zombie thread group leader, the child's resource
+ *     usage statistics (CPU time, page faults, I/O operations, etc.) are
+ *     added to the parent's cumulative child statistics (cutime, cstime,
+ *     cmin_flt, cmaj_flt, etc.). These are later retrievable via getrusage().
+ *   condition: Reaping zombie thread group leader
+ *   reversible: no
+ *
+ * state-trans: child->exit_state
+ *   from: EXIT_ZOMBIE
+ *   to: EXIT_DEAD
+ *   condition: Child is reaped (WEXITED without WNOWAIT, child not ptraced by
+ *     another process)
+ *   desc: When a zombie child is successfully waited for without WNOWAIT,
+ *     its exit_state transitions to EXIT_DEAD. The transition is performed
+ *     atomically using cmpxchg to handle races with other threads that might
+ *     also be trying to reap the same child.
+ *
+ * state-trans: child->exit_state
+ *   from: EXIT_ZOMBIE
+ *   to: EXIT_TRACE
+ *   condition: Child is ptraced by a process other than its real parent
+ *     and the real parent reaps it
+ *   desc: When a zombie child that is being ptraced by another process is
+ *     reaped by its real parent, the exit_state transitions to EXIT_TRACE.
+ *     The child remains in this state until the ptracer detaches, at which
+ *     point the child is re-notified to its real parent (or becomes EXIT_DEAD
+ *     if the parent ignores SIGCHLD).
+ *
+ * constraint: Options Requirements
+ *   desc: The @options parameter must include at least one of WEXITED,
+ *     WSTOPPED, or WCONTINUED. Passing zero or only modifier flags (WNOHANG,
+ *     WNOWAIT, __WNOTHREAD, __WALL, __WCLONE) without at least one event
+ *     type flag results in -EINVAL. This differs from wait4() which
+ *     implicitly waits for WEXITED.
+ *
+ * constraint: Child Relationship
+ *   desc: The calling process can only wait for its own children (created
+ *     via fork/clone with SIGCHLD or similar) or ptraced tasks. Attempting
+ *     to wait for an arbitrary process that is not a child returns -ECHILD.
+ *     With __WNOTHREAD, only children of the calling thread are considered;
+ *     without it, children of any thread in the thread group may be waited.
+ *
+ * constraint: P_PIDFD Kernel Version
+ *   desc: The P_PIDFD option requires Linux kernel 5.4 or later. On older
+ *     kernels, using P_PIDFD returns -EINVAL as it is not a recognized
+ *     identifier type.
+ *
+ * examples: waitid(P_ALL, 0, &info, WEXITED);  // Wait for any child to exit
+ *   waitid(P_PID, child_pid, &info, WEXITED);  // Wait for specific child
+ *   waitid(P_PID, pid, &info, WEXITED | WNOHANG);  // Non-blocking check
+ *   waitid(P_PID, pid, &info, WEXITED | WNOWAIT);  // Peek without reaping
+ *   waitid(P_PIDFD, pidfd, &info, WEXITED);  // Wait using pidfd
+ *   waitid(P_PGID, 0, &info, WSTOPPED);  // Wait for stopped child in group
+ *   waitid(P_ALL, 0, &info, WSTOPPED | WCONTINUED);  // Wait for job control
+ *
+ * notes: waitid() provides more precise control over which state changes
+ *   to wait for compared to wait() and waitpid(). The separation of WEXITED,
+ *   WSTOPPED, and WCONTINUED allows waiting for specific events without
+ *   receiving notifications about other events.
+ *
+ *   The WNOWAIT option is unique to waitid() and allows "peeking" at a
+ *   child's state without consuming the event. This is useful for monitoring
+ *   children without preventing other processes from also observing them.
+ *
+ *   P_PIDFD provides a race-free way to wait for a process. Traditional
+ *   PID-based waiting has a race window where the target process could exit
+ *   and its PID could be reused before the wait begins. With pidfd, the
+ *   file descriptor maintains a stable reference to the process.
+ *
+ *   When using P_PIDFD with a pidfd opened with O_NONBLOCK (or PIDFD_NONBLOCK
+ *   in pidfd_open()), waitid() returns -EAGAIN if the child hasn't exited
+ *   yet instead of blocking. This is useful for non-blocking process
+ *   monitoring or integration with poll/epoll.
+ *
+ *   The @ru parameter (resource usage) is a Linux extension. POSIX waitid()
+ *   does not include this parameter. The kernel syscall has it, but glibc's
+ *   wrapper function does not expose it. Direct syscall() is needed to use it.
+ *
+ *   Unlike wait4() which always waits for WEXITED, waitid() requires explicit
+ *   specification of which state changes to wait for. This is more verbose
+ *   but provides clearer semantics.
+ *
+ *   The si_status field in siginfo_t has different meanings depending on
+ *   si_code: for CLD_EXITED it contains the exit status (the value passed
+ *   to _exit()), for signal-related codes it contains the signal number.
+ *
+ *   Thread group semantics: without __WNOTHREAD, any thread in the calling
+ *   process can wait for any child of any thread in the same thread group.
+ *   This matches POSIX semantics where all threads share child processes.
+ *
+ *   The __WCLONE and __WALL flags affect which children are visible. By
+ *   default, only children that send SIGCHLD on termination are waited for.
+ *   __WCLONE inverts this (only "clone" children), while __WALL waits for
+ *   all children regardless of termination signal.
+ *
+ * since-version: 2.6.9
+ */
 SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
 		infop, int, options, struct rusage __user *, ru)
 {
