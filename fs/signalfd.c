@@ -296,6 +296,243 @@ static int do_signalfd4(int ufd, sigset_t *mask, int flags)
 	return ufd;
 }
 
+/**
+ * sys_signalfd4 - Create or modify a file descriptor for accepting signals
+ * @ufd: Existing signalfd descriptor to modify, or -1 to create a new one
+ * @user_mask: Pointer to user-space signal mask specifying signals to accept
+ * @sizemask: Size of the signal mask structure (must equal sizeof(sigset_t))
+ * @flags: Behavioral flags (SFD_CLOEXEC, SFD_NONBLOCK)
+ *
+ * long-desc: Creates a file descriptor that can be used to accept signals
+ *   targeted at the calling process. This provides an alternative to signal
+ *   handlers or sigwaitinfo(2), with the advantage that the file descriptor
+ *   can be monitored using select(2), poll(2), or epoll(7).
+ *
+ *   When ufd is -1, a new signalfd file descriptor is created. The signal mask
+ *   specifies which signals should be accepted via the file descriptor. Signals
+ *   that arrive and match the mask can be read from the file descriptor as
+ *   struct signalfd_siginfo structures (128 bytes each).
+ *
+ *   When ufd refers to an existing signalfd file descriptor, the signal mask
+ *   is updated atomically to the new value provided in user_mask. The same
+ *   file descriptor continues to be used.
+ *
+ *   SIGKILL and SIGSTOP cannot be received via a signalfd; these signals are
+ *   silently removed from the mask by the kernel. To actually receive signals
+ *   via the signalfd, the signals should typically be blocked using
+ *   sigprocmask(2) to prevent their default handling.
+ *
+ *   The signalfd file descriptor supports read(2), poll(2), select(2), and
+ *   close(2) operations. Reading from the file descriptor consumes the signals,
+ *   removing them from the pending queue. Multiple signalfd_siginfo structures
+ *   can be read in a single read(2) call if multiple signals are pending.
+ *
+ *   Child processes inherit signalfd file descriptors across fork(2). The
+ *   child's signalfd will receive signals directed to the child, not the
+ *   parent. After execve(2), signalfd file descriptors remain open unless
+ *   SFD_CLOEXEC was specified.
+ *
+ *   Thread semantics: A signalfd can read both per-thread signals (directed
+ *   to the specific thread) and process-wide signals (shared pending signals).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: ufd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be -1 to create a new signalfd, or a valid file descriptor
+ *     that was previously returned by signalfd() or signalfd4(). If ufd is a
+ *     valid file descriptor but does not refer to a signalfd, EINVAL is returned.
+ *     If ufd is an invalid file descriptor (not -1 and not open), EBADF is
+ *     returned. Values other than -1 that are negative are treated as invalid
+ *     file descriptors.
+ *
+ * param: user_mask
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, readable user-space memory region
+ *     containing a sigset_t structure. The mask specifies which signals should
+ *     be accepted via the signalfd. NULL pointers or inaccessible addresses
+ *     return EFAULT. SIGKILL (signal 9) and SIGSTOP (signal 19) are silently
+ *     removed from the mask by the kernel; they cannot be received via signalfd.
+ *     The mask is stored inverted internally to optimize signal checking. Use
+ *     sigemptyset(), sigfillset(), sigaddset(), sigdelset() from signal.h to
+ *     manipulate the mask before passing it.
+ *
+ * param: sizemask
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must equal sizeof(sigset_t), which is 8 bytes on most 64-bit
+ *     architectures and 8 bytes on 32-bit architectures. Any other value returns
+ *     EINVAL. This parameter exists for ABI compatibility and to detect size
+ *     mismatches between user space and kernel space sigset_t definitions.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: SFD_CLOEXEC | SFD_NONBLOCK
+ *   constraint: Bitwise OR of zero or more flags. SFD_CLOEXEC (equivalent to
+ *     O_CLOEXEC) sets the close-on-exec flag on the new file descriptor, causing
+ *     it to be automatically closed when execve(2) is called. SFD_NONBLOCK
+ *     (equivalent to O_NONBLOCK) sets non-blocking mode, causing read(2) to
+ *     return EAGAIN immediately if no signals are pending instead of blocking.
+ *     Any bits set outside of these two flags cause EINVAL to be returned.
+ *     When ufd is not -1 (modifying existing signalfd), flags must still be
+ *     valid but are ignored; the existing file descriptor flags are unchanged.
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns a file descriptor (non-negative integer). When
+ *     ufd is -1, this is a newly allocated signalfd file descriptor. When ufd
+ *     is an existing signalfd, the same file descriptor value (ufd) is returned
+ *     after updating the signal mask. The returned file descriptor can be used
+ *     with read(2), poll(2), select(2), epoll(7), and close(2). On error,
+ *     returns a negative error code.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) The sizemask argument does not equal
+ *     sizeof(sigset_t). This ensures ABI compatibility between user space and
+ *     kernel. (2) The flags argument contains bits other than SFD_CLOEXEC and
+ *     SFD_NONBLOCK. (3) The ufd argument is a valid file descriptor but does
+ *     not refer to a signalfd (i.e., the file was created by a different
+ *     mechanism such as open(), socket(), etc.). The check compares f_op
+ *     against the internal signalfd_fops structure.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The user_mask pointer points outside the accessible address space,
+ *     or the memory is not readable. The validation occurs via copy_from_user()
+ *     when copying the signal mask from user space to kernel space.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The ufd argument is not -1 and is not a valid open file descriptor.
+ *     This includes file descriptors that have been closed, never opened, or
+ *     are outside the valid range of file descriptor numbers for the process.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to allocate the signalfd_ctx structure
+ *     (which holds the signal mask), or to allocate the anonymous inode
+ *     structures (dentry, file) required for the new file descriptor. The
+ *     signalfd_ctx allocation uses kmalloc() with GFP_KERNEL.
+ *
+ * error: EMFILE, Too many open files
+ *   desc: The per-process limit on the number of open file descriptors has
+ *     been reached. This limit is controlled by RLIMIT_NOFILE (see getrlimit(2))
+ *     and defaults to 1024 on most systems. Can also occur if the process
+ *     has reached the system-wide sysctl_nr_open limit. Only occurs when
+ *     creating a new signalfd (ufd == -1).
+ *
+ * error: ENFILE, Too many open files in system
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is controlled by /proc/sys/fs/file-max. Only occurs
+ *     when creating a new signalfd (ufd == -1). Privileged processes with
+ *     CAP_SYS_ADMIN can exceed this limit.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: When creating a new signalfd (ufd == -1), the calling process's file
+ *     descriptor table spinlock is acquired during fd allocation in alloc_fd().
+ *     This lock protects the fd table from concurrent modifications. The lock
+ *     is held briefly during allocation and released before the syscall returns.
+ *
+ * lock: current->sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: conditional
+ *   released: conditional
+ *   desc: When modifying an existing signalfd (ufd != -1), the siglock spinlock
+ *     is acquired to atomically update the signal mask stored in the signalfd_ctx
+ *     structure. This lock is shared with signal delivery code, ensuring the
+ *     mask update is atomic with respect to signal delivery. The lock is acquired
+ *     with interrupts disabled (spin_lock_irq) and released immediately after
+ *     the mask update.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor and signalfd_ctx structure
+ *   desc: When ufd is -1, allocates a new file descriptor in the calling
+ *     process's file descriptor table, creates a new anonymous inode file
+ *     structure, and allocates a signalfd_ctx structure to hold the signal
+ *     mask. The file descriptor remains valid until explicitly closed with
+ *     close(2) or the process terminates.
+ *   condition: Only when ufd == -1
+ *   reversible: yes (via close(2))
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: signalfd_ctx->sigmask
+ *   desc: When ufd refers to an existing signalfd, the signal mask stored in
+ *     the associated signalfd_ctx structure is updated to the new value. This
+ *     affects which signals can be read from the signalfd. The update is atomic
+ *     with respect to signal delivery due to siglock protection.
+ *   condition: Only when ufd != -1 and refers to a valid signalfd
+ *   reversible: yes (call signalfd4 again with different mask)
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: signalfd_wqh wait queue
+ *   desc: When modifying an existing signalfd, wake_up() is called on the
+ *     signalfd_wqh wait queue to wake any processes blocked in poll() or
+ *     select() on this signalfd. This allows them to re-evaluate whether
+ *     pending signals match the new mask.
+ *   condition: Only when ufd != -1 and refers to a valid signalfd
+ *
+ * state-trans: signalfd_ctx
+ *   from: non-existent or existing mask
+ *   to: new mask value
+ *   condition: When creating new signalfd or updating existing one
+ *   desc: The signal mask stored in signalfd_ctx is set to the provided mask
+ *     with SIGKILL and SIGSTOP removed, then inverted (signotset). The inversion
+ *     optimizes the signal matching logic in signalfd_poll() and signalfd_dequeue().
+ *
+ * constraint: Signal mask filtering
+ *   desc: SIGKILL (signal 9) and SIGSTOP (signal 19) are always removed from
+ *     the provided signal mask by sigdelsetmask(). These signals cannot be
+ *     caught, blocked, or received via signalfd as per POSIX requirements.
+ *     Specifying them in the mask is silently ignored, not an error.
+ *
+ * constraint: RLIMIT_NOFILE
+ *   desc: The number of file descriptors that can be created is limited by
+ *     the process's RLIMIT_NOFILE resource limit. Attempting to create a
+ *     signalfd when at this limit returns EMFILE.
+ *
+ * constraint: System file limit
+ *   desc: The system-wide limit on open files (/proc/sys/fs/file-max) limits
+ *     total file allocations. Processes with CAP_SYS_ADMIN can exceed this.
+ *
+ * examples: fd = signalfd4(-1, &mask, sizeof(mask), SFD_CLOEXEC);  // Create new
+ *   signalfd4(fd, &newmask, sizeof(newmask), 0);  // Update existing
+ *   signalfd4(-1, &mask, sizeof(mask), SFD_NONBLOCK | SFD_CLOEXEC);  // Both flags
+ *
+ * notes: The signalfd mechanism was designed to simplify signal handling in
+ *   event-driven programs that use select/poll/epoll. To properly receive
+ *   signals via signalfd, the signals should typically be blocked with
+ *   sigprocmask(2) or pthread_sigmask(3) to prevent default signal handling.
+ *
+ *   The original signalfd() syscall (without the 4 suffix) does not support
+ *   flags and is equivalent to calling signalfd4() with flags=0. Starting with
+ *   glibc 2.9, the signalfd() wrapper function uses signalfd4() internally
+ *   when available.
+ *
+ *   Synchronous signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL) generated by hardware
+ *   exceptions cannot meaningfully be received via signalfd because they are
+ *   delivered to the faulting thread synchronously. However, if these signals
+ *   are sent asynchronously (e.g., via kill()), they can be received.
+ *
+ *   Race condition note: When updating an existing signalfd's mask, there is
+ *   a brief window where signals matching the old mask may still be delivered
+ *   to the signalfd. The mask update is atomic, but signals in flight are not
+ *   retroactively affected.
+ *
+ *   The signalfd_siginfo structure returned by read(2) is 128 bytes and contains
+ *   fields like ssi_signo (signal number), ssi_pid (sender PID), ssi_uid (sender
+ *   UID), and signal-specific data. See signalfd(2) man page for full details.
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		size_t, sizemask, int, flags)
 {
