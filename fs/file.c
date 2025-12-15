@@ -1450,6 +1450,233 @@ out_unlock:
 	return err;
 }
 
+/**
+ * sys_dup3 - Duplicate a file descriptor to a specified descriptor number
+ * @oldfd: Source file descriptor to duplicate
+ * @newfd: Target file descriptor number
+ * @flags: Operation flags (only O_CLOEXEC is valid)
+ *
+ * long-desc: Duplicates the file descriptor @oldfd to the file descriptor
+ *   number @newfd, atomically closing any file previously associated with
+ *   @newfd if it was open. This syscall is similar to dup2() but provides
+ *   atomic control over the close-on-exec flag via the @flags parameter.
+ *
+ *   Unlike dup2(), dup3() fails with EINVAL if @oldfd equals @newfd. This
+ *   is by design to prevent silent no-ops that could mask programming errors.
+ *   The dup2() syscall treats this case as a successful no-op (returning newfd
+ *   after validating that oldfd is open), which was deemed problematic for
+ *   certain use cases.
+ *
+ *   If @newfd was previously open, the file associated with it is atomically
+ *   closed as part of the dup3() operation. The close is performed after the
+ *   new file reference has been installed at @newfd, ensuring that no window
+ *   exists where @newfd is invalid. However, errors from closing the old file
+ *   are silently ignored (similar to dup2 behavior).
+ *
+ *   The O_CLOEXEC flag in @flags controls whether the close-on-exec flag
+ *   (FD_CLOEXEC) is set on the new file descriptor. If O_CLOEXEC is specified,
+ *   the new descriptor will be automatically closed when the process calls
+ *   exec(). This provides a race-free alternative to calling fcntl() to set
+ *   FD_CLOEXEC after dup2(), which is important in multi-threaded programs.
+ *
+ *   The new and old file descriptors share the same open file description,
+ *   meaning they share the same file offset and file status flags (O_APPEND,
+ *   O_NONBLOCK, etc.). However, the file descriptor flags (FD_CLOEXEC) are
+ *   per-descriptor and can differ.
+ *
+ *   This syscall internally uses files_lookup_fd_locked() which performs
+ *   a raw lookup without incrementing the reference count, suitable because
+ *   it runs under the files->file_lock. The reference is then incremented
+ *   by get_file() in do_dup2() before releasing the lock.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: oldfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid, open file descriptor. The descriptor can refer
+ *     to any type of file (regular file, directory, pipe, socket, device, etc.)
+ *     and can be opened with any mode including O_PATH. Must not equal @newfd.
+ *
+ * param: newfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, RLIMIT_NOFILE - 1
+ *   constraint: Must be less than the process's RLIMIT_NOFILE limit and less
+ *     than the system-wide sysctl_nr_open (/proc/sys/fs/nr_open). Must not
+ *     equal @oldfd. If @newfd refers to an already-open file descriptor, that
+ *     file will be closed atomically.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: O_CLOEXEC
+ *   constraint: Only O_CLOEXEC (0x80000) is a valid flag. Any other bits set
+ *     will cause EINVAL to be returned. If O_CLOEXEC is set, the new file
+ *     descriptor will have close-on-exec enabled. If flags is 0, close-on-exec
+ *     is cleared (default behavior, same as dup2).
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: newfd
+ *   desc: On success, returns @newfd. The returned value always equals the
+ *     @newfd parameter on success. The new file descriptor shares the same
+ *     open file description as @oldfd, with the close-on-exec flag set
+ *     according to @flags.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flags argument contains bits other than O_CLOEXEC. The kernel
+ *     validates flags with (flags & ~O_CLOEXEC) != 0 and rejects any unknown
+ *     flags to allow future extensions without breaking existing programs.
+ *
+ * error: EINVAL, oldfd equals newfd
+ *   desc: The @oldfd and @newfd arguments are equal. Unlike dup2() which
+ *     treats this as a no-op (just validating oldfd is open), dup3() was
+ *     designed to reject this case to avoid silent no-ops. This behavior
+ *     was added in the original dup3() implementation and is documented in
+ *     the POSIX proposal for dup3().
+ *
+ * error: EBADF, newfd exceeds RLIMIT_NOFILE
+ *   desc: The @newfd argument is greater than or equal to the per-process
+ *     file descriptor limit (RLIMIT_NOFILE). This check occurs before any
+ *     locks are taken. The limit can be queried via getrlimit(RLIMIT_NOFILE)
+ *     and is typically 1024 by default but can be raised up to the hard limit.
+ *
+ * error: EBADF, Invalid oldfd
+ *   desc: The @oldfd argument is not a valid open file descriptor. This occurs
+ *     if the descriptor was never opened, has been closed, or is outside the
+ *     valid range. The check is performed under files->file_lock using
+ *     files_lookup_fd_locked().
+ *
+ * error: EBADF, newfd exceeds sysctl_nr_open
+ *   desc: The @newfd argument exceeds the system-wide maximum file descriptor
+ *     limit (sysctl_nr_open, /proc/sys/fs/nr_open, default ~1M). This error
+ *     is returned when expand_files() fails with EMFILE because newfd >=
+ *     sysctl_nr_open. The EMFILE is converted to EBADF for POSIX compatibility.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory to expand the file descriptor
+ *     table. This occurs when @newfd requires a larger fd table than currently
+ *     allocated and kvmalloc() fails. The fd table grows exponentially, so this
+ *     error becomes more likely with very large @newfd values.
+ *
+ * error: EBUSY, Race condition with fd allocation
+ *   desc: The @newfd slot was allocated by another thread (via get_unused_fd())
+ *     but not yet populated (via fd_install()). This race condition can occur
+ *     when one thread is in the process of opening a file while another thread
+ *     attempts dup3() to the same fd number. POSIX is silent on this case;
+ *     Linux returns EBUSY rather than corrupting kernel state. This error is
+ *     extremely rare in well-behaved programs and indicates a race bug.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's file descriptor table spinlock is acquired at the
+ *     start of ksys_dup3() and released at the end (or in do_dup2()). This
+ *     lock protects the fd table from concurrent modifications. The lock may
+ *     be temporarily released during fd table expansion in expand_fdtable().
+ *
+ * lock: RCU
+ *   type: KAPI_LOCK_RCU
+ *   acquired: false
+ *   released: false
+ *   desc: RCU is used internally for fd table accesses. The files_fdtable()
+ *     macro uses rcu_dereference_check() to safely access the fd table.
+ *     If the fd table needs expansion and files_struct is shared (count > 1),
+ *     synchronize_rcu() is called to ensure all concurrent fd_install()
+ *     operations have completed.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor at newfd
+ *   desc: Installs the duplicated file reference at @newfd in the calling
+ *     process's file descriptor table. The fd is marked as open in the
+ *     open_fds bitmap, and the close-on-exec flag is set based on @flags.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: Previous file at newfd (if any)
+ *   desc: If @newfd was previously open, the file associated with it is closed
+ *     via filp_close(). This happens after the new file is installed, so
+ *     @newfd is never invalid during the operation. Errors from filp_close()
+ *     are silently ignored. Advisory locks held by this process on the old
+ *     file are released.
+ *   condition: newfd was previously open
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File reference count (f_ref)
+ *   desc: Increments the reference count on the struct file associated with
+ *     @oldfd via get_file(). This ensures the file remains valid as long as
+ *     either @oldfd or @newfd is open. The reference count is decremented
+ *     when the fd is closed.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: File descriptor table
+ *   desc: If @newfd is larger than the current fd table capacity, the table
+ *     is expanded via alloc_fdtable(). This allocates memory for a new fdtable
+ *     structure, fd array, and bitmaps using kmalloc() and kvmalloc() with
+ *     GFP_KERNEL_ACCOUNT. The old table is freed via RCU.
+ *   condition: newfd >= fdt->max_fds
+ *   reversible: no
+ *
+ * constraint: RLIMIT_NOFILE
+ *   desc: The @newfd argument must be less than the process's RLIMIT_NOFILE
+ *     soft limit. This limit can be increased up to the hard limit using
+ *     setrlimit() or prlimit(). The default soft limit is typically 1024.
+ *
+ * constraint: sysctl_nr_open
+ *   desc: The @newfd argument must be less than the system-wide limit
+ *     /proc/sys/fs/nr_open (default approximately 1M). This provides a ceiling
+ *     for RLIMIT_NOFILE.
+ *
+ * constraint: Distinct descriptors
+ *   desc: The @oldfd and @newfd arguments must be different. This is a key
+ *     difference from dup2() which allows oldfd == newfd as a no-op.
+ *
+ * examples: fd2 = dup3(fd1, 10, O_CLOEXEC);  // Duplicate fd1 to fd 10 with close-on-exec
+ *   fd2 = dup3(fd1, 10, 0);  // Duplicate fd1 to fd 10, clear close-on-exec
+ *   // Error checking: if (fd2 < 0) { perror("dup3"); }
+ *   // Note: fd2 == 10 on success (always equals newfd)
+ *
+ * notes: dup3() was introduced in Linux 2.6.27 to provide atomic close-on-exec
+ *   flag setting. It is Linux-specific and not part of POSIX, though a POSIX
+ *   proposal exists. glibc support was added in version 2.9.
+ *
+ *   The primary advantage over dup2() + fcntl(F_SETFD, FD_CLOEXEC) is atomicity:
+ *   in multi-threaded programs, there's no window between dup2() and fcntl()
+ *   where another thread could fork() and exec(), leaking the file descriptor.
+ *
+ *   The man page lists EINTR as a possible error, but the kernel implementation
+ *   does not use interruptible waits. The wait_event() in expand_files() is
+ *   non-interruptible. Thus, dup3() cannot be interrupted by signals in the
+ *   current implementation.
+ *
+ *   The syscall can sleep during fd table expansion (memory allocation) or
+ *   when waiting for a concurrent resize to complete. It is therefore not
+ *   safe to call from atomic context or with spinlocks held.
+ *
+ *   Race with concurrent close: If another thread closes @oldfd while this
+ *   thread is in dup3(), the behavior depends on timing. The lookup under
+ *   files->file_lock ensures consistency - dup3() will either see the file
+ *   before close (and succeed) or after (and return EBADF).
+ *
+ *   Race with concurrent open to @newfd: If another thread allocates @newfd
+ *   via get_unused_fd_flags() but hasn't called fd_install() yet, dup3()
+ *   returns EBUSY. This protects the invariant that allocated fds have NULL
+ *   in the fd array until fd_install().
+ *
+ *   No capabilities are required. No LSM security hooks are invoked (unlike
+ *   receive_fd which calls security_file_receive).
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
 {
 	return ksys_dup3(oldfd, newfd, flags);
