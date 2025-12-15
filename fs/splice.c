@@ -1866,6 +1866,411 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
 	return error;
 }
 
+/**
+ * sys_splice - Transfer data between file descriptors using a pipe buffer
+ * @fd_in: File descriptor to read from (source)
+ * @off_in: Pointer to input file offset, or NULL to use current file position
+ * @fd_out: File descriptor to write to (destination)
+ * @off_out: Pointer to output file offset, or NULL to use current file position
+ * @len: Maximum number of bytes to transfer
+ * @flags: Behavioral modifier flags (SPLICE_F_* constants)
+ *
+ * long-desc: Transfers up to @len bytes of data between two file descriptors
+ *   without copying data between kernel and user address space. At least one
+ *   of fd_in or fd_out must refer to a pipe. The data transfer uses the pipe's
+ *   internal page buffers as an intermediary, enabling efficient zero-copy
+ *   operations.
+ *
+ *   When both fd_in and fd_out are pipes (pipe-to-pipe splice), data is moved
+ *   directly between the pipe buffers. The pipe buffer entries from the input
+ *   pipe are transferred to the output pipe without copying the underlying
+ *   page data.
+ *
+ *   When fd_in is a pipe and fd_out is a file (pipe-to-file splice), data is
+ *   read from the pipe and written to the file using the file's splice_write
+ *   operation. The file's current position is updated unless off_out is
+ *   provided.
+ *
+ *   When fd_in is a file and fd_out is a pipe (file-to-pipe splice), data is
+ *   read from the file using the file's splice_read operation and placed into
+ *   the pipe. The file's current position is updated unless off_in is provided.
+ *   The input file must support seeking (FMODE_LSEEK) when splicing to an
+ *   internal kernel pipe used for file-to-file transfers via do_splice_direct.
+ *
+ *   If neither fd_in nor fd_out is a pipe, the syscall returns EINVAL. Direct
+ *   file-to-file splicing is not supported through this syscall; use
+ *   copy_file_range(2) or sendfile(2) for that purpose.
+ *
+ *   The offset parameters (off_in, off_out) control where data is read from
+ *   or written to. If NULL, the file's current position is used and updated.
+ *   If non-NULL, the pointed-to offset is used and updated, but the file's
+ *   current position remains unchanged. Offsets cannot be specified for pipe
+ *   file descriptors (returns ESPIPE).
+ *
+ *   The operation may transfer fewer bytes than requested. This can happen if:
+ *   the pipe buffer becomes full or empty, end-of-file is reached on input,
+ *   the file's splice operation returns a short count, or SPLICE_F_NONBLOCK
+ *   is set and the operation would block.
+ *
+ *   Splice was designed to enable high-performance I/O by avoiding unnecessary
+ *   data copying. It is particularly useful for network servers that need to
+ *   send file data to sockets, or for efficiently moving data between files
+ *   and pipes.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd_in
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor open for reading (FMODE_READ).
+ *     Can be a pipe (created via pipe/pipe2), a regular file, a block device,
+ *     a character device, or certain other file types that support splice_read.
+ *     If fd_in is a pipe, off_in must be NULL or ESPIPE is returned. If fd_in
+ *     is not a pipe and off_in is non-NULL, the file must support FMODE_PREAD
+ *     or EINVAL is returned. If fd_in does not support splice_read and is not
+ *     a pipe while fd_out is a pipe, EINVAL is returned. Invalid file
+ *     descriptor returns EBADF.
+ *
+ * param: off_in
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Optional pointer to a 64-bit file offset in user space. If
+ *     NULL, the current file position of fd_in is used and updated. If
+ *     non-NULL, specifies the offset to read from; the pointed-to value is
+ *     updated with the new offset but the file's position is unchanged. Must
+ *     be NULL if fd_in refers to a pipe (ESPIPE otherwise). The offset must
+ *     be non-negative for files without FOP_UNSIGNED_OFFSET flag (EINVAL
+ *     otherwise). The offset plus len must not overflow (EOVERFLOW otherwise).
+ *     If the pointer is invalid, EFAULT is returned.
+ *
+ * param: fd_out
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor open for writing (FMODE_WRITE).
+ *     Can be a pipe, a regular file, a block device, a socket, or certain other
+ *     file types that support splice_write. If fd_out is a pipe, off_out must
+ *     be NULL or ESPIPE is returned. If fd_out is not a pipe and off_out is
+ *     non-NULL, the file must support FMODE_PWRITE or EINVAL is returned. If
+ *     fd_out is opened with O_APPEND, EINVAL is returned (append mode is
+ *     incompatible with splice). If fd_out does not support splice_write and
+ *     fd_in is a pipe, EINVAL is returned. If fd_out is the same pipe as fd_in,
+ *     EINVAL is returned (no self-splicing). Invalid file descriptor returns
+ *     EBADF.
+ *
+ * param: off_out
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Optional pointer to a 64-bit file offset in user space. If
+ *     NULL, the current file position of fd_out is used and updated. If
+ *     non-NULL, specifies the offset to write to; the pointed-to value is
+ *     updated with the new offset but the file's position is unchanged. Must
+ *     be NULL if fd_out refers to a pipe (ESPIPE otherwise). The offset must
+ *     be non-negative for files without FOP_UNSIGNED_OFFSET flag (EINVAL
+ *     otherwise). If the pointer is invalid, EFAULT is returned.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, SIZE_MAX
+ *   constraint: Maximum number of bytes to transfer. If zero, the syscall
+ *     returns 0 immediately without any operation. The actual number of bytes
+ *     transferred may be less than requested due to pipe buffer capacity,
+ *     end-of-file, or partial completion. Internally capped by MAX_RW_COUNT
+ *     (~2GB) and pipe buffer space. Negative values when cast to ssize_t
+ *     return EINVAL (via rw_verify_area).
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT
+ *   constraint: Bitwise OR of zero or more SPLICE_F_* flags. SPLICE_F_MOVE
+ *     (0x01) is a hint to move pages instead of copying where possible; since
+ *     kernel 2.6.21 this is a no-op as the functionality was removed due to
+ *     implementation issues. SPLICE_F_NONBLOCK (0x02) makes pipe operations
+ *     non-blocking; if the pipe buffer is full (writing) or empty (reading)
+ *     and would block, EAGAIN is returned instead. Note: this only affects pipe
+ *     operations; file operations may still block unless O_NONBLOCK is set on
+ *     the file. SPLICE_F_MORE (0x04) hints that more data will be sent soon;
+ *     useful for sockets to enable TCP corking behavior. SPLICE_F_GIFT (0x08)
+ *     is unused for splice() (only meaningful for vmsplice). Any bits outside
+ *     SPLICE_F_ALL cause EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes transferred (non-negative).
+ *     This may be less than @len if the pipe buffer filled, the source ran out
+ *     of data, or a partial transfer occurred. A return value of 0 indicates
+ *     end-of-file on the input, which occurs when reading from an empty pipe
+ *     with no writers, reading a file at or past EOF, or when @len is 0. On
+ *     error, returns a negative error code.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Multiple conditions cause EINVAL: (1) flags contains invalid bits
+ *     (any bits not in SPLICE_F_ALL); (2) neither fd_in nor fd_out refers to
+ *     a pipe; (3) fd_in and fd_out refer to the same pipe; (4) off_in is
+ *     non-NULL for a non-pipe fd_in that lacks FMODE_PREAD; (5) off_out is
+ *     non-NULL for a non-pipe fd_out that lacks FMODE_PWRITE; (6) fd_out is
+ *     opened with O_APPEND; (7) the input file lacks splice_read support;
+ *     (8) the output file lacks splice_write support; (9) offset is negative
+ *     and file doesn't support unsigned offsets; (10) len is negative as
+ *     ssize_t.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: Returned when fd_in is not a valid open file descriptor, fd_out is
+ *     not a valid open file descriptor, fd_in is not open for reading
+ *     (FMODE_READ not set), or fd_out is not open for writing (FMODE_WRITE
+ *     not set).
+ *
+ * error: ESPIPE, Illegal seek
+ *   desc: Returned when an offset (off_in or off_out) is provided for a file
+ *     descriptor that refers to a pipe. Pipes do not have a file position, so
+ *     explicit offsets are not allowed. Use NULL for the offset when the
+ *     corresponding file descriptor is a pipe.
+ *
+ * error: EFAULT, Bad address
+ *   desc: Returned when off_in or off_out points to an invalid user-space
+ *     address that cannot be read from or written to. This occurs during
+ *     copy_from_user() when reading the initial offset value or during
+ *     copy_to_user() when writing back the updated offset. Also returned
+ *     if pipe_buf_get() fails to get a reference to a pipe buffer page
+ *     (rare, indicates page reference counting issue).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel memory allocation failed. This can occur when: (1) allocating
+ *     internal buffers for splice operations (bio_vec arrays); (2) allocating
+ *     pages for copy_splice_read when direct splicing isn't possible; (3)
+ *     allocating an internal pipe for file-to-file splice via do_splice_direct;
+ *     (4) growing the splice_pipe_desc arrays.
+ *
+ * error: EPIPE, Broken pipe
+ *   desc: Returned when writing to a pipe that has no readers (all read ends
+ *     have been closed, pipe->readers == 0). SIGPIPE is sent to the calling
+ *     process before returning this error. The signal is sent via send_sig()
+ *     and the default action is to terminate the process. Applications can
+ *     ignore or handle SIGPIPE to receive this error instead of dying.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: SPLICE_F_NONBLOCK was set and the pipe operation would block. For
+ *     pipe-to-file/socket splicing, this means the input pipe is empty. For
+ *     file-to-pipe splicing, this means the output pipe is full. For pipe-to-
+ *     pipe splicing, this means either the input pipe is empty or the output
+ *     pipe is full. Also returned for O_NONBLOCK sockets when the socket buffer
+ *     is full. Without SPLICE_F_NONBLOCK, the syscall would sleep until data
+ *     or space becomes available.
+ *
+ * error: ERESTARTSYS, Interrupted by signal (restartable)
+ *   desc: A signal was delivered to the calling thread while it was blocked
+ *     waiting for the pipe to become readable or writable. This error code is
+ *     handled by the kernel's signal restart mechanism: if the signal handler
+ *     was installed with SA_RESTART, the syscall is automatically restarted
+ *     after the handler returns; otherwise, -EINTR is returned to user space.
+ *     The signal check occurs in ipipe_prep(), opipe_prep(), wait_for_space(),
+ *     splice_from_pipe_next(), and splice_pipe_to_pipe().
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: Returned by rw_verify_area() when the offset plus count would
+ *     overflow the maximum file position for files that don't support unsigned
+ *     offsets. This is a safety check to prevent integer overflow in file
+ *     position calculations.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Returned by security_file_permission() via rw_verify_area() when
+ *     a Linux Security Module (LSM) such as SELinux, AppArmor, or Smack denies
+ *     the read or write operation on the file. The LSM hook is called to
+ *     revalidate permissions before the splice operation.
+ *
+ * error: EIO, Input/output error
+ *   desc: Can be returned when reading from a page-cache backed pipe buffer
+ *     (via page_cache_pipe_buf_confirm) if the underlying page had a read
+ *     error from the filesystem. The folio uptodate flag is checked and EIO
+ *     is returned if the page data is invalid.
+ *
+ * lock: pipe->mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The pipe's mutex is acquired via pipe_lock() for each pipe involved
+ *     in the splice operation. For pipe-to-pipe splicing, pipe_double_lock()
+ *     acquires both mutexes in address order to prevent ABBA deadlock. The
+ *     lock is held while accessing and modifying pipe buffer contents including
+ *     head/tail pointers. For blocking waits, the lock is temporarily released
+ *     during pipe_wait_readable() or pipe_wait_writable() to allow other
+ *     processes to access the pipe. The lock is always released before the
+ *     syscall returns.
+ *
+ * lock: inode->i_rwsem (file_start_write)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: For pipe-to-file splicing, file_start_write() acquires the file's
+ *     freeze protection (sb_start_write) before calling the splice_write
+ *     operation. This prevents splicing while the filesystem is frozen for
+ *     snapshots. The protection is released via file_end_write() after the
+ *     splice operation completes.
+ *
+ * signal: SIGPIPE
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Writing to pipe with no readers
+ *   desc: When attempting to splice data into a pipe that has no readers
+ *     (pipe->readers == 0), SIGPIPE is sent to the calling process via
+ *     send_sig() before returning EPIPE. This occurs in opipe_prep(),
+ *     wait_for_space(), and splice_pipe_to_pipe(). The default signal action
+ *     terminates the process. Applications should handle or ignore SIGPIPE
+ *     if they want to receive the EPIPE error instead.
+ *   error: -EPIPE
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: Any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Waiting for pipe to become readable or writable
+ *   desc: While blocked in pipe_wait_readable() or pipe_wait_writable()
+ *     waiting for pipe space or data, any signal delivered to the thread
+ *     causes signal_pending() to return true, terminating the wait loop.
+ *     The syscall returns ERESTARTSYS which the kernel converts to EINTR
+ *     or automatically restarts depending on SA_RESTART.
+ *   error: -ERESTARTSYS
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILE_POSITION
+ *   target: Input and output files
+ *   desc: When off_in is NULL, the file position of fd_in is advanced by the
+ *     number of bytes read. When off_out is NULL, the file position of fd_out
+ *     is advanced by the number of bytes written. When offsets are provided,
+ *     only the pointed-to values are updated, not the files' positions.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Pipe buffers
+ *   desc: For pipe-to-file or pipe-to-pipe splicing, data is consumed from
+ *     the input pipe, advancing pipe->tail and releasing pipe_buffer entries.
+ *     For file-to-pipe or pipe-to-pipe splicing, data is added to the output
+ *     pipe, advancing pipe->head and filling pipe_buffer entries. Page
+ *     references are transferred or copied between buffers.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Pipe waiters
+ *   desc: After adding data to a pipe, wakeup_pipe_readers() wakes processes
+ *     blocked in read() or poll() on the pipe via wake_up_interruptible().
+ *     After consuming data from a pipe, wakeup_pipe_writers() wakes processes
+ *     blocked in write() on the pipe. Also sends SIGIO via kill_fasync() if
+ *     fasync is configured on the pipe.
+ *   condition: When pipe occupancy changes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File metadata and fsnotify
+ *   desc: On successful transfer (return > 0), fsnotify_modify() is called
+ *     on the output file and fsnotify_access() is called on the input file.
+ *     This generates inotify/fanotify events (IN_MODIFY, IN_ACCESS) for
+ *     watchers. File access and modification timestamps may be updated by
+ *     the underlying file operations.
+ *   condition: Only on successful transfer
+ *
+ * state-trans: input pipe
+ *   from: contains data
+ *   to: less data (or empty)
+ *   condition: Pipe-to-file or pipe-to-pipe splice with successful transfer
+ *   desc: Data is consumed from the input pipe, pipe->tail advances, and
+ *     pipe_buffer entries are released. Pipe writers may be woken if the
+ *     pipe was previously full.
+ *
+ * state-trans: output pipe
+ *   from: has space (or empty)
+ *   to: more data (or full)
+ *   condition: File-to-pipe or pipe-to-pipe splice with successful transfer
+ *   desc: Data is added to the output pipe, pipe->head advances, and new
+ *     pipe_buffer entries reference the data pages. Pipe readers may be
+ *     woken if the pipe was previously empty.
+ *
+ * state-trans: output file
+ *   from: current contents
+ *   to: data appended/written at offset
+ *   condition: Pipe-to-file splice with successful transfer
+ *   desc: The file's contents are modified at the specified offset. For
+ *     regular files, this may involve page cache updates, block allocation,
+ *     and eventual disk writeback. For sockets, this sends data packets.
+ *
+ * constraint: Pipe requirement
+ *   desc: At least one of fd_in or fd_out must refer to a pipe. If neither
+ *     is a pipe, EINVAL is returned. This is a fundamental design constraint
+ *     of splice - the pipe buffer is used as an intermediate transport.
+ *
+ * constraint: No append mode
+ *   desc: The output file (fd_out) must not be opened with O_APPEND flag.
+ *     Append mode is incompatible with splice because splice needs to write
+ *     at specific offsets. If O_APPEND is set, EINVAL is returned.
+ *
+ * constraint: Pipe capacity
+ *   desc: The amount of data that can be transferred in a single call is
+ *     limited by pipe buffer capacity. Default capacity is 16 pages (65536
+ *     bytes) but can be changed via F_SETPIPE_SZ fcntl up to the value in
+ *     /proc/sys/fs/pipe-max-size (default 1MB, max set by pipe-max-pages).
+ *     If the output pipe is full, the call blocks or returns EAGAIN.
+ *
+ * constraint: Maximum transfer size
+ *   desc: Individual transfers are capped at MAX_RW_COUNT (~2GB) per call.
+ *     For pipe reads, the transfer is further limited to available pipe
+ *     buffer space in pages (pipe->max_usage - current usage) * PAGE_SIZE.
+ *
+ * constraint: File splice support
+ *   desc: Non-pipe files must have appropriate splice operation support in
+ *     their file_operations structure. The input file needs splice_read
+ *     (or copy_splice_read is used as fallback for O_DIRECT/DAX files).
+ *     The output file needs splice_write. Files without these operations
+ *     return EINVAL when used with splice.
+ *
+ * constraint: FMODE_LSEEK for internal pipe
+ *   desc: When doing file-to-file transfers internally through
+ *     splice_direct_to_actor (used by sendfile), the input file must have
+ *     FMODE_LSEEK set. This ensures the file supports seeking, which is
+ *     required for position tracking in the internal pipe transfer.
+ *
+ * examples: splice(fd_in, NULL, pipefd[1], NULL, 4096, 0);  // File to pipe
+ *   splice(pipefd[0], NULL, fd_out, NULL, 4096, 0);  // Pipe to file
+ *   splice(pipefd[0], NULL, sockfd, NULL, 4096, SPLICE_F_MORE);  // Pipe to socket
+ *   splice(fd_in, &off, pipefd[1], NULL, 4096, 0);  // File at offset to pipe
+ *   splice(pipefd_in[0], NULL, pipefd_out[1], NULL, 4096, SPLICE_F_NONBLOCK);
+ *
+ * notes: The SPLICE_F_MOVE flag was intended to enable true zero-copy by
+ *   moving pages directly from one buffer to another instead of copying.
+ *   However, the implementation was problematic and was effectively disabled
+ *   in kernel 2.6.21. The flag is now a no-op but is still accepted for
+ *   backwards compatibility.
+ *
+ *   splice() was designed to work with pipes as a fundamental building block.
+ *   The common pattern is: splice data from a file into a pipe, then splice
+ *   from the pipe to a socket. This can be done in a zero-copy manner where
+ *   the same pages are shared between the file page cache, the pipe buffer,
+ *   and the socket buffer.
+ *
+ *   The O_NONBLOCK flag on file descriptors interacts with SPLICE_F_NONBLOCK.
+ *   If either the input or output pipe has O_NONBLOCK set, the pipe operations
+ *   become non-blocking automatically. SPLICE_F_NONBLOCK only affects pipe
+ *   operations, not underlying file I/O.
+ *
+ *   A race condition concern was documented in 2023 regarding splice from
+ *   page cache to sockets: if a file is modified while splice is in progress,
+ *   the new data may be sent instead of the original data. This is because
+ *   splice shares page cache pages directly without copying. Applications
+ *   needing consistency should use appropriate file locking.
+ *
+ *   FMODE_NOWAIT is explicitly cleared from pipe file descriptors when splice
+ *   operates on them, to prevent interference with other pipe operations.
+ *   This is handled in __do_splice() via pipe_clear_nowait().
+ *
+ * since-version: 2.6.17
+ */
 SYSCALL_DEFINE6(splice, int, fd_in, loff_t __user *, off_in,
 		int, fd_out, loff_t __user *, off_out,
 		size_t, len, unsigned int, flags)
