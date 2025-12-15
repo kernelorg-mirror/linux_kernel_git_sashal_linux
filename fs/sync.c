@@ -1057,55 +1057,318 @@ out:
 	return ret;
 }
 
-/*
- * ksys_sync_file_range() permits finely controlled syncing over a segment of
- * a file in the range offset .. (offset+nbytes-1) inclusive.  If nbytes is
- * zero then ksys_sync_file_range() will operate from offset out to EOF.
+/**
+ * sys_sync_file_range - Synchronize a file segment with disk
+ * @fd: File descriptor for the file to synchronize
+ * @offset: Starting byte offset for the range to sync
+ * @nbytes: Number of bytes to sync (0 means sync to end of file)
+ * @flags: Bitmask of SYNC_FILE_RANGE_* flags controlling the operation
  *
- * The flag bits are:
+ * long-desc: Provides fine-grained control for synchronizing file data in
+ *   a specific byte range to the underlying storage device. Unlike fsync(2)
+ *   and fdatasync(2), this syscall allows applications to precisely control
+ *   which data is written and whether to wait for completion.
  *
- * SYNC_FILE_RANGE_WAIT_BEFORE: wait upon writeout of all pages in the range
- * before performing the write.
+ *   The offset and nbytes parameters specify the range to synchronize. The
+ *   offset is rounded down to the nearest page boundary, and the end of
+ *   the range (offset + nbytes) is rounded up to the nearest page boundary.
+ *   If nbytes is 0, the operation extends from offset to the end of the file.
  *
- * SYNC_FILE_RANGE_WRITE: initiate writeout of all those dirty pages in the
- * range which are not presently under writeback. Note that this may block for
- * significant periods due to exhaustion of disk request structures.
+ *   The flags parameter is a bitmask that controls the synchronization
+ *   behavior through three independent operations:
  *
- * SYNC_FILE_RANGE_WAIT_AFTER: wait upon writeout of all pages in the range
- * after performing the write.
+ *   SYNC_FILE_RANGE_WAIT_BEFORE (1): Wait for writeout of all pages in the
+ *     range that are already under writeback to complete before proceeding.
+ *     This ensures any in-flight I/O completes before new writeout starts.
  *
- * Useful combinations of the flag bits are:
+ *   SYNC_FILE_RANGE_WRITE (2): Initiate writeout of all dirty pages in the
+ *     range that are not presently under writeback. When used alone or with
+ *     only WAIT_BEFORE, this uses WB_SYNC_NONE mode (asynchronous writeback).
+ *     When combined with both WAIT_BEFORE and WAIT_AFTER, uses WB_SYNC_ALL
+ *     mode for data integrity (waits for any in-flight I/O to complete before
+ *     starting new I/O, ensuring pages dirty at entry are placed under I/O).
  *
- * SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE: ensures that all pages
- * in the range which were dirty on entry to ksys_sync_file_range() are placed
- * under writeout.  This is a start-write-for-data-integrity operation.
+ *   SYNC_FILE_RANGE_WAIT_AFTER (4): Wait for writeout of all pages in the
+ *     range to complete after the WRITE operation. Returns any errors that
+ *     occurred during writeback.
  *
- * SYNC_FILE_RANGE_WRITE: start writeout of all dirty pages in the range which
- * are not presently under writeout.  This is an asynchronous flush-to-disk
- * operation.  Not suitable for data integrity operations.
+ *   Common flag combinations:
+ *   - 0: No operation (returns success immediately)
+ *   - WRITE (2): Asynchronous flush, not suitable for data integrity
+ *   - WAIT_BEFORE|WRITE (3): Start writeback for data integrity
+ *   - WAIT_AFTER (4): Wait for completion of previous async writeback
+ *   - WRITE_AND_WAIT (7): Full data sync equivalent to fdatasync on the range
  *
- * SYNC_FILE_RANGE_WAIT_BEFORE (or SYNC_FILE_RANGE_WAIT_AFTER): wait for
- * completion of writeout of all pages in the range.  This will be used after an
- * earlier SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE operation to wait
- * for that operation to complete and to return the result.
+ *   CRITICAL LIMITATIONS (read carefully before use):
+ *   1. NO METADATA SYNC: This syscall NEVER writes file metadata. Without
+ *      metadata persistence, data written to newly-allocated blocks may be
+ *      lost on crash because the block allocation is not recorded.
+ *   2. NO DISK CACHE FLUSH: The syscall does not issue a disk cache flush
+ *      command. Data may remain in volatile disk cache after return.
+ *   3. OVERWRITES ONLY: Data integrity is only guaranteed when overwriting
+ *      existing, already-allocated disk blocks. For new writes past EOF or
+ *      writes to holes, use fsync(2) or fdatasync(2) instead.
+ *   4. COW FILESYSTEMS: On copy-on-write filesystems (btrfs, etc.), even
+ *      overwrites may allocate new blocks, breaking the overwrite guarantee.
  *
- * SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER
- * (a.k.a. SYNC_FILE_RANGE_WRITE_AND_WAIT):
- * a traditional sync() operation.  This is a write-for-data-integrity operation
- * which will ensure that all pages in the range which were dirty on entry to
- * ksys_sync_file_range() are written to disk.  It should be noted that disk
- * caches are not flushed by this call, so there are no guarantees here that the
- * data will be available on disk after a crash.
+ *   The syscall is designed for applications like databases that can track
+ *   which regions are already allocated and want fine-grained control over
+ *   background writeback to reduce latency spikes.
  *
+ *   On 32-bit architectures where 64-bit arguments must be aligned (ARM,
+ *   PowerPC), an alternative syscall sync_file_range2() is provided with
+ *   the flags parameter before the 64-bit arguments to avoid register
+ *   padding overhead.
  *
- * SYNC_FILE_RANGE_WAIT_BEFORE and SYNC_FILE_RANGE_WAIT_AFTER will detect any
- * I/O errors or ENOSPC conditions and will return those to the caller, after
- * clearing the EIO and ENOSPC flags in the address_space.
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
  *
- * It should be noted that none of these operations write out the file's
- * metadata.  So unless the application is strictly performing overwrites of
- * already-instantiated disk blocks, there are no guarantees here that the data
- * will be available after a crash.
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid file descriptor for an open file. The file
+ *     must be a regular file, block device, directory, or symbolic link.
+ *     Notably, the file descriptor does NOT need to be opened for writing;
+ *     sync_file_range can sync data written through other file descriptors
+ *     referring to the same file. This matches fsync() and fdatasync()
+ *     behavior. Pipes, sockets, FIFOs, and other special file types return
+ *     ESPIPE.
+ *
+ * param: offset
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, LLONG_MAX
+ *   constraint: Starting byte offset for synchronization, must be non-negative.
+ *     Rounded down to the nearest page boundary internally. The offset does
+ *     not need to be within the current file size; if the offset exceeds the
+ *     file size, the operation succeeds immediately with nothing to sync.
+ *     On 32-bit systems with 32-bit pgoff_t, offsets at or beyond
+ *     0x100000000ULL * PAGE_SIZE (typically 16TB on 4KB page systems) succeed
+ *     immediately as they are beyond the addressable page cache range.
+ *
+ * param: nbytes
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, LLONG_MAX
+ *   constraint: Length of the range to synchronize in bytes. When set to 0,
+ *     the range extends from offset to the end of the file (LLONG_MAX is used
+ *     internally as the end boundary). The end of the range is calculated as
+ *     offset + nbytes - 1 (inclusive) and rounded up to page boundary. The
+ *     sum offset + nbytes must not overflow a signed 64-bit value; overflow
+ *     returns EINVAL. Negative values when cast to signed are rejected.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+ *   constraint: Bitmask of synchronization control flags. Only the three
+ *     defined SYNC_FILE_RANGE_* flags are valid. Setting any other bits
+ *     returns EINVAL. The value 0 is permitted and results in no operation
+ *     (immediate success). The combination SYNC_FILE_RANGE_WRITE_AND_WAIT (7)
+ *     represents all three flags and provides the strongest guarantee.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the requested synchronization
+ *     operations completed. For WAIT_BEFORE and WAIT_AFTER operations, this
+ *     means all pages in the range have completed writeback. For WRITE alone,
+ *     this only means writeback was successfully initiated. Success does NOT
+ *     guarantee data has reached persistent media due to disk write caches.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The file descriptor fd is not a valid open file descriptor. This
+ *     occurs if fd was never opened, has been closed, or is outside the
+ *     valid range for the process's file descriptor table.
+ *
+ * error: EINVAL, Invalid flags specified
+ *   desc: The flags argument contains bits other than the three valid
+ *     SYNC_FILE_RANGE_* flags. Only bits 0, 1, and 2 may be set; any other
+ *     bits being set causes this error.
+ *
+ * error: EINVAL, Invalid offset (negative)
+ *   desc: The offset argument, when interpreted as a signed 64-bit value,
+ *     is negative. File offsets must be non-negative.
+ *
+ * error: EINVAL, Invalid range (overflow or wraparound)
+ *   desc: The sum of offset + nbytes, when interpreted as a signed 64-bit
+ *     value, overflows or wraps around to a negative value. This also
+ *     occurs if the calculated end byte (offset + nbytes) is less than
+ *     offset, indicating arithmetic overflow.
+ *
+ * error: ESPIPE, Illegal seek (unsupported file type)
+ *   desc: The file referred to by fd is not a regular file, block device,
+ *     directory, or symbolic link. Pipes, FIFOs, sockets, and certain
+ *     other special files do not support synchronization and return this
+ *     error. This is the same error returned by lseek(2) on such files.
+ *
+ * error: EIO, I/O error during writeback
+ *   desc: An I/O error occurred while writing data to the storage device.
+ *     This error is detected during WAIT_BEFORE or WAIT_AFTER operations
+ *     via the AS_EIO flag in the address_space. The error may reflect a
+ *     previous write operation that failed during background writeback.
+ *     After this error, some pages may have been written while others
+ *     failed. The specific affected pages cannot be determined. The
+ *     AS_EIO flag is cleared after being reported.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The filesystem ran out of space during writeback. This typically
+ *     occurs when delayed allocation fails to find space for data that
+ *     was successfully buffered in memory. Detected via the AS_ENOSPC
+ *     flag in the address_space during WAIT_BEFORE or WAIT_AFTER. The
+ *     AS_ENOSPC flag is cleared after being reported.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed during the writeback operation. When
+ *     using SYNC_FILE_RANGE_WRITE_AND_WAIT (all three flags), the kernel
+ *     uses WB_SYNC_ALL mode which will retry writeback after reclaim
+ *     throttling if ENOMEM occurs. With other flag combinations using
+ *     WB_SYNC_NONE mode, ENOMEM is returned immediately without retry.
+ *
+ * lock: mapping->i_pages (xa_lock)
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The xarray lock protecting the page cache is acquired briefly
+ *     during page lookup and writeback state changes. Acquired via
+ *     xa_lock_irq() when iterating pages under writeback during the
+ *     WAIT_BEFORE and WAIT_AFTER phases. Also acquired during writeback
+ *     initiation when looking up dirty pages.
+ *
+ * lock: PG_writeback (page bit lock)
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: true
+ *   released: true
+ *   desc: During WAIT_BEFORE and WAIT_AFTER operations, folio_wait_writeback()
+ *     waits on the PG_writeback bit of each page in the range. The wait
+ *     uses TASK_UNINTERRUPTIBLE state, making it non-interruptible by
+ *     signals. The bit is set by writeback initiation and cleared by I/O
+ *     completion handlers.
+ *
+ * lock: file->f_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired during file_check_and_advance_wb_err() when checking
+ *     and advancing the file's writeback error sequence number. Ensures
+ *     atomic error reporting across concurrent sync operations on the
+ *     same file descriptor.
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DISCARD
+ *   condition: During any wait operation
+ *   desc: All wait operations in sync_file_range() use TASK_UNINTERRUPTIBLE
+ *     state via folio_wait_writeback(). This makes the syscall completely
+ *     non-interruptible by signals. Signals delivered during the sync
+ *     remain pending and are handled after return. The process will appear
+ *     to hang if storage is slow or unresponsive. The hung task detector
+ *     will log a warning after hung_task_timeout_secs (default 120 seconds).
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File data pages in specified range
+ *   desc: When SYNC_FILE_RANGE_WRITE is set, initiates writeback of dirty
+ *     pages in the specified byte range. Pages are submitted to the block
+ *     layer for I/O. The writeback mode (WB_SYNC_NONE vs WB_SYNC_ALL)
+ *     depends on the flag combination. Only file DATA is written; file
+ *     metadata (inode, directory entries, allocation maps) is NOT synced.
+ *   condition: Only when SYNC_FILE_RANGE_WRITE flag is set
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Address space error flags (AS_EIO, AS_ENOSPC)
+ *   desc: When WAIT_BEFORE or WAIT_AFTER operations encounter errors,
+ *     the AS_EIO and AS_ENOSPC flags in the file's address_space are
+ *     checked and cleared via file_check_and_advance_wb_err(). This
+ *     means each error is reported to at most one caller. The file's
+ *     f_wb_err cursor is also advanced to track which errors have been
+ *     reported to this file descriptor.
+ *   condition: During WAIT_BEFORE or WAIT_AFTER operations
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Calling process
+ *   desc: The process may sleep for extended periods waiting for I/O
+ *     completion during WAIT_BEFORE and WAIT_AFTER operations. With
+ *     SYNC_FILE_RANGE_WRITE alone, the process may also block briefly
+ *     if the block device request queue is congested, despite using
+ *     WB_SYNC_NONE mode. cond_resched() is called between processing
+ *     folio batches to allow preemption.
+ *   reversible: no
+ *
+ * constraint: No metadata synchronization
+ *   desc: This syscall NEVER writes file metadata. For files where data
+ *     has been written past EOF or into holes (sparse regions), the
+ *     block allocation metadata is not persisted. A crash after
+ *     sync_file_range() but before an fsync()/fdatasync() may result
+ *     in data loss or corruption even though sync_file_range() returned
+ *     success.
+ *
+ * constraint: No disk cache flush
+ *   desc: The syscall does not issue a disk cache flush command (e.g.,
+ *     FLUSH CACHE or FUA). Data may remain in the disk's volatile write
+ *     cache after this call returns. For true data durability, use
+ *     fsync(2) or fdatasync(2) which issue cache flush commands. This
+ *     syscall is designed for background writeback, not crash safety.
+ *
+ * constraint: 32-bit pgoff_t limitation
+ *   desc: On 32-bit systems with 32-bit pgoff_t (sizeof(pgoff_t) == 4),
+ *     offsets at or beyond 0x100000000ULL << PAGE_SHIFT are beyond the
+ *     page cache's addressing capability. Operations starting at such
+ *     offsets succeed immediately without doing anything. Operations
+ *     ending at such offsets are truncated to the maximum addressable
+ *     range.
+ *
+ * constraint: Per-file-descriptor error reporting
+ *   desc: Writeback errors are tracked per file descriptor using the
+ *     errseq_t mechanism. Errors are reported via the file's f_wb_err
+ *     cursor and are only reported once. If multiple file descriptors
+ *     reference the same file, an error may only be reported to one
+ *     of them. Applications should use a single file descriptor for
+ *     sync operations or check all descriptors.
+ *
+ * constraint: Page-aligned operation
+ *   desc: The actual synchronization operates on page-aligned boundaries.
+ *     The offset is rounded down to the nearest page boundary, and the
+ *     end of the range is rounded up. This may result in syncing slightly
+ *     more data than specified. For 4KB pages, offset 1000 and nbytes 100
+ *     would sync the entire first page (bytes 0-4095).
+ *
+ * examples: sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);  // Async writeback of entire file
+ *   sync_file_range(fd, 0, 4096, SYNC_FILE_RANGE_WRITE_AND_WAIT);  // Sync first 4KB
+ *   sync_file_range(fd, off, len, SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE);  // Start integrity writeback
+ *   sync_file_range(fd, off, len, SYNC_FILE_RANGE_WAIT_AFTER);  // Wait for previous async writeback
+ *
+ * notes: This syscall was introduced in Linux 2.6.17 specifically for
+ *   applications like databases (PostgreSQL) that need fine-grained control
+ *   over writeback without the overhead of full fsync operations.
+ *
+ *   The man page describes this syscall as "extremely dangerous" for portable
+ *   programs due to the lack of metadata synchronization. Use fsync(2) or
+ *   fdatasync(2) for applications requiring crash-safe data persistence.
+ *
+ *   Historical note: The writeback mode was changed to WB_SYNC_NONE in commit
+ *   23d0127096cb (Linux 4.6) for performance, then partially reverted in commit
+ *   c553ea4fdf27 (Linux 5.2) to use WB_SYNC_ALL when all three flags are set,
+ *   matching user expectations for the SYNC_FILE_RANGE_WRITE_AND_WAIT case.
+ *
+ *   Architecture variants: sync_file_range2() is provided for architectures
+ *   (ARM, PowerPC, some others) where 64-bit syscall arguments must be
+ *   register-aligned. It takes flags before offset/nbytes to avoid padding.
+ *   Functionally identical to sync_file_range().
+ *
+ *   NFS consideration: On NFS, this syscall initiates WRITE operations but
+ *   does not issue a COMMIT. The COMMIT (which makes data persistent on the
+ *   server) only happens with fsync()/fdatasync(). Therefore sync_file_range()
+ *   provides even weaker guarantees on NFS than on local filesystems.
+ *
+ * since-version: 2.6.17
  */
 int ksys_sync_file_range(int fd, loff_t offset, loff_t nbytes,
 			 unsigned int flags)
