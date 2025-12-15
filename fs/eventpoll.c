@@ -2558,10 +2558,384 @@ error_tgt_fput:
 	return error;
 }
 
-/*
- * The following function implements the controller interface for
- * the eventpoll file that enables the insertion/removal/change of
- * file descriptors inside the interest set.
+/**
+ * sys_epoll_ctl - Control interface for an epoll file descriptor
+ * @epfd: File descriptor referring to the epoll instance
+ * @op: Operation to perform (EPOLL_CTL_ADD, EPOLL_CTL_MOD, or EPOLL_CTL_DEL)
+ * @fd: Target file descriptor to add, modify, or remove from the interest list
+ * @event: Pointer to epoll_event structure specifying events and user data
+ *
+ * long-desc: Manages entries in the interest list of an epoll file descriptor.
+ *   This syscall allows adding, modifying, or removing file descriptors from
+ *   the set of descriptors being monitored by an epoll instance.
+ *
+ *   The supported operations are:
+ *   - EPOLL_CTL_ADD (1): Register @fd on the epoll instance @epfd. The events
+ *     to monitor and user data are specified in @event. The kernel always adds
+ *     EPOLLERR and EPOLLHUP to the monitored events regardless of the mask.
+ *   - EPOLL_CTL_MOD (3): Change the settings associated with @fd to the new
+ *     settings in @event. This re-arms EPOLLONESHOT file descriptors.
+ *   - EPOLL_CTL_DEL (2): Remove @fd from the interest list. The @event argument
+ *     is ignored and can be NULL on kernels >= 2.6.9. Earlier kernels required
+ *     a non-NULL pointer even though it was unused.
+ *
+ *   The epoll_event structure contains:
+ *   - events: Bitmask of events to monitor (EPOLLIN, EPOLLOUT, etc.)
+ *   - data: User data that is returned unchanged by epoll_wait()
+ *
+ *   When adding a file descriptor, the kernel performs loop detection to
+ *   prevent circular epoll chains (an epoll fd monitoring another epoll fd
+ *   that monitors the first). The nesting depth is limited to EP_MAX_NESTS (4)
+ *   and the number of wakeup paths is also constrained to prevent wakeup
+ *   storms.
+ *
+ *   Edge-triggered mode (EPOLLET) delivers events only when the state changes,
+ *   while level-triggered mode (default) reports events as long as the
+ *   condition persists. EPOLLONESHOT disables the fd after one event is
+ *   delivered, requiring EPOLL_CTL_MOD to re-arm it.
+ *
+ *   EPOLLEXCLUSIVE provides exclusive wakeup semantics to avoid thundering
+ *   herd problems when multiple processes/threads monitor the same fd. This
+ *   flag can only be used with EPOLL_CTL_ADD and not on epoll fds themselves.
+ *
+ *   EPOLLWAKEUP keeps the system awake while the event is pending, useful for
+ *   power management. It requires CAP_BLOCK_SUSPEND capability; without it,
+ *   the flag is silently removed from the events mask rather than returning
+ *   an error.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: epfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to an epoll instance
+ *     created by epoll_create() or epoll_create1(). Cannot be the same as @fd.
+ *     The kernel verifies the underlying file has eventpoll_fops file_operations.
+ *
+ * param: op
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   valid-mask: EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD
+ *   constraint: Must be one of EPOLL_CTL_ADD (1), EPOLL_CTL_DEL (2), or
+ *     EPOLL_CTL_MOD (3). EPOLL_CTL_ADD requires @fd not already be registered.
+ *     EPOLL_CTL_DEL and EPOLL_CTL_MOD require @fd to already be registered.
+ *     Any other value results in EINVAL at the switch statement default case.
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor supporting poll operations
+ *     (file->f_op->poll must be non-NULL). Regular files, directories, and
+ *     some special files that don't support poll return EPERM. Cannot be the
+ *     same as @epfd. Pipes, sockets, eventfds, timerfd, signalfd, and most
+ *     device files are valid targets. An epoll fd can monitor another epoll
+ *     fd, but nesting depth is limited to prevent loops and stack overflow.
+ *
+ * param: event
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: For EPOLL_CTL_ADD and EPOLL_CTL_MOD, must point to a readable
+ *     struct epoll_event in user space. The events field is a bitmask of
+ *     EPOLLIN, EPOLLOUT, EPOLLRDHUP, EPOLLPRI, EPOLLERR, EPOLLHUP, EPOLLET,
+ *     EPOLLONESHOT, EPOLLWAKEUP, and EPOLLEXCLUSIVE. The data field is an
+ *     opaque 64-bit value returned by epoll_wait(). For EPOLL_CTL_DEL, this
+ *     argument is ignored and may be NULL on Linux >= 2.6.9. EPOLLEXCLUSIVE
+ *     is only valid with EPOLL_CTL_ADD and cannot be used with epoll fds or
+ *     combined with flags other than EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP,
+ *     EPOLLWAKEUP, or EPOLLET. If EPOLLEXCLUSIVE is used with EPOLL_CTL_MOD,
+ *     the operation returns EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: On success, returns zero. The requested operation has been completed.
+ *     For EPOLL_CTL_ADD, the fd is now registered and will be monitored. For
+ *     EPOLL_CTL_MOD, the event mask and data have been updated. For
+ *     EPOLL_CTL_DEL, the fd has been removed from the interest list.
+ *
+ * error: EBADF, Invalid epfd or fd file descriptor
+ *   desc: Either @epfd is not a valid file descriptor, @fd is not a valid
+ *     file descriptor, or both are invalid. The kernel obtains file pointers
+ *     via fdget() for both descriptors; if either fd is not allocated in the
+ *     process's file descriptor table, this error is returned. This check
+ *     occurs early, before any locking or validation.
+ *
+ * error: EEXIST, File descriptor already registered (EPOLL_CTL_ADD)
+ *   desc: The @fd is already registered in the interest list of @epfd. Each
+ *     (file descriptor, file pointer) pair can only be registered once per
+ *     epoll instance. Note that if the same underlying file is opened via
+ *     different file descriptors (e.g., via dup()), each can be separately
+ *     registered since they have different file pointers. To modify an
+ *     existing registration, use EPOLL_CTL_MOD instead.
+ *
+ * error: EINVAL, Invalid arguments or operation
+ *   desc: Returned for multiple invalid conditions: (1) @epfd is not an epoll
+ *     file descriptor (the file's f_op is not eventpoll_fops), (2) @fd is
+ *     the same as @epfd (an epoll instance cannot monitor itself), (3) @op
+ *     is not EPOLL_CTL_ADD, EPOLL_CTL_DEL, or EPOLL_CTL_MOD, (4) EPOLLEXCLUSIVE
+ *     is specified with EPOLL_CTL_MOD, (5) EPOLLEXCLUSIVE is used when adding
+ *     an epoll fd to another epoll instance, (6) EPOLLEXCLUSIVE is combined
+ *     with flags other than EPOLLIN, EPOLLOUT, EPOLLWAKEUP, EPOLLERR, EPOLLHUP,
+ *     or EPOLLET, (7) adding an epoll fd would create too many wakeup paths
+ *     (checked by reverse_path_check()).
+ *
+ * error: ELOOP, Loop detected or nesting too deep
+ *   desc: Adding @fd to @epfd would create a circular dependency of epoll file
+ *     descriptors, or the nesting depth exceeds EP_MAX_NESTS (4). The kernel
+ *     performs a graph traversal via ep_loop_check() when adding one epoll fd
+ *     to another to detect cycles. The combined upward and downward depth
+ *     from the insertion point must not exceed 4 to prevent stack overflow
+ *     during wakeup cascades. This error only occurs for EPOLL_CTL_ADD when
+ *     @fd is itself an epoll file descriptor.
+ *
+ * error: ENOENT, File descriptor not registered (EPOLL_CTL_MOD/DEL)
+ *   desc: The @fd is not registered in the interest list of @epfd. This
+ *     error occurs when trying to modify or delete a file descriptor that
+ *     was never added, or was previously removed. The kernel searches for
+ *     the (fd, file pointer) pair in a red-black tree via ep_find(); if not
+ *     found, this error is returned.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to complete the operation. For
+ *     EPOLL_CTL_ADD, this can occur when: (1) allocating struct epitem
+ *     (~128 bytes on 64-bit) via kmem_cache_zalloc(epi_cache), (2) allocating
+ *     struct eppoll_entry for wait queue hooks via kmem_cache_alloc(pwq_cache),
+ *     (3) allocating struct epitems_head for tracking file associations via
+ *     kmem_cache_zalloc(ephead_cache), (4) allocating wakeup_source when
+ *     EPOLLWAKEUP is set. For EPOLL_CTL_MOD, this can occur when adding a
+ *     wakeup_source that wasn't previously allocated. All allocations use
+ *     GFP_KERNEL which allows sleeping and memory reclaim.
+ *
+ * error: ENOSPC, User watches limit exceeded
+ *   desc: The per-user limit on the number of watched file descriptors has
+ *     been reached. This limit is set by /proc/sys/fs/epoll/max_user_watches
+ *     (default is approximately 4% of lowmem divided by ~160 bytes per watch).
+ *     The limit is per-user (tracked via ep->user->epoll_watches), not per
+ *     epoll instance. The error is returned early in ep_insert() before
+ *     allocating the epitem structure. The limit can be increased by root via
+ *     the sysctl interface. This error only occurs for EPOLL_CTL_ADD.
+ *
+ * error: EPERM, File descriptor does not support poll
+ *   desc: The @fd refers to a file that does not support poll operations
+ *     (file->f_op->poll is NULL). Regular files, directories, and certain
+ *     special files cannot be monitored by epoll. This check is performed
+ *     via file_can_poll() early in do_epoll_ctl(). Files that support poll
+ *     include: sockets, pipes, FIFOs, terminals, eventfd, signalfd, timerfd,
+ *     and most character devices. Note that inotify and fanotify fds support
+ *     poll and can be monitored by epoll.
+ *
+ * error: EFAULT, Invalid event pointer
+ *   desc: For EPOLL_CTL_ADD and EPOLL_CTL_MOD, the @event pointer is invalid
+ *     or points to memory that is not readable. The kernel uses copy_from_user()
+ *     to copy the 12-byte (or 16-byte on some architectures) epoll_event
+ *     structure. If the copy fails, this error is returned. This check happens
+ *     in the syscall wrapper before calling do_epoll_ctl(). For EPOLL_CTL_DEL,
+ *     @event is not accessed so EFAULT cannot occur.
+ *
+ * lock: ep->mtx
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The per-epoll instance mutex is acquired via mutex_lock_nested() at
+ *     the start of the operation and released at the end. This mutex serializes
+ *     all EPOLL_CTL operations and protects the red-black tree (ep->rbr),
+ *     the ready list (ep->rdllist), and epitem structures. The mutex allows
+ *     sleeping while held, which is necessary for copy_from_user operations
+ *     and memory allocation in called helper functions.
+ *
+ * lock: epnested_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: A global mutex acquired only during EPOLL_CTL_ADD operations when
+ *     potential nesting is detected (adding an epoll fd to another epoll, or
+ *     when the target file is already being monitored by other epoll instances).
+ *     This mutex prevents race conditions during loop detection that could
+ *     allow creation of cycles. It is released after the operation completes.
+ *     The loop_check_gen counter is incremented under this lock to track
+ *     which eventpoll instances have been visited during cycle detection.
+ *
+ * lock: ep->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-epoll spinlock is acquired briefly when modifying the ready
+ *     list (ep->rdllist) or checking/modifying ovflist. This spinlock can be
+ *     taken from IRQ context in ep_poll_callback(), so it's acquired with
+ *     spin_lock_irq/spin_lock_irqsave. In ep_insert() and ep_modify(), it's
+ *     used when adding items to the ready list after polling shows readiness.
+ *
+ * lock: file->f_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The target file's f_lock spinlock is acquired when adding or removing
+ *     the epitem from the file's f_ep list (a list of all epoll items monitoring
+ *     this file). This enables eventpoll_release_file() to clean up when a file
+ *     is closed. The lock is taken briefly in attach_epitem() and __ep_remove().
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: epitem structure (EPOLL_CTL_ADD only)
+ *   desc: Allocates a struct epitem from the epi_cache slab cache. This
+ *     structure tracks the monitored file descriptor, associated events, and
+ *     linkage in the red-black tree and ready list. The epitem is inserted into
+ *     ep->rbr (red-black tree) for O(log n) lookup by file descriptor. It may
+ *     also be added to ep->rdllist if the fd is already ready.
+ *   condition: EPOLL_CTL_ADD operation succeeds
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: eppoll_entry structure (EPOLL_CTL_ADD only)
+ *   desc: Allocates struct eppoll_entry from pwq_cache to hook into the target
+ *     file's wait queue. This enables the file to wake up epoll when events
+ *     occur. Multiple eppoll_entry structures may be allocated if the file has
+ *     multiple wait queues.
+ *   condition: EPOLL_CTL_ADD and target file has wait queues
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: wakeup_source (conditional)
+ *   desc: If EPOLLWAKEUP is set in the events mask and the caller has
+ *     CAP_BLOCK_SUSPEND capability, a wakeup_source is allocated and registered
+ *     to prevent system suspend while events are pending. The wakeup source
+ *     name is derived from the file's dentry name.
+ *   condition: EPOLLWAKEUP flag set and CAP_BLOCK_SUSPEND held
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: epitem and associated structures (EPOLL_CTL_DEL only)
+ *   desc: For EPOLL_CTL_DEL, the epitem is removed from the red-black tree and
+ *     ready list, wait queue hooks are removed via ep_unregister_pollwait(),
+ *     and the epitem is freed via kfree_rcu() after an RCU grace period. The
+ *     per-user epoll watch counter is decremented.
+ *   condition: EPOLL_CTL_DEL operation succeeds
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: epitem event mask and data (EPOLL_CTL_MOD only)
+ *   desc: Updates the events mask and user data in the existing epitem. If the
+ *     monitored fd is now ready according to the new mask, it is added to the
+ *     ready list. If EPOLLWAKEUP is added, a wakeup_source is created. If
+ *     EPOLLWAKEUP is removed, the wakeup_source is destroyed (via
+ *     synchronize_rcu() followed by wakeup_source_unregister()).
+ *   condition: EPOLL_CTL_MOD operation succeeds
+ *   reversible: yes
+ *
+ * state-trans: epoll_interest_list
+ *   from: fd not registered
+ *   to: fd registered with events mask
+ *   condition: EPOLL_CTL_ADD succeeds
+ *   desc: The file descriptor transitions from not being monitored to being
+ *     in the epoll instance's interest list, stored in the red-black tree.
+ *
+ * state-trans: epoll_interest_list
+ *   from: fd registered with events mask A
+ *   to: fd registered with events mask B
+ *   condition: EPOLL_CTL_MOD succeeds
+ *   desc: The file descriptor's monitored events and user data are updated.
+ *     The fd remains in the interest list with different settings.
+ *
+ * state-trans: epoll_interest_list
+ *   from: fd registered
+ *   to: fd not registered
+ *   condition: EPOLL_CTL_DEL succeeds
+ *   desc: The file descriptor is removed from the interest list and will no
+ *     longer generate events. The epitem is freed after RCU grace period.
+ *
+ * state-trans: epitem_oneshot
+ *   from: events monitored
+ *   to: events disabled (mask cleared except EP_PRIVATE_BITS)
+ *   condition: EPOLLONESHOT set and event delivered via epoll_wait
+ *   desc: After epoll_wait delivers an event for an EPOLLONESHOT fd, the
+ *     events mask is cleared (except private bits). EPOLL_CTL_MOD must be
+ *     used to re-enable event monitoring for this fd.
+ *
+ * capability: CAP_BLOCK_SUSPEND
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Using EPOLLWAKEUP flag to prevent system suspend during event handling
+ *   without: The EPOLLWAKEUP flag is silently removed from the events mask.
+ *     No error is returned, but the wakeup functionality is disabled.
+ *   condition: Checked in ep_take_care_of_epollwakeup() when EPOLLWAKEUP is set
+ *
+ * constraint: User Watch Limit
+ *   desc: The total number of file descriptors watched across all epoll
+ *     instances by a single user is limited by max_user_watches, configurable
+ *     via /proc/sys/fs/epoll/max_user_watches. Default is approximately 4% of
+ *     available lowmem divided by EP_ITEM_COST (~160 bytes). Exceeding this
+ *     limit returns ENOSPC on EPOLL_CTL_ADD.
+ *
+ * constraint: Nesting Depth
+ *   desc: When epoll file descriptors monitor other epoll file descriptors,
+ *     the nesting depth is limited to EP_MAX_NESTS (4) to prevent stack
+ *     overflow during wakeup cascades. Additionally, the number of wakeup
+ *     paths emanating from any single file is limited by path_limits[] array.
+ *     Exceeding these limits returns ELOOP on EPOLL_CTL_ADD.
+ *
+ * constraint: Poll Support
+ *   desc: The target file descriptor must refer to a file type that supports
+ *     poll operations (f_op->poll is non-NULL). Regular files, directories,
+ *     and some special files do not support poll and return EPERM.
+ *
+ * constraint: EPOLLEXCLUSIVE Restrictions
+ *   desc: The EPOLLEXCLUSIVE flag has several restrictions: (1) only valid
+ *     with EPOLL_CTL_ADD, not EPOLL_CTL_MOD, (2) cannot be used when @fd is
+ *     an epoll file descriptor, (3) can only be combined with EPOLLIN,
+ *     EPOLLOUT, EPOLLWAKEUP, EPOLLERR, EPOLLHUP, and EPOLLET. Violating any
+ *     of these returns EINVAL.
+ *
+ * examples: epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);  // Add socket
+ *   epoll_ctl(epfd, EPOLL_CTL_MOD, sockfd, &ev);  // Modify events or re-arm
+ *   epoll_ctl(epfd, EPOLL_CTL_DEL, sockfd, NULL);  // Remove (Linux >= 2.6.9)
+ *   ev.events = EPOLLIN | EPOLLET;  // Edge-triggered read
+ *   ev.events = EPOLLOUT | EPOLLONESHOT;  // One-shot write notification
+ *   ev.events = EPOLLIN | EPOLLEXCLUSIVE;  // Exclusive wakeup (Linux 4.5+)
+ *
+ * notes: The epoll_event structure has different alignment on x86-64 to match
+ *   the 32-bit structure layout, using __attribute__((packed)). This enables
+ *   32-bit applications to work correctly on 64-bit kernels without compat
+ *   syscall handling for epoll_ctl.
+ *
+ *   Closing a file descriptor automatically removes it from all epoll instances
+ *   via eventpoll_release_file(). However, if the same underlying file is
+ *   opened multiple times (e.g., via dup()), the descriptor must be explicitly
+ *   removed from each epoll instance or all file descriptors must be closed.
+ *
+ *   The distinction between file descriptors and file descriptions (struct file)
+ *   is important: epoll tracks (fd number, struct file pointer) pairs. Two
+ *   different fd numbers pointing to the same struct file (via dup()) are
+ *   considered the same entry. But the same fd number after close() and a new
+ *   open() will have a different struct file and thus be a different entry.
+ *
+ *   When using EPOLLEXCLUSIVE, only one of the threads/processes waiting on
+ *   the same event source will be woken up when the event occurs, avoiding
+ *   the thundering herd problem. This is particularly useful for accept()
+ *   on listening sockets shared between multiple processes.
+ *
+ *   Level-triggered mode (default) will keep reporting an event as long as
+ *   the condition persists. Edge-triggered mode (EPOLLET) only reports when
+ *   the state changes. Edge-triggered requires careful programming to avoid
+ *   missing events - applications should read/write until EAGAIN after each
+ *   notification.
+ *
+ *   The operation is atomic with respect to other epoll_ctl calls on the same
+ *   epoll instance - the ep->mtx mutex ensures serialization. However, events
+ *   can be delivered via epoll_wait() concurrently.
+ *
+ *   Historical note: Before Linux 2.6.9, EPOLL_CTL_DEL required a non-NULL
+ *   @event pointer even though the value was ignored. This was fixed to accept
+ *   NULL. Portable applications targeting ancient kernels may still pass a
+ *   dummy pointer for compatibility.
+ *
+ *   EPOLL_CTL_DISABLE was proposed but rejected in favor of the current design.
+ *   The proposed flag would have allowed disabling a registration without
+ *   removing it, but this added complexity without sufficient benefit.
+ *
+ * since-version: 2.6
  */
 SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
