@@ -841,6 +841,234 @@ out:
 	return res;
 }
 
+/**
+ * sys_faccessat - check user's permissions for a file relative to a directory
+ * @dfd: Directory file descriptor (or AT_FDCWD for current working directory)
+ * @filename: Pathname of file to check, relative to @dfd or absolute
+ * @mode: Accessibility check mask (F_OK, R_OK, W_OK, X_OK, or combinations)
+ *
+ * long-desc: Checks whether the calling process can access the file specified
+ *   by @filename. When @dfd is AT_FDCWD, relative paths are resolved from the
+ *   current working directory. When @dfd is a valid directory file descriptor,
+ *   relative paths are resolved from that directory. Absolute paths ignore
+ *   @dfd in both cases.
+ *
+ *   Unlike most syscalls which use effective user/group IDs, faccessat() uses
+ *   the real uid/gid for permission checks. This is achieved by temporarily
+ *   overriding credentials: fsuid is set to uid, fsgid is set to gid, and
+ *   effective capabilities are cleared (for non-root) or set to permitted
+ *   capabilities (for root), unless the SECURE_NO_SETUID_FIXUP securebits flag
+ *   is set. This behavior matches the POSIX access() semantics designed for
+ *   set-user-ID programs to check permissions of the real user.
+ *
+ *   The @mode argument specifies the accessibility checks: F_OK (0) tests for
+ *   existence only, R_OK (4) tests read permission, W_OK (2) tests write
+ *   permission, X_OK (1) tests execute permission. These can be combined via
+ *   bitwise OR. The check succeeds only if ALL requested permissions are
+ *   granted.
+ *
+ *   For regular files with X_OK, the syscall also checks if the filesystem is
+ *   mounted with the "noexec" option and returns -EACCES if so. For write
+ *   permission checks on non-special files, the syscall additionally verifies
+ *   the filesystem is not read-only, returning -EROFS if it is.
+ *
+ *   WARNING: Using access/faccessat to check permissions before opening a file
+ *   creates a time-of-check-time-of-use (TOCTOU) race condition. File
+ *   permissions or existence may change between the check and subsequent
+ *   operation. Do not use this syscall for security-critical access control.
+ *
+ *   This syscall was introduced in Linux 2.6.16. Note that faccessat() does
+ *   not accept a flags argument; use faccessat2() for flag support including
+ *   AT_EACCESS, AT_SYMLINK_NOFOLLOW, and AT_EMPTY_PATH.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be AT_FDCWD (-100) to use current working directory, or
+ *     a valid file descriptor referring to a directory when @filename is a
+ *     relative path. Ignored when @filename is an absolute path. An invalid
+ *     or non-directory file descriptor with a relative path returns -EBADF
+ *     or -ENOTDIR respectively.
+ *
+ * param: filename
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname in user-space memory.
+ *     Maximum total path length is PATH_MAX (4096) bytes including null
+ *     terminator. Individual path components are limited to NAME_MAX (255)
+ *     bytes. An empty string returns -ENOENT. If the pointer is invalid or
+ *     inaccessible, returns -EFAULT.
+ *
+ * param: mode
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: 0x7
+ *   constraint: Must contain only bits from S_IRWXO (octal 0007), corresponding
+ *     to R_OK (4), W_OK (2), X_OK (1), or F_OK (0). The value 0 (F_OK) tests
+ *     only for existence. Any bits set outside this mask cause -EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 if all requested permissions are granted (or if @mode is
+ *     F_OK and the file exists). On failure, returns a negative error code.
+ *
+ * error: EINVAL, Invalid mode bits
+ *   desc: The @mode argument contains bits outside the valid mask (S_IRWXO).
+ *     Valid values are F_OK (0), or any combination of R_OK (4), W_OK (2),
+ *     and X_OK (1).
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @filename pointer points outside the accessible address space.
+ *     Detected when copying the pathname from user space via strncpy_from_user()
+ *     in getname_flags().
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to allocate the filename structure via
+ *     __getname(), or to allocate credentials via prepare_creds() for the
+ *     temporary credential override.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A component of @filename does not exist, or @filename is an empty
+ *     string, or @filename is a dangling symbolic link pointing to a
+ *     nonexistent target, or a directory component has been removed.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: @dfd is not AT_FDCWD and is not a valid open file descriptor,
+ *     and @filename is a relative path. Not returned for absolute paths.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component of @filename used as a directory is not actually a
+ *     directory, or @dfd refers to a non-directory file and @filename is
+ *     a relative path.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The kernel limit is 40 symlinks per path resolution with a maximum
+ *     recursion depth of 8 for nested symbolic links (MAXSYMLINKS).
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: @filename or one of its path components exceeds system limits.
+ *     Individual components are limited to NAME_MAX (255) bytes, and the
+ *     total path is limited to PATH_MAX (4096) bytes including terminator.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The requested access would be denied. This can occur because:
+ *     (1) read, write, or execute permission is denied for the file itself,
+ *     (2) search permission is denied for a directory in the path prefix,
+ *     (3) execute permission was requested on a regular file and the
+ *     filesystem is mounted with MS_NOEXEC (noexec option), (4) the file
+ *     has an unmapped uid/gid and write was requested. Permission checking
+ *     uses real uid/gid, not effective, unless AT_EACCESS flag is used
+ *     with faccessat2().
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Write access was requested on a file that has the immutable
+ *     attribute set (via chattr +i or FS_IMMUTABLE_FL ioctl flag).
+ *
+ * error: EROFS, Read-only file system
+ *   desc: Write access was requested on a file that resides on a read-only
+ *     filesystem. This includes filesystems mounted read-only and those
+ *     that became read-only due to errors (remount-ro). Only checked for
+ *     non-special files (not sockets, FIFOs, block/char devices).
+ *
+ * error: EIO, Input/output error
+ *   desc: An I/O error occurred while reading from the filesystem during
+ *     path resolution or inode lookup. This is filesystem-dependent and
+ *     indicates a hardware or low-level filesystem error.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle has become stale, typically on NFS when the file
+ *     was deleted or replaced on the server. The kernel automatically
+ *     retries with LOOKUP_REVAL to revalidate, but if it still fails,
+ *     -ESTALE is returned to userspace.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The file's uid or gid cannot be represented in the current
+ *     user namespace. Returned when HAS_UNMAPPED_ID() is true for the
+ *     inode during permission checking.
+ *
+ * lock: RCU read-side critical section
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: Path lookup uses RCU-walk mode (rcu_read_lock) for fast path
+ *     resolution. If RCU-walk fails (e.g., due to blocking operation needed),
+ *     the lookup falls back to reference-counted (ref-walk) mode.
+ *
+ * lock: inode->i_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: conditional
+ *   released: true
+ *   desc: May be briefly acquired when setting the IOP_FASTPERM flag on an
+ *     inode during permission checking optimization. This is a one-time
+ *     operation per inode lifetime.
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypasses read, write, and execute permission checks on files
+ *     and directories. For execute permission on files, at least one execute
+ *     bit (owner, group, or other) must still be set.
+ *   without: Permission checks follow standard UNIX DAC rules based on file
+ *     mode bits and real uid/gid of the calling process.
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when initial permission check fails.
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypasses read permission checks on files and read/execute (search)
+ *     permission checks on directories.
+ *   without: Permission checks follow standard UNIX DAC rules.
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when initial permission check fails.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Task credentials (temporary)
+ *   desc: Temporarily overrides the calling task's subjective credentials
+ *     to use real uid/gid instead of effective uid/gid for permission
+ *     checking. This modification is task-local and is reverted before
+ *     the syscall returns via revert_creds().
+ *   reversible: yes
+ *   condition: Always, unless AT_EACCESS flag is used with faccessat2()
+ *
+ * constraint: TOCTOU Race Condition
+ *   desc: Results of access/faccessat are inherently racy. The file's
+ *     permissions, ownership, or existence may change between this check
+ *     and any subsequent operation on the file. Do not rely on this syscall
+ *     for security decisions. The kernel explicitly acknowledges this in
+ *     the __mnt_is_readonly() check with a comment noting the race.
+ *
+ * constraint: Real vs Effective ID Semantics
+ *   desc: Unlike most filesystem operations, faccessat() checks permissions
+ *     using real uid/gid, not effective uid/gid. This is the POSIX-mandated
+ *     behavior for access(). To check with effective credentials, use
+ *     faccessat2() with the AT_EACCESS flag.
+ *
+ * examples: faccessat(AT_FDCWD, "/etc/passwd", R_OK);  // Check readable
+ *   faccessat(AT_FDCWD, "/tmp", W_OK | X_OK);  // Check write+search on dir
+ *   faccessat(dirfd, "file.txt", F_OK);  // Check existence relative to dirfd
+ *
+ * notes: This syscall follows symbolic links by default. To check the
+ *   permissions of a symlink itself without following it, use faccessat2()
+ *   with the AT_SYMLINK_NOFOLLOW flag. The original faccessat() deliberately
+ *   omits the flags argument present in the POSIX specification; glibc's
+ *   faccessat() wrapper emulates flags via faccessat2() when available.
+ *
+ *   ACLs (Access Control Lists) are considered if the filesystem supports
+ *   POSIX ACLs. The check_acl() function is called during permission
+ *   evaluation when the file has ACL entries.
+ *
+ *   On idmapped mounts, uid/gid mapping is applied before permission checking
+ *   via mnt_idmap().
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 {
 	return do_faccessat(dfd, filename, mode, 0);
