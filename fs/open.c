@@ -4504,9 +4504,281 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
 	return retval;
 }
 
-/*
- * This routine simulates a hangup on the tty, to arrange that users
- * are given clean terminals at login time.
+/**
+ * sys_vhangup - Simulate a hangup on the current controlling terminal
+ *
+ * long-desc: Simulates a terminal hangup on the calling process's controlling
+ *   terminal. This syscall is primarily used by login programs to ensure that
+ *   users are given "clean" terminals at login time, preventing previous users
+ *   from having access to the terminal's file descriptors.
+ *
+ *   When called, vhangup() performs the following sequence of operations on
+ *   the controlling tty (if one exists):
+ *
+ *   1. Redirects all open file descriptors for the tty to a "hung up" set of
+ *      file operations (hung_up_tty_fops), causing subsequent I/O operations
+ *      to fail with appropriate errors.
+ *
+ *   2. Sends SIGHUP and SIGCONT signals to the session leader of the terminal's
+ *      session. SIGHUP notifies processes of the hangup, while SIGCONT ensures
+ *      stopped processes receive the SIGHUP.
+ *
+ *   3. Disassociates processes in the session from the controlling terminal by
+ *      clearing their tty reference in signal->tty.
+ *
+ *   4. Clears the terminal's session and process group associations.
+ *
+ *   5. Flushes the line discipline buffers and optionally reinitializes the
+ *      line discipline if the tty driver has TTY_DRIVER_RESET_TERMIOS set.
+ *
+ *   6. Invokes the tty driver's hangup() callback, or close() multiple times
+ *      if the terminal is a console device.
+ *
+ *   7. Wakes up any processes blocked on read or write operations on the tty.
+ *
+ *   The hangup is performed synchronously - when vhangup() returns, all hangup
+ *   processing is complete. This synchronous behavior is important for security
+ *   in login programs to ensure the previous user's access is revoked before
+ *   the new user session begins.
+ *
+ *   If the calling process has no controlling terminal, the syscall succeeds
+ *   but performs no action. The controlling terminal is determined via
+ *   current->signal->tty.
+ *
+ *   This is a Linux-specific syscall. It is not part of POSIX but follows
+ *   historical Unix conventions. The name comes from "virtual hangup" as it
+ *   simulates the effect of a modem hangup on the terminal line.
+ *
+ *   Historical note: A race condition existed prior to kernel 2.6.28 where
+ *   the syscall directly accessed current->signal->tty without proper locking.
+ *   This was fixed by introducing tty_vhangup_self() which properly acquires
+ *   the siglock to safely obtain a reference to the controlling tty.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. This includes the case where the calling
+ *     process has no controlling terminal (the syscall silently succeeds).
+ *     On error, returns -EPERM without performing any hangup operations.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The caller does not have the CAP_SYS_TTY_CONFIG capability in its
+ *     user namespace. This is the only error that can be returned by this
+ *     syscall. The capability check is performed via capable(CAP_SYS_TTY_CONFIG)
+ *     which checks against the process's effective capabilities. Root processes
+ *     (uid 0) have this capability by default unless it has been explicitly
+ *     dropped. Unprivileged users cannot perform terminal hangups.
+ *
+ * lock: current->sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired in get_current_tty() via spin_lock_irqsave() to safely
+ *     read current->signal->tty and obtain a reference to the controlling tty.
+ *     This protects against concurrent modifications to the controlling
+ *     terminal association.
+ *
+ * lock: tty->legacy_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The main tty lock acquired via tty_lock() at the start of hangup
+ *     processing. This serializes hangup with other tty operations and
+ *     protects the tty state during the entire hangup sequence. Released
+ *     via tty_unlock() after hangup is complete.
+ *
+ * lock: tty->files_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Spinlock protecting the list of open file structures associated
+ *     with the tty (tty->tty_files). Acquired when iterating through open
+ *     files to redirect them to hung_up_tty_fops.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Read lock acquired in tty_signal_session_leader() to safely iterate
+ *     through processes in the session when sending SIGHUP and SIGCONT signals
+ *     and clearing tty references.
+ *
+ * lock: p->sighand->siglock (per process)
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired for each process in the session to safely modify the
+ *     process's signal->tty reference and send signals. Uses spin_lock_irq().
+ *
+ * lock: tty->ctrl.lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Spinlock protecting tty control state (session, pgrp, pktstatus).
+ *     Acquired with spin_lock_irq() when clearing the tty's session and
+ *     process group associations and when reading pgrp for signal delivery.
+ *
+ * lock: tty->ldisc_sem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Line discipline semaphore acquired in tty_ldisc_hangup() via
+ *     tty_ldisc_lock() with MAX_SCHEDULE_TIMEOUT. Protects line discipline
+ *     operations during hangup including possible reinitialization.
+ *
+ * signal: SIGHUP
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Sent to the session leader of the controlling terminal's
+ *     session. Only the session leader process receives this signal directly.
+ *   desc: Hangup signal indicating the controlling terminal has been hung up.
+ *     The default action is to terminate the process. Session leaders should
+ *     handle this signal to perform cleanup and notify child processes.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: SIGCONT
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_CONTINUE
+ *   condition: Sent to the session leader immediately after SIGHUP.
+ *   desc: Continue signal sent to ensure stopped session leaders receive the
+ *     SIGHUP. If the session leader is stopped, SIGHUP would be pending but
+ *     not delivered until the process continues. SIGCONT ensures delivery.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Open file descriptors for the tty
+ *   desc: All open file descriptors for the controlling terminal have their
+ *     f_op pointer changed from the normal tty file operations to
+ *     hung_up_tty_fops. Subsequent read() calls return 0 (EOF), write() calls
+ *     return -EIO, and other operations fail appropriately. This effectively
+ *     revokes access to the terminal for all processes that had it open.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process controlling terminal associations
+ *   desc: All processes in the terminal's session have their signal->tty
+ *     pointer cleared to NULL. This disassociates them from the controlling
+ *     terminal. These processes will no longer receive terminal-generated
+ *     signals (SIGINT, SIGQUIT, SIGTSTP, etc.) from this terminal.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: TTY session and process group
+ *   desc: The tty's ctrl.session and ctrl.pgrp are set to NULL, and
+ *     ctrl.pktstatus is cleared to 0. The old pid structures are released
+ *     via put_pid(). This removes the terminal's association with its
+ *     controlling session.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: TTY flags
+ *   desc: Sets TTY_HUPPED flag on the tty, indicating the terminal has been
+ *     hung up. Clears TTY_THROTTLED and TTY_DO_WRITE_WAKEUP flags.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Line discipline buffers
+ *   desc: The line discipline's flush_buffer() method is called to discard
+ *     any pending input. The driver's flush_buffer() is also called via
+ *     tty_driver_flush_buffer(). If TTY_DRIVER_RESET_TERMIOS is set, the
+ *     termios settings are reset and the line discipline may be reinitialized.
+ *   condition: Always when controlling tty exists and has line discipline
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Session leader and optionally foreground process group
+ *   desc: SIGHUP and SIGCONT are sent to the session leader. For session
+ *     exit hangups (exit_session=1), SIGHUP is also sent to the foreground
+ *     process group. For vhangup() syscall, exit_session=0 so only the
+ *     session leader receives signals directly.
+ *   condition: When the tty has a session associated
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_HARDWARE
+ *   target: TTY driver
+ *   desc: The tty driver's hangup() callback is invoked, or close() is
+ *     called multiple times if this is a console device. This allows the
+ *     driver to perform hardware-specific hangup operations (e.g., dropping
+ *     DTR on a serial port).
+ *   condition: Always when controlling tty exists and driver has callback
+ *   reversible: depends on driver
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Blocked readers and writers
+ *   desc: Wakes up all processes blocked on tty->write_wait and tty->read_wait
+ *     via wake_up_interruptible_poll(). This allows blocked I/O operations to
+ *     return with appropriate error codes or EOF.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Asynchronous notification (fasync)
+ *   desc: Asynchronous notification is disabled for all open files via
+ *     __tty_fasync(-1, filp, 0). Processes registered for SIGIO will no
+ *     longer receive signals for tty events.
+ *   condition: Always when controlling tty exists
+ *   reversible: no
+ *
+ * state-trans: tty_state
+ *   from: open/active
+ *   to: hung_up
+ *   condition: Successful hangup with controlling tty
+ *   desc: The controlling terminal transitions from active state to hung up
+ *     state. The TTY_HUPPED flag is set, file operations are replaced with
+ *     hung_up_tty_fops, and session associations are cleared.
+ *
+ * capability: CAP_SYS_TTY_CONFIG
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Permits hanging up the calling process's controlling terminal
+ *   without: The syscall fails immediately with -EPERM. No hangup operations
+ *     are performed and the controlling terminal (if any) is unchanged.
+ *   condition: Checked at syscall entry via capable(CAP_SYS_TTY_CONFIG)
+ *     before any other processing. The check uses the process's effective
+ *     capabilities in its user namespace.
+ *
+ * constraint: Controlling Terminal Required (for effect)
+ *   desc: While the syscall always succeeds (returns 0) if the caller has
+ *     CAP_SYS_TTY_CONFIG, the hangup operations only occur if the calling
+ *     process has a controlling terminal (current->signal->tty != NULL).
+ *     Without a controlling terminal, the call is a no-op.
+ *
+ * constraint: Session Leader Notification
+ *   desc: Signals are sent only to the session leader of the controlling
+ *     terminal's session. Other processes in the session are disassociated
+ *     from the terminal but do not receive signals directly from vhangup().
+ *     They may receive SIGHUP from their session leader if it propagates
+ *     the signal.
+ *
+ * examples: vhangup();  // Hang up controlling terminal (requires privilege)
+ *   if (vhangup() < 0) perror("vhangup");  // Check for permission error
+ *
+ * notes: This syscall is primarily used by login(1) and similar programs
+ *   to revoke access to the terminal from the previous user's session before
+ *   starting a new login session. The sequence typically is: fork(), setsid()
+ *   to create new session, open tty to make it controlling terminal, then
+ *   vhangup() to clear any previous associations.
+ *
+ *   Unlike tty_hangup() which schedules hangup asynchronously via workqueue,
+ *   vhangup() performs the hangup synchronously. This synchronous behavior
+ *   is critical for security - the syscall must not return until all previous
+ *   access to the terminal has been revoked.
+ *
+ *   The syscall does not fail if there is no controlling terminal - it simply
+ *   does nothing and returns success. Applications should not rely on vhangup()
+ *   failure to detect absence of a controlling terminal.
+ *
+ *   When CONFIG_TTY is disabled in the kernel configuration, tty_vhangup_self()
+ *   becomes a no-op inline function, but the syscall still performs the
+ *   capability check and returns success.
+ *
+ * since-version: 1.0
  */
 SYSCALL_DEFINE0(vhangup)
 {
