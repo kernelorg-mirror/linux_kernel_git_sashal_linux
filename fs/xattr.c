@@ -3061,6 +3061,289 @@ SYSCALL_DEFINE4(removexattrat, int, dfd, const char __user *, pathname,
 	return path_removexattrat(dfd, pathname, at_flags, name);
 }
 
+/**
+ * sys_removexattr - Remove an extended attribute from a file
+ * @pathname: Path to the file from which to remove the attribute
+ * @name: Null-terminated name of the extended attribute to remove (includes namespace prefix)
+ *
+ * long-desc: Removes the extended attribute identified by name from the file
+ *   specified by pathname. Extended attributes are name:value pairs associated
+ *   with inodes (files, directories, symbolic links, etc.) that extend the
+ *   normal attributes (stat data) associated with all inodes.
+ *
+ *   The attribute name must include a namespace prefix. Valid namespaces are:
+ *   - "user." - User-defined attributes (regular files and directories only)
+ *   - "trusted." - Trusted attributes (requires CAP_SYS_ADMIN)
+ *   - "security." - Security module attributes (e.g., SELinux, Smack, capabilities)
+ *   - "system." - System attributes (e.g., POSIX ACLs via system.posix_acl_access)
+ *
+ *   This syscall follows symbolic links. Use lremovexattr() to operate on the
+ *   symbolic link itself, or fremovexattr() to operate on an open file descriptor.
+ *
+ *   For POSIX ACL attributes (system.posix_acl_access, system.posix_acl_default),
+ *   the operation is handled by vfs_remove_acl() which has slightly different
+ *   permission checks than regular xattr removal.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_USER_PATH
+ *   constraint: Must be a valid null-terminated path string in user memory.
+ *     The path is resolved following symbolic links. Maximum path length is
+ *     PATH_MAX (4096 bytes). The file must exist and the caller must have
+ *     appropriate permissions to modify extended attributes.
+ *
+ * param: name
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_USER_STRING
+ *   range: 1, 255
+ *   constraint: Must be a valid null-terminated string in user memory containing
+ *     the extended attribute name with namespace prefix (e.g., "user.myattr").
+ *     The name (including prefix) must be between 1 and XATTR_NAME_MAX (255)
+ *     characters. An empty name returns ERANGE.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The extended attribute is removed from the file.
+ *
+ * error: ENODATA, Attribute not found
+ *   desc: The named extended attribute does not exist on the file. This is the
+ *     most common error - the caller attempts to remove an attribute that was
+ *     never set or was already removed. Returned from the filesystem's xattr
+ *     handler set operation with NULL value and XATTR_REPLACE flag.
+ *
+ * error: ENOENT, File not found
+ *   desc: The file specified by pathname does not exist, or a directory component
+ *     in the path does not exist. Returned from path lookup (filename_lookup).
+ *
+ * error: EACCES, Permission denied
+ *   desc: Permission denied during path resolution (search permission on a directory
+ *     component) or write access to the file is denied based on DAC permissions.
+ *     Returned from inode_permission() during path resolution.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned in several cases: (1) The file is marked immutable (chattr +i)
+ *     or append-only (chattr +a) - checked by may_write_xattr(). (2) For trusted.*
+ *     namespace, caller lacks CAP_SYS_ADMIN in the filesystem's user namespace -
+ *     checked by xattr_permission(). (3) For security.* namespace attributes
+ *     (except security.capability), caller lacks CAP_SYS_ADMIN - checked by
+ *     cap_inode_removexattr(). (4) For security.capability, caller lacks
+ *     CAP_SETFCAP - checked by cap_inode_removexattr() via capable_wrt_inode_uidgid().
+ *     (5) For user.* namespace on sticky directories, caller is not the owner
+ *     and lacks CAP_FOWNER - checked by xattr_permission(). (6) The inode has
+ *     an unmapped ID in an idmapped mount - checked by HAS_UNMAPPED_ID().
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The filesystem does not support extended attributes (IOP_XATTR not set
+ *     on inode), no xattr handler exists for the given namespace prefix, or the
+ *     handler does not implement the set operation. Returned from xattr_resolve_name()
+ *     or __vfs_removexattr(). Also returned for POSIX ACL xattrs when the
+ *     underlying set_posix_acl() operation is not supported.
+ *
+ * error: ERANGE, Name out of range
+ *   desc: The attribute name is empty (zero length) or exceeds XATTR_NAME_MAX
+ *     (255 characters). Returned from import_xattr_name() via strncpy_from_user().
+ *     An empty name string (error == 0) or a name that fills the entire buffer
+ *     (error == sizeof(kname->name) == 256) both return ERANGE.
+ *
+ * error: EFAULT, Bad address
+ *   desc: One of the user pointers (pathname or name) is invalid or points to
+ *     memory that cannot be accessed. Returned from strncpy_from_user() for the
+ *     name, or from getname() during pathname processing.
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: The filesystem containing the file is mounted read-only. Returned from
+ *     mnt_want_write() before attempting any modification.
+ *
+ * error: EIO, I/O error
+ *   desc: The inode is marked as bad (is_bad_inode), indicating filesystem
+ *     corruption or I/O failure. Returned from xattr_resolve_name() when checking
+ *     for bad inodes. Also may be returned by filesystem-specific xattr handler
+ *     operations or during vfs_remove_acl() for POSIX ACLs.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered during path resolution
+ *     (more than MAXSYMLINKS, typically 40). Returned from filename_lookup().
+ *
+ * error: ENAMETOOLONG, Filename too long
+ *   desc: The pathname or a component of the pathname exceeds the system limit
+ *     (PATH_MAX or NAME_MAX). Returned from filename_lookup().
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component of the path prefix is not a directory. Returned from
+ *     filename_lookup() during path resolution.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle became stale during the operation (NFS). The syscall
+ *     automatically retries with LOOKUP_REVAL before returning this error to
+ *     userspace. Checked via retry_estale() in filename_removexattr().
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned when the xattr name prefix matches a handler but the remainder
+ *     is malformed. Returned from xattr_resolve_name() when the handler requires
+ *     a suffix but none is provided. Also returned from vfs_remove_acl() for
+ *     invalid POSIX ACL type names.
+ *
+ * error: EWOULDBLOCK, Operation would block
+ *   desc: Returned internally when NFSv4 delegation breaking would block but
+ *     non-blocking mode was requested. The caller (vfs_removexattr) handles this
+ *     by retrying with a blocking wait. Not normally visible to userspace.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The inode's read-write semaphore is acquired exclusively via inode_lock()
+ *     in vfs_removexattr() before calling __vfs_removexattr_locked() and released
+ *     via inode_unlock() after. This serializes concurrent xattr modifications
+ *     on the same inode. The lock may be released and re-acquired if delegation
+ *     breaking requires waiting.
+ *
+ * lock: sb->s_writers (superblock freeze protection)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Write access to the mount is acquired via mnt_want_write() which calls
+ *     sb_start_write(). This prevents filesystem freeze during the operation.
+ *     Released via mnt_drop_write() after the operation completes. Acquired
+ *     in filename_removexattr() before calling removexattr().
+ *
+ * lock: file_rwsem (delegation breaking)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: If the file has NFSv4 delegations, the percpu file_rwsem may be acquired
+ *     during delegation breaking in __break_lease(). The syscall may wait for
+ *     delegation holders to acknowledge the break. This occurs in the retry loop
+ *     of vfs_removexattr() when try_break_deleg() indicates a delegation exists.
+ *
+ * signal: Any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RESTART
+ *   condition: Signal arrives during interruptible waits (delegation breaking)
+ *   desc: The syscall may wait for NFSv4 delegation holders to release their
+ *     delegations via break_deleg_wait(). During this wait, signals can interrupt
+ *     the operation. Most other blocking points in this syscall (inode_lock,
+ *     mnt_want_write) use non-interruptible waits. Path lookup operations may
+ *     also be interrupted by fatal signals.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File's extended attributes
+ *   desc: On success, the specified extended attribute is removed from the file.
+ *     The change is typically persisted to storage synchronously or asynchronously
+ *     depending on filesystem and mount options. For POSIX ACL removal, the file's
+ *     permission mode may also be affected.
+ *   reversible: yes
+ *   condition: Operation succeeds
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify event
+ *   desc: On success, fsnotify_xattr() is called to notify any registered
+ *     watchers (inotify, fanotify) of the extended attribute modification.
+ *     This generates an IN_ATTRIB event for the file.
+ *   condition: Operation succeeds
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: LSM state via security_inode_post_removexattr()
+ *   desc: On success, the LSM post-removal hook is called, allowing security
+ *     modules to update their internal state. For example, this may update
+ *     SELinux inode security data when security labels are removed.
+ *   condition: Operation succeeds
+ *
+ * state-trans: extended attribute
+ *   from: exists with some value
+ *   to: nonexistent
+ *   condition: Operation succeeds
+ *   desc: The extended attribute transitions from existing (with some value) to
+ *     not existing on the file. The attribute name no longer appears in listxattr
+ *     output and subsequent getxattr calls return ENODATA.
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Removing trusted.* namespace attributes and most security.* attributes
+ *   without: Removing trusted.* returns EPERM via xattr_permission(). Removing
+ *     security.* (except security.capability) returns EPERM via cap_inode_removexattr().
+ *     The check uses ns_capable() against the filesystem's user namespace.
+ *   condition: Attribute name starts with "trusted." or "security." (except
+ *     security.capability)
+ *
+ * capability: CAP_SETFCAP
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Removing the security.capability extended attribute
+ *   without: Removing security.capability returns EPERM
+ *   condition: Attribute name is "security.capability". Checked via
+ *     capable_wrt_inode_uidgid() in cap_inode_removexattr() which considers
+ *     the inode's ownership and mount idmapping.
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypassing owner check for user.* on sticky directories
+ *   without: Non-owners cannot remove user.* attributes on files in sticky
+ *     directories without this capability
+ *   condition: Removing user.* namespace attribute on a file in a sticky directory
+ *     where caller is not the file owner
+ *
+ * constraint: Filesystem support
+ *   desc: The filesystem must support extended attributes (have IOP_XATTR flag
+ *     set and provide xattr handlers). Common filesystems supporting xattrs
+ *     include ext4, XFS, Btrfs, and tmpfs. Some filesystems (e.g., FAT, older
+ *     ext2) do not support extended attributes and return EOPNOTSUPP.
+ *
+ * constraint: user.* namespace restrictions
+ *   desc: The user.* namespace is only supported on regular files and directories.
+ *     Attempting to remove user.* attributes on other file types (symlinks,
+ *     devices, sockets, FIFOs) returns EPERM. This is checked by xattr_permission().
+ *
+ * constraint: LSM checks
+ *   desc: Linux Security Modules (SELinux, Smack, AppArmor) may impose additional
+ *     restrictions via security_inode_removexattr() hook. These can return various
+ *     error codes depending on the security policy. The LSM hook is called after
+ *     permission checks but before the actual xattr removal. Some LSMs may
+ *     implement inode_xattr_skipcap hook to bypass default capability checks
+ *     for specific attributes.
+ *
+ * examples: removexattr("/path/file", "user.comment");  // Remove user attribute
+ *   removexattr("/path/file", "trusted.overlay.opaque");  // Remove trusted attr
+ *   removexattr("/path/file", "security.selinux");  // Remove SELinux label
+ *
+ * notes: Extended attributes provide a way to associate arbitrary metadata with
+ *   files beyond the standard stat attributes. removexattr() is the complement
+ *   to setxattr() - while setxattr creates or modifies attributes, removexattr
+ *   deletes them entirely.
+ *
+ *   The trusted.* namespace is commonly used by overlayfs for opaque directory
+ *   markers and by backup utilities to store metadata that should not be
+ *   visible to unprivileged processes.
+ *
+ *   Removing the security.capability attribute removes any file capabilities
+ *   from an executable, causing it to run with only the capabilities it
+ *   inherits from its parent process.
+ *
+ *   NFSv4 delegation support means this syscall may need to wait for remote
+ *   clients to release their delegations before the operation can complete.
+ *   This is handled by the try_break_deleg()/break_deleg_wait() retry loop
+ *   in vfs_removexattr(). In pathological cases with unresponsive clients,
+ *   this can introduce unbounded delays.
+ *
+ *   The implementation internally uses the handler's set operation with
+ *   NULL value, size 0, and XATTR_REPLACE flag to perform the removal.
+ *   This allows filesystems to implement removal through the same code
+ *   path as setting attributes.
+ *
+ *   Unlike removexattr() which follows symlinks, lremovexattr() operates
+ *   on the symbolic link itself, and fremovexattr() operates on an open
+ *   file descriptor. The removexattrat() syscall (added in Linux 6.17)
+ *   provides additional flexibility with AT_FDCWD and AT_* flags.
+ *
+ * since-version: 2.4
+ */
 SYSCALL_DEFINE2(removexattr, const char __user *, pathname,
 		const char __user *, name)
 {
