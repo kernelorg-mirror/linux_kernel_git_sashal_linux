@@ -716,6 +716,212 @@ static int do_inotify_init(int flags)
 	return ret;
 }
 
+/**
+ * sys_inotify_init1 - Initialize an inotify instance with flags
+ * @flags: Flags controlling the behavior of the inotify instance
+ *
+ * long-desc: Creates a new inotify instance and returns a file descriptor
+ *   referring to the inotify event queue. The inotify subsystem provides a
+ *   mechanism for monitoring filesystem events. Applications can add watches
+ *   to the inotify instance using inotify_add_watch(2), and events are read
+ *   from the returned file descriptor using read(2).
+ *
+ *   The @flags parameter allows the caller to modify the default behavior:
+ *   IN_CLOEXEC sets the close-on-exec (FD_CLOEXEC) flag on the new file
+ *   descriptor, ensuring it is automatically closed during exec(). IN_NONBLOCK
+ *   sets the O_NONBLOCK file status flag, causing read() to return EAGAIN
+ *   instead of blocking when no events are available.
+ *
+ *   The inotify file descriptor can be used with poll(2), select(2), or
+ *   epoll(7) to monitor for available events. Events are delivered as
+ *   variable-length inotify_event structures when read from the descriptor.
+ *
+ *   When the file descriptor is closed (either explicitly or via close-on-exec),
+ *   all watches associated with the inotify instance are automatically removed,
+ *   and the resources are freed. The inotify instance persists as long as at
+ *   least one file descriptor referring to it is open.
+ *
+ *   This syscall is functionally equivalent to inotify_init() when @flags is 0,
+ *   but provides a race-free way to set O_CLOEXEC and O_NONBLOCK that is
+ *   important for multi-threaded applications.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: IN_CLOEXEC | IN_NONBLOCK
+ *   constraint: Only IN_CLOEXEC (equivalent to O_CLOEXEC, 0x80000) and
+ *     IN_NONBLOCK (equivalent to O_NONBLOCK, 0x800) are valid. Any other bits
+ *     set will result in EINVAL. Pass 0 for default behavior (blocking reads,
+ *     file descriptor not closed on exec).
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns a new file descriptor for the inotify instance.
+ *     This file descriptor can be used with inotify_add_watch(2) to add
+ *     watches, and read(2) to retrieve inotify events. The descriptor is
+ *     readable (O_RDONLY) and supports poll/select/epoll.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flags argument contains bits other than IN_CLOEXEC and
+ *     IN_NONBLOCK. The kernel validates flags with (flags & ~(IN_CLOEXEC |
+ *     IN_NONBLOCK)) and rejects any unknown flags. This allows future kernel
+ *     versions to add new flags without breaking existing programs.
+ *
+ * error: EMFILE, Per-process file descriptor limit reached
+ *   desc: The per-process limit on the number of open file descriptors has
+ *     been reached. This limit is determined by RLIMIT_NOFILE, which can be
+ *     queried via getrlimit(2) and modified via setrlimit(2) or prlimit(2).
+ *     The default soft limit is typically 1024. This error is returned from
+ *     get_unused_fd_flags() when alloc_fd() cannot find an available slot
+ *     below the limit.
+ *
+ * error: EMFILE, Per-user inotify instance limit reached
+ *   desc: The per-user limit on the number of inotify instances has been
+ *     reached. This limit is controlled by /proc/sys/fs/inotify/max_user_instances
+ *     (default 128). The limit is tracked via the user namespace ucount
+ *     mechanism (UCOUNT_INOTIFY_INSTANCES) and applies per-user across all
+ *     processes owned by that user. The check is performed in inotify_new_group()
+ *     via inc_ucount().
+ *
+ * error: ENFILE, System-wide file limit reached
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is controlled by /proc/sys/fs/file-max. Users with
+ *     CAP_SYS_ADMIN capability can bypass this limit. This error is returned
+ *     from alloc_empty_file() when the global file count (nr_files) exceeds
+ *     files_stat.max_files.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory for the required data
+ *     structures. Memory is allocated for the fsnotify_group structure,
+ *     the overflow event (inotify_event_info), the ucounts structure for
+ *     resource tracking, the anonymous inode dentry, and the file structure.
+ *     All allocations use GFP_KERNEL or GFP_KERNEL_ACCOUNT flags and can
+ *     therefore trigger memory reclaim.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's file descriptor table spinlock is acquired briefly
+ *     during file descriptor allocation in alloc_fd(). This lock protects
+ *     the fd table from concurrent modifications. The lock is held only
+ *     during fd slot reservation and bitmap updates.
+ *
+ * lock: ucounts_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global ucounts lock is acquired during user count tracking
+ *     operations. It protects the per-user inotify instance count incremented
+ *     by inc_ucount() in inotify_new_group(). The lock is held briefly with
+ *     interrupts disabled.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: inotify instance (fsnotify_group)
+ *   desc: Creates a new fsnotify_group structure representing the inotify
+ *     instance. The group contains the event queue, watch list (via IDR),
+ *     and associated metadata. Memory is allocated via kzalloc() with
+ *     GFP_KERNEL or GFP_KERNEL_ACCOUNT flags.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor
+ *   desc: Allocates and installs a new file descriptor in the calling
+ *     process's file descriptor table. The descriptor refers to an
+ *     anonymous inode with inotify-specific file operations. The descriptor
+ *     is marked as open in the process's fd bitmap.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Per-user inotify instance count
+ *   desc: Increments the per-user count of inotify instances tracked via
+ *     the user namespace ucount mechanism. This count is decremented when
+ *     the inotify instance is destroyed (file descriptor closed and all
+ *     references released).
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: System-wide open file count
+ *   desc: Increments the global nr_files counter via percpu_counter_inc()
+ *     when the file structure is allocated. This count is tracked against
+ *     the system-wide limit /proc/sys/fs/file-max.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Memory cgroup
+ *   desc: Memory allocations are charged to the calling process's memory
+ *     cgroup via GFP_KERNEL_ACCOUNT. The group holds a reference to the
+ *     memcg obtained via get_mem_cgroup_from_mm().
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass system-wide file limit check
+ *   without: Subject to /proc/sys/fs/file-max limit (returns ENFILE when
+ *     exceeded)
+ *   condition: Checked in alloc_empty_file() when system file count exceeds
+ *     files_stat.max_files
+ *
+ * constraint: max_user_instances
+ *   desc: The per-user limit /proc/sys/fs/inotify/max_user_instances
+ *     (default 128) limits how many inotify instances a single user can
+ *     create across all processes. This limit is namespace-aware and can
+ *     be configured per user namespace.
+ *
+ * constraint: RLIMIT_NOFILE
+ *   desc: The per-process file descriptor limit controls the maximum file
+ *     descriptor number that can be allocated. The soft limit defaults to
+ *     1024 and can be raised up to the hard limit via setrlimit(2).
+ *
+ * constraint: /proc/sys/fs/file-max
+ *   desc: The system-wide limit on total open files. When this limit is
+ *     reached, only processes with CAP_SYS_ADMIN can create new files.
+ *     Default value depends on system memory.
+ *
+ * constraint: /proc/sys/fs/nr_open
+ *   desc: The system-wide maximum value for RLIMIT_NOFILE. Defaults to
+ *     approximately 1M. This provides an upper bound on per-process file
+ *     descriptor limits.
+ *
+ * examples: fd = inotify_init1(IN_CLOEXEC);  // Create with close-on-exec
+ *   fd = inotify_init1(IN_NONBLOCK);  // Create with non-blocking reads
+ *   fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);  // Both flags
+ *   fd = inotify_init1(0);  // Equivalent to inotify_init()
+ *   // Error handling: if (fd < 0) { perror("inotify_init1"); }
+ *
+ * notes: inotify_init1() was introduced in Linux 2.6.27 to provide atomic
+ *   flag setting. The older inotify_init() syscall is equivalent to
+ *   inotify_init1(0) and remains available for compatibility.
+ *
+ *   The IN_CLOEXEC flag is particularly important in multi-threaded programs
+ *   to prevent file descriptor leaks across fork()/exec() sequences. Without
+ *   this flag, there is a race window where another thread could fork()
+ *   before fcntl(F_SETFD, FD_CLOEXEC) is called.
+ *
+ *   The max_user_instances limit (default 128) is per user, not per process.
+ *   Applications creating many inotify instances should be aware of this limit.
+ *   The limit can be increased via /proc/sys/fs/inotify/max_user_instances.
+ *
+ *   Unlike some syscalls, inotify_init1() does not use interruptible waits
+ *   and therefore cannot return EINTR. Memory allocation uses GFP_KERNEL
+ *   which may block but is not signal-interruptible.
+ *
+ *   The returned file descriptor supports read(), poll(), select(), and
+ *   epoll(). It does not support write(), lseek(), or mmap(). The FIONREAD
+ *   ioctl can be used to determine the number of bytes available to read.
+ *
+ *   Historical note: Early inotify implementations had memory leak and
+ *   double-free bugs on error paths (fixed in commits a2ae4cc9a16e and
+ *   d0de4dc584ec). Current implementations properly clean up resources
+ *   on all error paths.
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE1(inotify_init1, int, flags)
 {
 	return do_inotify_init(flags);
