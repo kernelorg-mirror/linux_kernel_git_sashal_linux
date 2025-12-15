@@ -4498,6 +4498,379 @@ struct dentry *mount_subtree(struct vfsmount *m, const char *name)
 }
 EXPORT_SYMBOL(mount_subtree);
 
+/**
+ * sys_mount - Mount a filesystem at a specified location
+ * @dev_name: Device or source to mount (device path, directory, or NULL)
+ * @dir_name: Target mount point path
+ * @type: Filesystem type name (e.g., "ext4", "tmpfs", "nfs")
+ * @flags: Mount flags controlling behavior and attributes
+ * @data: Filesystem-specific mount options (comma-separated string or NULL)
+ *
+ * long-desc: Mounts a filesystem or performs mount-related operations at the
+ *   specified mount point. The exact behavior depends on the flags parameter,
+ *   which selects one of several distinct operations:
+ *
+ *   NEW MOUNT (default): Creates a new mount of the filesystem on the device
+ *   specified by dev_name at the directory dir_name. The type parameter must
+ *   specify a valid, loaded filesystem type. The data parameter can contain
+ *   filesystem-specific options. This is the most common mount operation.
+ *
+ *   BIND MOUNT (MS_BIND): Makes a file or directory subtree visible at another
+ *   location. dev_name specifies the source path, dir_name specifies where it
+ *   should appear. With MS_REC, the entire subtree is copied recursively. The
+ *   type and data parameters are ignored. Bind mounts share the same
+ *   underlying filesystem and inode, so changes are visible in both locations.
+ *
+ *   REMOUNT (MS_REMOUNT): Changes mount flags on an existing mount without
+ *   unmounting. dir_name specifies the mount point to reconfigure. The flags
+ *   and data parameters specify new options. Only certain flags can be changed
+ *   via remount (MS_RMT_MASK). Remounting is useful for changing a mount from
+ *   read-write to read-only or vice versa.
+ *
+ *   BIND REMOUNT (MS_REMOUNT | MS_BIND): Changes per-mount flags on a bind
+ *   mount without affecting the superblock. This is the only way to change
+ *   flags like MS_RDONLY on a bind mount independently of the original mount.
+ *   Since Linux 2.6.26.
+ *
+ *   MOVE MOUNT (MS_MOVE): Relocates an existing mount from dev_name to
+ *   dir_name. The mount subtree is atomically detached from its old location
+ *   and attached at the new location. The source must be a mount point.
+ *
+ *   PROPAGATION CHANGE (MS_SHARED, MS_PRIVATE, MS_SLAVE, MS_UNBINDABLE):
+ *   Changes the propagation type of the mount at dir_name. These flags are
+ *   mutually exclusive. With MS_REC, the change applies recursively to the
+ *   entire mount subtree. Propagation affects how mount/unmount events
+ *   propagate between mount namespaces.
+ *
+ *   Mount flags can also specify per-mount attributes that restrict access:
+ *   MS_RDONLY (read-only), MS_NOSUID (ignore setuid bits), MS_NODEV (no
+ *   device access), MS_NOEXEC (no program execution), MS_SYNCHRONOUS
+ *   (synchronous I/O), MS_NOATIME (no access time updates), etc.
+ *
+ *   For backward compatibility, if the flags value has MS_MGC_VAL (0xC0ED)
+ *   in the high 16 bits, these magic bits are silently stripped. This was
+ *   required in kernels before 2.4.
+ *
+ *   This syscall has been largely superseded by the new mount API (fsopen,
+ *   fsconfig, fsmount, move_mount) introduced in Linux 5.2, which provides
+ *   better error reporting and handling of large option strings. However,
+ *   this syscall remains fully supported and is still the most commonly
+ *   used interface.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dev_name
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: For new mounts, specifies the device to mount (block device
+ *     path like "/dev/sda1") or pseudo-filesystem source (like "proc", "none",
+ *     or a network path). For bind mounts and move operations, specifies the
+ *     source path. Maximum length is PATH_MAX (4096) bytes. May be NULL for
+ *     filesystem types that don't require a source (e.g., proc, sysfs, tmpfs).
+ *     For propagation changes and some remount operations, this parameter is
+ *     ignored.
+ *
+ * param: dir_name
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Target mount point path. Must be a valid null-terminated
+ *     pathname to an existing directory (or file for bind mounts of files).
+ *     Maximum length is PATH_MAX (4096) bytes. Symbolic links are followed
+ *     during path resolution (LOOKUP_FOLLOW). For new mounts, this becomes
+ *     the mount point. For move operations, this is the destination.
+ *
+ * param: type
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Filesystem type name as a null-terminated string. Required for
+ *     new mounts; ignored for bind, move, remount, and propagation operations.
+ *     Must match a registered filesystem type (see /proc/filesystems). Maximum
+ *     length is PATH_MAX bytes. Some filesystems support subtypes specified as
+ *     "type.subtype" (e.g., "fuse.sshfs"). May be NULL for operations that
+ *     don't require a type specification.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_SYNCHRONOUS |
+ *     MS_REMOUNT | MS_MANDLOCK | MS_DIRSYNC | MS_NOSYMFOLLOW | MS_NOATIME |
+ *     MS_NODIRATIME | MS_BIND | MS_MOVE | MS_REC | MS_SILENT | MS_POSIXACL |
+ *     MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED | MS_RELATIME |
+ *     MS_I_VERSION | MS_STRICTATIME | MS_LAZYTIME
+ *   constraint: Bitmask of mount flags. Operation type is determined by
+ *     MS_BIND, MS_MOVE, MS_REMOUNT, or propagation flags (MS_SHARED,
+ *     MS_PRIVATE, MS_SLAVE, MS_UNBINDABLE). MS_REC makes bind mounts and
+ *     propagation changes recursive. Attribute flags (MS_RDONLY, MS_NOSUID,
+ *     etc.) can be combined with operation flags. Only one propagation type
+ *     flag may be specified. MS_NOUSER (internal kernel flag) returns EINVAL.
+ *     The magic value MS_MGC_VAL in high bits is stripped for compatibility.
+ *
+ * param: data
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Filesystem-specific mount options as a null-terminated string,
+ *     typically comma-separated key=value pairs (e.g., "noexec,uid=1000").
+ *     Maximum size is PAGE_SIZE (typically 4096) bytes. The interpretation
+ *     is filesystem-dependent. May be NULL if no options are needed. For bind,
+ *     move, and propagation operations, this parameter is ignored. For remount,
+ *     only options valid for the filesystem's remount operation are accepted.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on successful mount operation. The mount point becomes
+ *     active and the filesystem is accessible at the specified location.
+ *
+ * error: EPERM, Caller lacks required capability
+ *   desc: The caller does not have CAP_SYS_ADMIN in the appropriate user
+ *     namespace. For most operations, this is checked against the mount
+ *     namespace's user namespace via may_mount(). For new mounts, also
+ *     checked against the filesystem's user namespace via mount_capable().
+ *     For remount, checked against the superblock's user namespace. Also
+ *     returned when attempting to change locked mount flags or when the
+ *     mount reveals too much information (mount_too_revealing check for
+ *     sensitive filesystems like proc/sys in user namespaces).
+ *
+ * error: EINVAL, Invalid argument or operation
+ *   desc: Returned for numerous conditions including: MS_NOUSER flag set in
+ *     flags; empty filesystem type string with subtype separator; invalid
+ *     flag combinations; target not a mount point for remount/propagation;
+ *     source is unbindable for bind mount; mount namespace mismatch
+ *     (check_mnt failure); attempting bind of mount with locked children
+ *     (without MS_REC); move would create circular mount; attempting to set
+ *     multiple propagation types; source directory for move is not a mount
+ *     point; attempting to mount on a symlink; attempting to stack same
+ *     filesystem on same mount point.
+ *
+ * error: ENOENT, Path does not exist
+ *   desc: A component of the pathname (dev_name or dir_name) does not exist,
+ *     or the pathname is empty. For bind mounts and moves, returned if the
+ *     source path cannot be resolved. For new mounts, also returned if the
+ *     mount point directory has been deleted (d_unlinked check).
+ *
+ * error: ENODEV, Filesystem type not configured
+ *   desc: The filesystem type specified in the type parameter is not
+ *     supported by the kernel. The filesystem module may not be loaded,
+ *     or the filesystem type may not have been compiled into the kernel.
+ *     Check /proc/filesystems for available types.
+ *
+ * error: ENOTBLK, Source is not a block device
+ *   desc: The filesystem type requires a block device but dev_name does not
+ *     refer to one. This is returned by filesystem-specific mount code for
+ *     filesystems like ext4, xfs, etc.
+ *
+ * error: EBUSY, Mount point or source is busy
+ *   desc: Returned when attempting to stack the same filesystem on the same
+ *     mount point (comparing superblock and mount root dentry), or when a
+ *     block device is already mounted and the filesystem doesn't support
+ *     multiple mounts. For move operations, returned if the source mount
+ *     point has been overmounted.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: Memory allocation failed. Mount operations allocate memory for
+ *     copying strings from userspace (type, dev_name, data), for the mount
+ *     structure, and potentially for the superblock and related structures.
+ *     All allocations use GFP_KERNEL and can trigger memory reclaim.
+ *
+ * error: EFAULT, Invalid user pointer
+ *   desc: One of the user pointers (dev_name, dir_name, type, or data) points
+ *     outside the process's accessible address space. Detected during
+ *     copy_mount_string() or copy_mount_options() via copy_from_user or
+ *     strndup_user.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search permission denied for a path component; writing to read-only
+ *     filesystem; source device on MS_NODEV filesystem; LSM security hooks
+ *     (SELinux, AppArmor, etc.) denied the operation. security_sb_mount()
+ *     is called early in the mount process and may return this error.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component of the path used as a directory is not a directory,
+ *     or for new mounts requiring a directory mount point (most cases), the
+ *     target is not a directory.
+ *
+ * error: ENAMETOOLONG, Pathname too long
+ *   desc: The dev_name, dir_name, or type string exceeds PATH_MAX bytes,
+ *     or a path component exceeds NAME_MAX bytes.
+ *
+ * error: ELOOP, Too many symbolic links or circular mount
+ *   desc: Too many symbolic links in path resolution (typically 40 limit).
+ *     For move operations, also returned if the move would create a circular
+ *     mount structure (source is ancestor of destination).
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: Attempting to mount read-write when the block device or source
+ *     filesystem is read-only and MS_RDONLY was not specified. Also returned
+ *     when attempting to remount read-write a filesystem that cannot support
+ *     it.
+ *
+ * error: ENOSPC, Namespace mount limit exceeded
+ *   desc: The mount namespace has reached its maximum number of mounts. The
+ *     limit is configurable via sysctl_mount_max (default 100000). This
+ *     prevents denial of service through excessive mount operations.
+ *
+ * error: EOVERFLOW, Value overflow
+ *   desc: Internal value overflow, typically related to mount ID generation
+ *     or propagation group IDs.
+ *
+ * lock: namespace_sem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The namespace semaphore is acquired for writing via namespace_lock()
+ *     to serialize mount tree modifications. This prevents concurrent mount
+ *     operations from corrupting the mount tree structure. Held during the
+ *     core mount attachment operations.
+ *
+ * lock: mount_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The mount hash seqlock is acquired via lock_mount_hash() for
+ *     modifications to the mount hash table and mount tree structure. This
+ *     is a finer-grained lock than namespace_sem, held for shorter durations.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The inode lock on the mount point directory is acquired via
+ *     inode_lock() before modifying the mount tree. This prevents concurrent
+ *     directory operations from interfering with mount operations.
+ *
+ * lock: sb->s_umount
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   condition: For remount operations
+ *   desc: The superblock's umount semaphore is acquired for writing during
+ *     remount operations via down_write(&sb->s_umount). This serializes
+ *     remount with other superblock operations like unmount.
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_CREATE
+ *   target: Mount tree and namespace
+ *   desc: A new mount structure is allocated and linked into the mount tree.
+ *     The mount namespace's mount count (nr_mounts) is incremented. For new
+ *     mounts, a superblock may be created or shared with existing mounts of
+ *     the same filesystem.
+ *   reversible: yes
+ *   condition: All mount operations except propagation changes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Shared mount propagation
+ *   desc: If the parent mount is in a shared propagation group (MS_SHARED),
+ *     the new mount automatically propagates to peer and slave mounts. This
+ *     can cause mounts to appear in other mount namespaces.
+ *   condition: Parent mount has shared propagation
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount flags
+ *   desc: For remount operations, the mount's flags and potentially the
+ *     superblock's flags are modified according to the new flags parameter.
+ *   condition: MS_REMOUNT flag set
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount propagation type
+ *   desc: Changes the mount's propagation type between shared, private,
+ *     slave, and unbindable. This affects how future mount/unmount events
+ *     propagate.
+ *   condition: Propagation flag (MS_SHARED, MS_PRIVATE, MS_SLAVE, MS_UNBINDABLE)
+ *   reversible: yes
+ *
+ * state-trans: mount_tree
+ *   from: No mount at dir_name (or existing mount for overmount)
+ *   to: New mount visible at dir_name
+ *   condition: Successful new mount, bind mount, or move mount
+ *   desc: The target directory becomes a mount point with the new filesystem
+ *     mounted on top. If there was already a mount at that location, it is
+ *     overmounted (hidden but still exists).
+ *
+ * state-trans: mount_propagation
+ *   from: Current propagation type
+ *   to: New propagation type (shared/private/slave/unbindable)
+ *   condition: Propagation flag specified
+ *   desc: The mount's propagation type determines how mount events flow
+ *     between mount namespaces. Shared mounts propagate bidirectionally,
+ *     slave mounts receive but don't send, private mounts don't propagate.
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Mount and modify filesystems
+ *   without: Returns -EPERM
+ *   condition: Checked via may_mount() against mount namespace's user_ns
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Mount non-user-namespace-mountable filesystems
+ *   without: Returns -EPERM from mount_capable() for FS without FS_USERNS_MOUNT
+ *   condition: For new mounts of filesystems not marked FS_USERNS_MOUNT
+ *
+ * constraint: Mount Namespace Membership
+ *   desc: Most operations require the target mount to be in the caller's
+ *     mount namespace. The check_mnt() function verifies this. Operations
+ *     on mounts outside the caller's namespace fail with EINVAL.
+ *
+ * constraint: Mount Point Locked Status
+ *   desc: Mounts with MNT_LOCKED flag cannot have their security-relevant
+ *     flags changed. This protects mounts that were created with more
+ *     privilege than the current process has. Attempting to unlock returns
+ *     EPERM from can_change_locked_flags().
+ *
+ * constraint: Filesystem Specific Limits
+ *   desc: Many filesystems impose additional constraints checked during
+ *     superblock creation or option parsing. These include device existence,
+ *     option validity, privilege requirements for certain options, etc.
+ *
+ * constraint: Mount Tree Depth
+ *   desc: The mount tree depth is not explicitly limited, but deep trees
+ *     can cause stack overflow during recursive operations. The kernel
+ *     uses iterative algorithms to mitigate this.
+ *
+ * examples: mount("/dev/sda1", "/mnt", "ext4", MS_RDONLY, NULL);  // Read-only
+ *   mount("/dev/sdb1", "/data", "xfs", 0, "logbufs=8");  // With options
+ *   mount("none", "/tmp", "tmpfs", 0, "size=1G,mode=1777");  // tmpfs
+ *   mount("/home", "/chroot/home", NULL, MS_BIND, NULL);  // Bind mount
+ *   mount("/home", "/chroot/home", NULL, MS_BIND|MS_REC, NULL);  // Recursive bind
+ *   mount(NULL, "/mnt", NULL, MS_REMOUNT|MS_RDONLY, NULL);  // Remount read-only
+ *   mount("/mnt", "/newmnt", NULL, MS_MOVE, NULL);  // Move mount
+ *   mount(NULL, "/mnt", NULL, MS_SHARED, NULL);  // Make shared
+ *   mount(NULL, "/mnt", NULL, MS_PRIVATE, NULL);  // Make private
+ *   mount(NULL, "/mnt", NULL, MS_REMOUNT|MS_BIND|MS_RDONLY, NULL);  // Read-only bind
+ *
+ * notes: The mount() syscall has been part of Linux since version 0.97 and
+ *   is syscall number 165 on x86-64, 21 on i386.
+ *
+ *   Unlike many syscalls, mount() does not check for pending signals during
+ *   execution and cannot return -EINTR. However, it may block waiting for
+ *   locks, memory allocation, or filesystem-specific operations.
+ *
+ *   The 4096-byte limit on mount options (PAGE_SIZE) can be problematic for
+ *   some configurations. The new mount API (fsopen/fsconfig/fsmount) removes
+ *   this limitation by allowing options to be set incrementally.
+ *
+ *   Race condition: There is an inherent race between path resolution and
+ *   mount attachment. Another process could modify the mount tree between
+ *   these operations. The kernel handles this with proper locking, but
+ *   callers should be aware that the mount may not end up exactly where
+ *   expected if the mount tree is being modified concurrently.
+ *
+ *   MS_MANDLOCK is deprecated since Linux 5.15 and is silently ignored.
+ *   A warning is printed to the kernel log but the mount succeeds.
+ *
+ *   For bind mounts, only per-mount flags (MS_NOSUID, MS_NODEV, MS_NOEXEC,
+ *   etc.) can be different from the source. The underlying superblock
+ *   flags are always shared.
+ *
+ * since-version: 0.97
+ */
 SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 		char __user *, type, unsigned long, flags, void __user *, data)
 {
