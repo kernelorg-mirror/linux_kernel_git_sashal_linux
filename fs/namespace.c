@@ -2061,6 +2061,306 @@ static int ksys_umount(char __user *name, int flags)
 	return path_umount(&path, flags);
 }
 
+/**
+ * sys_umount - Unmount a filesystem
+ * @name: Path to the mount point to unmount
+ * @flags: Flags controlling unmount behavior
+ *
+ * long-desc: Unmounts the filesystem mounted at the specified path. This
+ *   syscall is also known as umount2() in user-space, as it accepts behavioral
+ *   flags. The older umount() library call is equivalent to calling this
+ *   syscall with flags=0.
+ *
+ *   The unmount operation detaches the specified filesystem from the mount
+ *   tree, making the files on that filesystem inaccessible. The mount point
+ *   directory becomes visible again with its original contents. For the
+ *   unmount to succeed, the filesystem must not be busy (no open files, no
+ *   processes with current working directories within it, etc.) unless
+ *   special flags are used.
+ *
+ *   MNT_FORCE requests a forced unmount, asking the filesystem to abort
+ *   pending operations. This is primarily useful for network filesystems
+ *   that may be stuck waiting for a server. Supported by: 9p, ceph, cifs,
+ *   fuse, lustre, and NFS. May cause data loss on other filesystems.
+ *
+ *   MNT_DETACH performs a "lazy" unmount: the mount point is immediately
+ *   detached from the mount tree (making it invisible), but the actual
+ *   unmount is deferred until the filesystem is no longer busy. This is
+ *   useful when you need to unmount a filesystem but cannot wait for all
+ *   users to finish.
+ *
+ *   MNT_EXPIRE implements a two-phase expiration mechanism. On the first
+ *   call, if the filesystem is not busy, it is marked as expired and the
+ *   call returns -EAGAIN. On a subsequent call, if the filesystem is still
+ *   marked expired (and still not busy), it is actually unmounted. If the
+ *   filesystem becomes busy between calls, the expiry mark is cleared.
+ *   MNT_EXPIRE cannot be combined with MNT_FORCE or MNT_DETACH.
+ *
+ *   UMOUNT_NOFOLLOW prevents following symlinks in the final component of
+ *   the path. This is a security feature for setuid programs to prevent
+ *   symlink attacks where an unprivileged user creates a symlink to a
+ *   mount point.
+ *
+ *   When unmounting a mount that is part of a shared subtree (created with
+ *   MS_SHARED), the unmount will propagate to peer mounts and slave mounts.
+ *   Use MS_PRIVATE on a mount before unmounting to prevent propagation.
+ *
+ *   Special case: attempting to unmount the root filesystem of the calling
+ *   process (current->fs->root) without MNT_DETACH will instead remount
+ *   it read-only rather than actually unmounting it, which would be
+ *   impossible while the system is running.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: name
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname pointing to an
+ *     existing mount point. The path is resolved relative to the current
+ *     working directory (AT_FDCWD is used internally). Maximum length is
+ *     PATH_MAX (4096) bytes including the null terminator. Symlinks in the
+ *     path are followed unless UMOUNT_NOFOLLOW is specified, in which case
+ *     symlinks in the final component cause the operation to fail.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW
+ *   constraint: Valid flags are MNT_FORCE (0x1) to force unmount by aborting
+ *     pending operations, MNT_DETACH (0x2) for lazy unmount, MNT_EXPIRE (0x4)
+ *     for expiration-based unmount, and UMOUNT_NOFOLLOW (0x8) to not follow
+ *     symlinks. MNT_EXPIRE cannot be combined with MNT_FORCE or MNT_DETACH.
+ *     Pass 0 for a standard synchronous unmount that will fail if busy.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on successful unmount. For MNT_EXPIRE, returns 0 only
+ *     when the filesystem was successfully unmounted on the second call
+ *     (after being marked expired on the first call).
+ *
+ * error: EPERM, Caller lacks required capability
+ *   desc: The caller does not have CAP_SYS_ADMIN in the user namespace that
+ *     owns the mount namespace of the target mount. This check is performed
+ *     by may_mount() via ns_capable(). Also returned when MNT_FORCE is
+ *     requested but the caller lacks CAP_SYS_ADMIN in the filesystem's
+ *     superblock user namespace. Also returned when attempting to unmount
+ *     (or remount read-only) the root filesystem without CAP_SYS_ADMIN.
+ *
+ * error: EBUSY, Mount point is busy
+ *   desc: The filesystem is still in use: there are open files, processes
+ *     with current working directories on the filesystem, active swap files,
+ *     or other references preventing unmount. With MNT_EXPIRE, also returned
+ *     if the mount has child mounts or has more than the expected reference
+ *     count. Use MNT_DETACH for lazy unmount if you cannot make the
+ *     filesystem quiescent. Use lsof(8) or fuser(1) to identify users.
+ *
+ * error: EINVAL, Invalid flags or not a mount point
+ *   desc: Returned for several conditions: (1) flags contains bits other
+ *     than MNT_FORCE, MNT_DETACH, MNT_EXPIRE, and UMOUNT_NOFOLLOW; (2) the
+ *     path does not refer to a mount point; (3) the mount is not in the
+ *     caller's mount namespace (internal check_mnt() failure); (4) the mount
+ *     has MNT_LOCKED flag set (cannot be unmounted from this namespace);
+ *     (5) MNT_EXPIRE was combined with MNT_FORCE or MNT_DETACH; (6) MNT_EXPIRE
+ *     was used on the root filesystem; (7) the mount has no parent (is the
+ *     absolute root of the namespace).
+ *
+ * error: EAGAIN, Mount marked for expiry (success case)
+ *   desc: When using MNT_EXPIRE, this return value indicates the mount was
+ *     not busy and has been successfully marked as expired. A second call
+ *     with MNT_EXPIRE (before the mount becomes busy again) will perform
+ *     the actual unmount. This is not an error per se but indicates the
+ *     first phase of the expiration protocol completed.
+ *
+ * error: ENOENT, Path component does not exist
+ *   desc: A component of the pathname does not exist, or the pathname is
+ *     an empty string. This error comes from path resolution before the
+ *     mount-specific checks are performed.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search permission is denied on a component of the path prefix
+ *     during pathname resolution. Also returned by LSM hooks (SELinux,
+ *     AppArmor, etc.) if the security policy denies the unmount operation.
+ *     SELinux checks FILESYSTEM__UNMOUNT permission on the superblock.
+ *
+ * error: EFAULT, Invalid user pointer
+ *   desc: The name argument points outside the process's accessible address
+ *     space. This error is detected by strncpy_from_user() during pathname
+ *     copying.
+ *
+ * error: ENAMETOOLONG, Pathname too long
+ *   desc: The pathname exceeds PATH_MAX (4096) bytes, or a pathname component
+ *     exceeds NAME_MAX (255) bytes.
+ *
+ * error: ENOTDIR, Path component is not a directory
+ *   desc: A component used as a directory in the pathname is not actually
+ *     a directory. This error comes from path resolution.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving the
+ *     pathname (limit is typically 40 levels). Also returned if
+ *     UMOUNT_NOFOLLOW is specified and the final path component is a
+ *     symbolic link.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory needed for pathname processing
+ *     or internal data structures. All allocations in this path use
+ *     GFP_KERNEL and may sleep.
+ *
+ * lock: namespace_sem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The namespace read-write semaphore is acquired for writing via
+ *     namespace_lock()/down_write() to protect mount tree modifications.
+ *     This serializes all mount namespace operations. The lock is held
+ *     during the actual unmount operation and released before returning.
+ *
+ * lock: mount_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The mount hash seqlock is acquired for writing via lock_mount_hash()
+ *     to protect mount hash table modifications. This is a lower-level lock
+ *     than namespace_sem and is held for shorter durations during specific
+ *     mount tree manipulations.
+ *
+ * lock: sb->s_umount
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   condition: Only when unmounting root (causes read-only remount)
+ *   desc: When attempting to unmount the current root filesystem without
+ *     MNT_DETACH, the superblock's s_umount semaphore is acquired for writing
+ *     via down_write() to perform a read-only remount instead of actual
+ *     unmount. This serializes with other superblock operations.
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Mount tree
+ *   desc: The mount point is detached from the filesystem mount tree. For
+ *     synchronous unmount (no MNT_DETACH), the filesystem is fully unmounted
+ *     and resources are released. For MNT_DETACH, the mount becomes invisible
+ *     but remains in memory until all references are released.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount namespace mount count
+ *   desc: The mount namespace's nr_mounts counter is decremented when a mount
+ *     is removed from the namespace. This affects the namespace's mount quota
+ *     tracking.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Shared mount propagation
+ *   condition: Mount is in a shared subtree (MS_SHARED)
+ *   desc: When unmounting a mount that is part of a shared subtree, the
+ *     unmount operation propagates to peer mounts and slave mounts. This can
+ *     cause unmounts in other mount namespaces that share the propagation
+ *     group.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Filesystem superblock
+ *   condition: Unmounting root filesystem
+ *   desc: When attempting to unmount the current root filesystem without
+ *     MNT_DETACH, the filesystem is remounted read-only instead. This
+ *     affects all users of the filesystem, not just the caller.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount expiry mark
+ *   condition: MNT_EXPIRE flag specified
+ *   desc: Sets or clears the mnt_expiry_mark flag on the mount structure.
+ *     First MNT_EXPIRE call sets the mark, subsequent access clears it,
+ *     second MNT_EXPIRE call unmounts if still marked.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Unmount filesystems in the mount namespace
+ *   without: Returns -EPERM from may_mount() check
+ *   condition: Always checked via ns_capable() against the mount namespace's
+ *     user namespace
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Use MNT_FORCE flag for forced unmount
+ *   without: Returns -EPERM when MNT_FORCE is specified
+ *   condition: Checked via ns_capable() against the filesystem's superblock
+ *     user namespace when MNT_FORCE is in flags
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Remount root filesystem read-only
+ *   without: Returns -EPERM when attempting to unmount root without MNT_DETACH
+ *   condition: Checked when target is the current root filesystem
+ *
+ * constraint: Mount Namespace Membership
+ *   desc: The mount must belong to the caller's current mount namespace.
+ *     Mounts from other namespaces cannot be unmounted even with appropriate
+ *     privileges. The check_mnt() function verifies mnt->mnt_ns equals
+ *     current->nsproxy->mnt_ns.
+ *
+ * constraint: Mount Locked Status
+ *   desc: Mounts with the MNT_LOCKED flag cannot be unmounted. This flag is
+ *     set on mounts that are locked into a less privileged mount namespace
+ *     to prevent unprivileged users from unmounting them. Attempting to
+ *     unmount a locked mount returns -EINVAL.
+ *
+ * constraint: Root Filesystem Special Handling
+ *   desc: The root filesystem of the calling process (current->fs->root.mnt)
+ *     cannot be truly unmounted while the system is running. Without
+ *     MNT_DETACH, attempting to unmount root causes a read-only remount
+ *     instead. With MNT_DETACH, the root can be lazily detached (used in
+ *     pivot_root scenarios).
+ *
+ * constraint: MNT_EXPIRE Restrictions
+ *   desc: MNT_EXPIRE cannot be used on the root filesystem and cannot be
+ *     combined with MNT_FORCE or MNT_DETACH flags. The mount must have
+ *     exactly the expected reference count (2: parent vfsmount + syscall)
+ *     and no child mounts for expiration to proceed.
+ *
+ * examples: umount("/mnt/usb", 0);  // Standard unmount
+ *   umount("/mnt/nfs", MNT_FORCE);  // Force unmount of stuck NFS mount
+ *   umount("/mnt/busy", MNT_DETACH);  // Lazy unmount of busy filesystem
+ *   umount("/mnt/tmp", MNT_EXPIRE);  // First call: mark for expiry, returns -1/EAGAIN
+ *   umount("/mnt/tmp", MNT_EXPIRE);  // Second call: unmount if still idle
+ *   umount("/mnt/untrusted", UMOUNT_NOFOLLOW);  // Secure unmount in setuid program
+ *
+ * notes: The umount2() library function maps directly to this syscall. The
+ *   umount() library function calls this syscall with flags=0.
+ *
+ *   The syscall number is 166 on x86-64 (named umount2 in the syscall table)
+ *   and 52 on i386 (also named umount2). The older i386 umount syscall (22)
+ *   maps to sys_oldumount which calls this with flags=0.
+ *
+ *   Race condition note: There is an inherent race between checking if a
+ *   mount is busy and actually unmounting it. A process could open a file
+ *   after the busy check but before the unmount completes. The kernel handles
+ *   this by re-checking under locks (namespace_sem and mount_lock), but
+ *   MNT_DETACH is the only way to guarantee forward progress.
+ *
+ *   Historical bug: commit 32235dd3e7904 fixed a missing memory barrier
+ *   in do_umount() before reference count checks in the synchronous unmount
+ *   case. This could cause false EBUSY returns in rare race conditions.
+ *
+ *   The MNT_EXPIRE mechanism is used by automounters to expire idle mounts.
+ *   It avoids the race condition where a mount becomes busy between checking
+ *   and unmounting by using the two-phase mark-then-unmount protocol.
+ *
+ *   Unlike many syscalls, umount does not check for pending signals and
+ *   cannot return -EINTR. However, it may block waiting for I/O completion
+ *   or lock acquisition.
+ *
+ *   Mounts with pending filesystem notifications (fsnotify) will have
+ *   notifications queued when unmounted, provided the namespace has
+ *   registered watchers.
+ *
+ * since-version: 2.4.0
+ */
 SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 {
 	return ksys_umount(name, flags);
