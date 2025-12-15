@@ -1085,6 +1085,160 @@ SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
 	return do_faccessat(AT_FDCWD, filename, mode, 0);
 }
 
+/**
+ * sys_chdir - Change current working directory
+ * @filename: Pathname of new working directory
+ *
+ * long-desc: Changes the current working directory of the calling process to
+ *   the directory specified by @filename. The current working directory is
+ *   the starting point for interpreting relative pathnames (those not starting
+ *   with '/').
+ *
+ *   The path resolution follows symbolic links (LOOKUP_FOLLOW). The final
+ *   component must be a directory (LOOKUP_DIRECTORY). The calling process
+ *   must have search (execute) permission on the target directory.
+ *
+ *   If the path lookup encounters a stale NFS file handle (-ESTALE), the
+ *   syscall automatically retries with LOOKUP_REVAL to revalidate cached
+ *   dentries before returning the error to userspace.
+ *
+ *   The change affects only the calling process. Child processes created via
+ *   fork() inherit the parent's working directory at fork time. The working
+ *   directory is preserved across execve() calls.
+ *
+ *   For changing directory using an open file descriptor, use fchdir(). For
+ *   changing the root directory, use chroot() which requires CAP_SYS_CHROOT.
+ *
+ *   POSIX.1-2008 compliant. This syscall has existed since Linux 1.0.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: filename
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname in user-space memory.
+ *     Maximum total path length is PATH_MAX (4096) bytes including null
+ *     terminator. Individual path components are limited to NAME_MAX (255)
+ *     bytes. The path must resolve to a directory. An empty string returns
+ *     -ENOENT. If the pointer is invalid or inaccessible, returns -EFAULT.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code and
+ *     the current working directory remains unchanged.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A component of @filename does not exist, or @filename is an empty
+ *     string, or @filename is a dangling symbolic link pointing to a
+ *     nonexistent target.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @filename is not actually a
+ *     directory, or the final component of @filename is not a directory.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search permission is denied on a component of the path prefix,
+ *     or search (execute) permission is denied on the target directory.
+ *     Permission checking uses effective uid/gid. The calling process needs
+ *     execute permission on the target directory to change to it.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @filename pointer points outside the accessible address space.
+ *     Detected when copying the pathname from user space via strncpy_from_user()
+ *     in getname_flags().
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: @filename or one of its path components exceeds system limits.
+ *     Individual components are limited to NAME_MAX (255) bytes, and the
+ *     total path is limited to PATH_MAX (4096) bytes including terminator.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The kernel limit is 40 symlinks per path resolution with a maximum
+ *     recursion depth of 8 for nested symbolic links (MAXSYMLINKS).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to allocate the filename structure via
+ *     __getname() or other internal structures during path resolution.
+ *
+ * error: EIO, Input/output error
+ *   desc: An I/O error occurred while reading from the filesystem during
+ *     path resolution or inode lookup. This is filesystem-dependent and
+ *     indicates a hardware or low-level filesystem error.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle has become stale, typically on NFS when the
+ *     directory was deleted or replaced on the server. The kernel
+ *     automatically retries with LOOKUP_REVAL to revalidate, but if it
+ *     still fails, -ESTALE is returned to userspace.
+ *
+ * lock: RCU read-side critical section
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: Path lookup uses RCU-walk mode (rcu_read_lock) for fast path
+ *     resolution. If RCU-walk fails (e.g., due to blocking operation needed),
+ *     the lookup falls back to reference-counted (ref-walk) mode.
+ *
+ * lock: fs->seq (seqlock)
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's fs_struct seqlock is acquired exclusively via
+ *     write_seqlock() in set_fs_pwd() when updating the current working
+ *     directory. This serializes concurrent accesses to fs->pwd and ensures
+ *     atomic updates visible to other threads sharing the fs_struct.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process current working directory (current->fs->pwd)
+ *   desc: Changes the calling process's current working directory to the
+ *     specified path. The new directory's path structure (vfsmount and dentry)
+ *     is stored in current->fs->pwd. The previous working directory's
+ *     reference count is decremented via path_put().
+ *   condition: On successful path resolution and permission check
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Reference counts on path structures
+ *   desc: Increments reference count on the new working directory's vfsmount
+ *     (via mntget) and dentry (via dget) through path_get(). Decrements
+ *     reference count on the old working directory through path_put().
+ *   condition: On success
+ *   reversible: no
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypasses execute permission check on directories
+ *   without: Process must have execute permission on each directory component
+ *     in the path and on the target directory itself
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Overrides all DAC permission checks including execute on directories
+ *   without: Process must have appropriate execute permissions for path traversal
+ *   condition: Checked via capable_wrt_inode_uidgid() in generic_permission()
+ *     when standard permission check fails
+ *
+ * examples: chdir("/tmp");  // Change to /tmp directory
+ *   chdir("..");  // Move to parent directory
+ *   chdir("subdir");  // Change to relative subdirectory
+ *
+ * notes: Unlike chroot(), chdir() does not require any capabilities - any
+ *   process can change its working directory if it has search permission.
+ *   The working directory is per-process state stored in the fs_struct.
+ *   Threads sharing the same fs_struct (created with CLONE_FS) share the
+ *   same working directory. A successful chdir() does not guarantee that
+ *   the directory will remain accessible; it may be subsequently deleted
+ *   or have permissions changed. Some filesystems (AFS, FUSE, NFS) perform
+ *   additional permission checks via the MAY_CHDIR flag.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(chdir, const char __user *, filename)
 {
 	struct path path;
