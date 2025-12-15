@@ -2576,6 +2576,215 @@ SYSCALL_DEFINE3(listxattr, const char __user *, pathname, char __user *, list,
 	return path_listxattrat(AT_FDCWD, pathname, 0, list, size);
 }
 
+/**
+ * sys_llistxattr - list extended attribute names without following symlinks
+ * @pathname: Path to the file whose extended attributes to list
+ * @list: User buffer to receive the list of attribute names
+ * @size: Size of the user buffer in bytes
+ *
+ * long-desc: Retrieves the list of extended attribute names associated with
+ *   the file specified by pathname. This syscall is identical to listxattr()
+ *   except that if pathname refers to a symbolic link, llistxattr() retrieves
+ *   the attribute names of the link itself, rather than the file it refers to.
+ *
+ *   The attribute names are returned as a sequence of null-terminated strings
+ *   concatenated together in the list buffer. Each name includes its namespace
+ *   prefix (e.g., "security.selinux", "trusted.overlay.opaque").
+ *
+ *   If size is 0 and list is NULL, returns the current size of the attribute
+ *   name list without copying any data. This allows the caller to determine
+ *   the required buffer size before allocating memory.
+ *
+ *   The list of attribute names may vary based on the caller's privileges:
+ *   - "trusted.*" attributes are only listed for processes with CAP_SYS_ADMIN
+ *   - Security labels from LSMs (security.*) are included based on LSM policy
+ *   - POSIX ACLs (system.posix_acl_*) are listed if present and supported
+ *
+ *   Note that the user.* namespace is NOT supported on symbolic links. Since
+ *   llistxattr() operates on the symlink itself, user.* attributes will never
+ *   appear in the list for symbolic links. This is a deliberate restriction to
+ *   prevent resource consumption attacks, as any unprivileged user who can
+ *   create symlinks could otherwise attach arbitrary xattr data to them.
+ *
+ *   The maximum size of the attribute name list is limited to XATTR_LIST_MAX
+ *   (65536 bytes). If the actual list exceeds this limit, E2BIG is returned.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_USER_PATH
+ *   constraint: Must be a valid null-terminated path string in user memory.
+ *     The path is resolved WITHOUT following the final symbolic link component
+ *     (AT_SYMLINK_NOFOLLOW is used). However, symbolic links in directory
+ *     components of the path ARE followed. Maximum path length is PATH_MAX
+ *     (4096 bytes). The caller must have search permission on all directory
+ *     components of the path.
+ *
+ * param: list
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: When size is non-zero, must be a valid pointer to a user
+ *     buffer of at least size bytes. When size is zero, may be NULL (used
+ *     to query required buffer size). The buffer receives null-terminated
+ *     attribute names concatenated together.
+ *
+ * param: size
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, 65536
+ *   constraint: Size of the list buffer in bytes. Zero is permitted and
+ *     returns the required buffer size without writing any data. Values
+ *     larger than XATTR_LIST_MAX (65536) are silently capped to that limit.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the size in bytes of the attribute name list.
+ *     This is the total length of all null-terminated strings including their
+ *     null terminators. If size was 0, returns the required buffer size. If
+ *     there are no extended attributes, returns 0.
+ *
+ * error: ENOENT, File not found
+ *   desc: The file or symbolic link specified by pathname does not exist, or a
+ *     directory component in the path does not exist. Note that the final
+ *     component is not required to exist as a regular file - llistxattr can
+ *     operate on symbolic links, but the link itself must exist.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Permission denied during path resolution (search permission denied on
+ *     a directory component). Also returned by LSM security_inode_listxattr()
+ *     hook if the security policy denies listing attributes.
+ *
+ * error: ERANGE, Buffer too small
+ *   desc: The provided buffer (size > 0) is too small to hold the attribute name
+ *     list. Call with size=0 first to determine required size, then allocate
+ *     appropriate buffer. Note: list may change between calls.
+ *
+ * error: E2BIG, List too large
+ *   desc: The total size of attribute names exceeds XATTR_LIST_MAX (65536 bytes).
+ *     This occurs when the filesystem returns -ERANGE with a buffer that is
+ *     already at the maximum size. The file has more extended attributes than
+ *     can be listed.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel could not allocate memory for the intermediate buffer used to
+ *     retrieve attribute names from the filesystem (kvmalloc failed). The buffer
+ *     size is min(size, XATTR_LIST_MAX).
+ *
+ * error: EFAULT, Bad address
+ *   desc: The pathname pointer is invalid or points to memory that cannot be
+ *     accessed, or the list buffer is invalid and size is non-zero. Returned
+ *     from getname() for pathname or copy_to_user() for list buffer.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered during path resolution of
+ *     directory components (more than MAXSYMLINKS, typically 40). Note that
+ *     the final path component is never followed, only preceding symlinks in
+ *     the directory path are followed.
+ *
+ * error: ENAMETOOLONG, Filename too long
+ *   desc: The pathname or a component of the pathname exceeds the system limit
+ *     (PATH_MAX or NAME_MAX).
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component of the path prefix is not a directory.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle became stale during the operation (NFS). The syscall
+ *     automatically retries with LOOKUP_REVAL before returning this error.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The filesystem does not support extended attributes. This occurs when
+ *     the inode has no listxattr operation and security_inode_listsecurity()
+ *     returns no security labels.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from the filesystem, or the inode
+ *     is marked as bad (is_bad_inode). Filesystem-specific error.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Kernel buffer for attribute names
+ *   desc: When size > 0, a kernel buffer is allocated via kvmalloc() to receive
+ *     attribute names from the filesystem before copying to userspace. This
+ *     memory is freed (kvfree) after the operation completes, regardless of
+ *     success or failure.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_ACCESS_RESOURCE
+ *   allows: Listing trusted.* namespace attributes
+ *   without: Attributes in the trusted.* namespace are silently omitted from
+ *     the returned list. The caller does not receive an error, but simply
+ *     does not see these attributes. This applies to filesystems using
+ *     simple_xattr_list() (tmpfs, ramfs, etc.).
+ *   condition: Filesystem uses simple_xattr_list() and has trusted.* attributes
+ *
+ * constraint: Filesystem support
+ *   desc: The filesystem must support extended attributes. Most modern
+ *     filesystems (ext4, XFS, Btrfs, NFS, tmpfs) support xattrs. Some
+ *     filesystems (FAT, older ext2) do not. When unsupported, either
+ *     EOPNOTSUPP is returned or an empty list (0 bytes).
+ *
+ * constraint: user.* namespace restrictions on symlinks
+ *   desc: The user.* namespace is only supported on regular files and directories.
+ *     Since llistxattr() operates on symbolic links directly, user.* attributes
+ *     will never be listed for symlinks because symlinks cannot have them. This
+ *     restriction exists to prevent resource consumption attacks where
+ *     unprivileged users could create symlinks in world-writable directories
+ *     and attach arbitrary amounts of xattr data.
+ *
+ * constraint: LSM checks
+ *   desc: Linux Security Modules (SELinux, Smack, AppArmor) may restrict
+ *     which attributes are visible via security_inode_listxattr() hook.
+ *     The LSM can deny the operation entirely or filter specific attributes.
+ *
+ * constraint: Race conditions with attribute changes
+ *   desc: The set of extended attributes may change between querying the
+ *     required size (size=0) and retrieving the actual list. If attributes
+ *     are added, the second call may return ERANGE. Applications should
+ *     handle this by retrying with a larger buffer.
+ *
+ * examples: llistxattr("/path/symlink", buf, sizeof(buf));  // List symlink xattrs
+ *   llistxattr("/path/symlink", NULL, 0);  // Query required buffer size
+ *
+ * notes: llistxattr() is primarily used when you need to list extended attributes
+ *   of symbolic links themselves rather than their targets. This is important
+ *   for operations like backup/restore where symlink metadata must be preserved,
+ *   or for listing security contexts on symbolic links (SELinux assigns security
+ *   labels to symlinks independent of their targets).
+ *
+ *   The common pattern for listing extended attributes is:
+ *   1. Call llistxattr() with size=0 to get required buffer size
+ *   2. Allocate a buffer of that size
+ *   3. Call llistxattr() again with the buffer
+ *   4. Parse the returned list by scanning for null terminators
+ *
+ *   Be aware that:
+ *   - The attribute list may change between calls (handle ERANGE by retrying)
+ *   - trusted.* attributes are hidden from unprivileged callers
+ *   - user.* attributes are never present on symlinks (by design)
+ *   - Some filesystems may return an empty list even if they don't support xattrs
+ *   - The returned names include namespace prefixes (user., trusted., etc.)
+ *
+ *   Common use cases for llistxattr():
+ *   - Listing SELinux labels on symlinks (security.selinux)
+ *   - Backup utilities enumerating symlink metadata
+ *   - OverlayFS metadata enumeration on symlinks (trusted.overlay.*)
+ *
+ *   Related syscalls:
+ *   - listxattr(): Same but follows symbolic links
+ *   - flistxattr(): Operates on open file descriptor
+ *   - lgetxattr(): Retrieve value of a specific attribute from symlink
+ *   - lsetxattr(): Set value of an attribute on symlink
+ *   - lremovexattr(): Remove an attribute from symlink
+ *
+ * since-version: 2.4
+ */
 SYSCALL_DEFINE3(llistxattr, const char __user *, pathname, char __user *, list,
 		size_t, size)
 {
