@@ -1561,21 +1561,272 @@ static ssize_t vmsplice_to_pipe(struct file *file, struct iov_iter *iter,
 	return ret;
 }
 
-/*
- * Note that vmsplice only really supports true splicing _from_ user memory
- * to a pipe, not the other way around. Splicing from user memory is a simple
- * operation that can be supported without any funky alignment restrictions
- * or nasty vm tricks. We simply map in the user memory and fill them into
- * a pipe. The reverse isn't quite as easy, though. There are two possible
- * solutions for that:
+/**
+ * sys_vmsplice - Splice user memory pages into or out of a pipe
+ * @fd: Pipe file descriptor
+ * @uiov: Pointer to array of iovec structures describing user memory regions
+ * @nr_segs: Number of iovec segments in the array
+ * @flags: Behavioral flags (SPLICE_F_* constants)
  *
- *	- memcpy() the data internally, at which point we might as well just
- *	  do a regular read() on the buffer anyway.
- *	- Lots of nasty vm tricks, that are neither fast nor flexible (it
- *	  has restriction limitations on both ends of the pipe).
+ * long-desc: Transfers data between user memory and a pipe without copying
+ *   through an intermediate kernel buffer (zero-copy in one direction).
  *
- * Currently we punt and implement it as a normal copy, see pipe_to_user().
+ *   When fd refers to the write end of a pipe (opened with O_WRONLY or O_RDWR),
+ *   vmsplice() maps the user memory pages described by the iovec array directly
+ *   into the pipe's internal buffer. This is a true zero-copy operation where
+ *   the same physical pages are shared between user space and the pipe.
  *
+ *   When fd refers to the read end of a pipe (opened with O_RDONLY or O_RDWR),
+ *   vmsplice() copies data from the pipe into the user memory regions described
+ *   by iov. Note that despite the splice name, this direction is implemented
+ *   as a memory copy, not a zero-copy operation, due to VM complexity issues.
+ *
+ *   The direction of data transfer is determined automatically by checking the
+ *   file mode of fd. If FMODE_WRITE is set, data flows from user memory to pipe.
+ *   If FMODE_READ is set, data flows from pipe to user memory.
+ *
+ *   For user-to-pipe transfers, the pages are pinned using get_user_pages_fast()
+ *   and added to the pipe buffer. The calling process must not modify these
+ *   pages until the data has been consumed from the pipe, as this could corrupt
+ *   the pipe contents. Using SPLICE_F_GIFT indicates the pages are donated to
+ *   the kernel and should not be modified afterward.
+ *
+ *   This syscall is commonly used for high-performance I/O where minimizing
+ *   memory copies is critical, such as in web servers or media streaming
+ *   applications. It pairs naturally with splice(2) to move data from memory
+ *   through a pipe to a socket or file without intermediate copies.
+ *
+ *   Double-buffering is a common pattern: fill half of a buffer while the other
+ *   half is being transferred via vmsplice, then switch. This allows continuous
+ *   data flow without synchronization complexity.
+ *
+ *   Note: vmsplice() was the subject of serious security vulnerabilities in 2008
+ *   (CVE-2008-0009, CVE-2008-0010, CVE-2008-0600) that allowed local privilege
+ *   escalation. These were caused by missing permission checks and integer
+ *   overflow issues in early implementations.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor that refers to a pipe. The
+ *     direction of data transfer is determined by the file mode: if FMODE_WRITE
+ *     is set, data is transferred from user memory to the pipe; if FMODE_READ
+ *     is set, data is transferred from the pipe to user memory. If the file
+ *     descriptor is invalid, EBADF is returned. If the file descriptor does
+ *     not reference a pipe, EBADF is returned. If the file descriptor has
+ *     neither FMODE_READ nor FMODE_WRITE set, EBADF is returned.
+ *
+ * param: uiov
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to an array of struct iovec in user space. Each iovec
+ *     specifies a memory region with iov_base (starting address) and iov_len
+ *     (length in bytes). The iov_base pointers must reference valid, accessible
+ *     user memory. For transfers to pipe, the memory must be readable. For
+ *     transfers from pipe, the memory must be writable. Invalid addresses cause
+ *     EFAULT. If iov_len when cast to ssize_t is negative, EINVAL is returned.
+ *     The total bytes across all segments is capped at MAX_RW_COUNT (~2GB).
+ *     NULL pointer or inaccessible memory returns EFAULT.
+ *
+ * param: nr_segs
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UIO_MAXIOV
+ *   constraint: Number of iovec structures in the uiov array. Must be between
+ *     0 and UIO_MAXIOV (1024) inclusive. If nr_segs is 0, the syscall returns 0
+ *     immediately with no data transferred. If nr_segs exceeds UIO_MAXIOV,
+ *     EINVAL is returned. For efficiency, if nr_segs <= UIO_FASTIOV (8), a
+ *     stack-allocated array is used; otherwise heap allocation is required.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT
+ *   constraint: Bitwise OR of zero or more SPLICE_F_* flags. SPLICE_F_MOVE
+ *     (0x01) is currently unused for vmsplice. SPLICE_F_NONBLOCK (0x02) causes
+ *     the call to return EAGAIN instead of blocking when the pipe is full
+ *     (for to-pipe) or empty (for to-user). SPLICE_F_MORE (0x04) indicates more
+ *     data will follow; currently has no effect but reserved for future use.
+ *     SPLICE_F_GIFT (0x08) indicates the user pages are a "gift" to the kernel
+ *     and the caller promises not to modify them; enables potential optimization
+ *     in subsequent splice operations. Any bits outside this mask cause EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes transferred (non-negative).
+ *     This may be less than requested if the pipe buffer is full (to-pipe),
+ *     the pipe is empty (to-user), or partial data was available. A return
+ *     value of 0 indicates no data was transferred, which occurs when nr_segs
+ *     is 0 or all iovec segments have zero length. On error, returns a negative
+ *     error code.
+ *
+ * error: EINVAL, Invalid flags or segment count
+ *   desc: Returned when flags contains bits not in SPLICE_F_ALL mask (i.e.,
+ *     bits other than SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SPLICE_F_MORE, and
+ *     SPLICE_F_GIFT are set), when nr_segs exceeds UIO_MAXIOV (1024), or when
+ *     any iov_len field is negative when interpreted as ssize_t.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: Returned when fd is not a valid open file descriptor, when fd does
+ *     not reference a pipe, or when the file has neither FMODE_READ nor
+ *     FMODE_WRITE set. For vmsplice to work, fd must be specifically a pipe
+ *     file descriptor (created by pipe() or pipe2()), not a regular file,
+ *     socket, or other file type.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The uiov pointer is outside the accessible address space, one of
+ *     the iov_base pointers in the iovec array is invalid, or the memory
+ *     region is not accessible for the required operation (read for to-pipe,
+ *     write for to-user). The check uses access_ok() and copy_from_user().
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel memory allocation failed. This can occur when nr_segs exceeds
+ *     UIO_FASTIOV (8) requiring heap allocation for the iovec array, when
+ *     allocating the page array for get_user_pages_fast(), or when internal
+ *     pipe buffer structures cannot be allocated. Uses GFP_KERNEL allocation.
+ *
+ * error: EPIPE, Broken pipe
+ *   desc: When transferring data to pipe, returned if there are no readers
+ *     on the pipe (pipe->readers == 0). This indicates no process has the
+ *     read end of the pipe open. SIGPIPE is also sent to the calling process
+ *     before returning this error. Can be avoided by blocking or ignoring
+ *     SIGPIPE.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: SPLICE_F_NONBLOCK was set in flags and the operation would block.
+ *     For to-pipe transfers, this means the pipe buffer is full and no space
+ *     is available. For to-user transfers, this means the pipe is empty and
+ *     no data is available. Without SPLICE_F_NONBLOCK, the syscall would
+ *     block until space/data becomes available.
+ *
+ * error: ERESTARTSYS, Interrupted by signal (restartable)
+ *   desc: The syscall was waiting for pipe space (to-pipe) or data (to-user)
+ *     and a signal was delivered to the calling thread. This error is handled
+ *     by the syscall restart mechanism: if the signal handler was registered
+ *     with SA_RESTART, the syscall is automatically restarted after the signal
+ *     handler returns. Otherwise, the syscall returns -EINTR to user space.
+ *
+ * lock: pipe->mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The pipe's mutex is acquired via pipe_lock() before accessing or
+ *     modifying the pipe buffer. For to-pipe transfers, the lock is held while
+ *     waiting for space (if blocking), adding pages to the pipe buffer, and
+ *     updating head/tail pointers. For to-user transfers, the lock is held
+ *     while reading data from pipe buffers. The lock is always released before
+ *     the syscall returns, and is temporarily released during blocking waits
+ *     in pipe_wait_readable() or pipe_wait_writable().
+ *
+ * signal: SIGPIPE
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Writing to pipe with no readers (pipe->readers == 0)
+ *   desc: When attempting to transfer data to a pipe that has no readers
+ *     (all read ends have been closed), SIGPIPE is sent to the calling
+ *     process before returning EPIPE. The default action for SIGPIPE is
+ *     to terminate the process. Applications can ignore or handle this
+ *     signal to receive the EPIPE error instead of being terminated.
+ *   error: -EPIPE
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: Any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Waiting for pipe space or data
+ *   desc: While blocked waiting for the pipe to become writable (to-pipe)
+ *     or readable (to-user), any signal delivered to the thread will cause
+ *     the wait to be interrupted. The syscall returns ERESTARTSYS which is
+ *     converted to EINTR or triggers automatic restart depending on SA_RESTART.
+ *   error: -ERESTARTSYS
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Pipe buffer contents
+ *   desc: For to-pipe transfers, user memory pages are added to the pipe's
+ *     internal ring buffer, incrementing pipe->head. For to-user transfers,
+ *     data is consumed from the pipe buffer, advancing pipe->tail and
+ *     releasing pipe_buffer entries. The pipe occupancy changes accordingly.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Page references
+ *   desc: For to-pipe transfers, get_user_pages_fast() pins the user pages
+ *     and takes references on them. These references are released when the
+ *     pipe buffer entry is consumed (via pipe_buf_release). The pages remain
+ *     pinned in memory until read from the pipe.
+ *   condition: Only for user-to-pipe transfers
+ *   reversible: yes (when pipe data is consumed)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Pipe waiters
+ *   desc: For to-pipe transfers, pipe readers blocked in read() or poll()
+ *     are woken via wake_up_interruptible(&pipe->rd_wait). For to-user
+ *     transfers, pipe writers are woken via wake_up_interruptible(&pipe->wr_wait).
+ *     Also triggers fasync notifications (SIGIO via kill_fasync).
+ *   condition: When data is added or consumed from pipe
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: fsnotify events
+ *   desc: On successful transfer, fsnotify events are generated. For to-pipe
+ *     transfers, fsnotify_modify() is called on the pipe file. For to-user
+ *     transfers, fsnotify_access() is called. This allows inotify and fanotify
+ *     watchers to detect pipe activity.
+ *   condition: Only on successful transfer (return > 0)
+ *
+ * state-trans: pipe buffer
+ *   from: empty or partially filled
+ *   to: contains new data (to-pipe) or less data (to-user)
+ *   condition: Successful transfer of any bytes
+ *   desc: The pipe's ring buffer state changes. For to-pipe: pipe->head
+ *     increments and new pipe_buffer entries reference the user pages.
+ *     For to-user: pipe->tail increments and consumed buffers are released.
+ *
+ * constraint: Pipe capacity limit
+ *   desc: The amount of data that can be transferred to a pipe in a single
+ *     call is limited by the pipe's available buffer space. Default pipe
+ *     capacity is 16 pages (65536 bytes) but can be changed via F_SETPIPE_SZ
+ *     fcntl up to /proc/sys/fs/pipe-max-size (default 1MB). If pipe is full,
+ *     the call blocks (without SPLICE_F_NONBLOCK) or returns EAGAIN.
+ *
+ * constraint: Maximum iovec segments
+ *   desc: The nr_segs parameter cannot exceed UIO_MAXIOV (1024). This limit
+ *     is imposed by the iovec handling code and matches limits on other
+ *     vectored I/O syscalls like readv() and writev().
+ *
+ * constraint: Maximum transfer size
+ *   desc: Total bytes transferred is capped at MAX_RW_COUNT (~2GB) per call.
+ *     Individual iov_len values that would exceed this when summed are
+ *     truncated. This prevents integer overflow in size calculations.
+ *
+ * examples: vmsplice(pipefd[1], iov, 2, 0);  // Block until space available
+ *   vmsplice(pipefd[1], iov, 2, SPLICE_F_NONBLOCK);  // Return EAGAIN if full
+ *   vmsplice(pipefd[1], iov, 2, SPLICE_F_GIFT);  // Donate pages to kernel
+ *   vmsplice(pipefd[0], iov, 1, 0);  // Read from pipe to user buffer
+ *
+ * notes: vmsplice only achieves true zero-copy for user-to-pipe transfers.
+ *   The pipe-to-user direction is implemented as a memcpy internally due to
+ *   VM complexity. For best performance, use vmsplice to put data into a pipe,
+ *   then splice(2) to move it to a socket or file.
+ *
+ *   The SPLICE_F_GIFT flag is important for correctness when the user buffer
+ *   will be reused: it tells the kernel that subsequent splice operations may
+ *   reuse the pages. Without this flag, modifying the user buffer while data
+ *   is still in the pipe can cause data corruption.
+ *
+ *   FMODE_NOWAIT is explicitly cleared from pipe files when vmsplice is used
+ *   to prevent interference with other pipe operations.
+ *
+ * since-version: 2.6.17
  */
 SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
 		unsigned long, nr_segs, unsigned int, flags)
