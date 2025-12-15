@@ -391,6 +391,268 @@ static const struct file_operations timerfd_fops = {
 	.unlocked_ioctl	= timerfd_ioctl,
 };
 
+/**
+ * sys_timerfd_create - Create a timer file descriptor for timer event delivery
+ * @clockid: Clock source for the timer (CLOCK_MONOTONIC, CLOCK_REALTIME, etc.)
+ * @flags: Flags modifying file descriptor behavior (TFD_CLOEXEC, TFD_NONBLOCK)
+ *
+ * long-desc: Creates a new timer object accessible via a file descriptor,
+ *   enabling timer expiration notifications through standard file descriptor
+ *   polling mechanisms (poll(2), select(2), epoll(7)) rather than signals.
+ *   This provides a more convenient interface for event-driven applications
+ *   compared to POSIX interval timers created via timer_create(2).
+ *
+ *   The returned file descriptor supports the following operations:
+ *   - read(2): Blocks until timer expires, returns an 8-byte unsigned integer
+ *     containing the number of expirations since the last read. For periodic
+ *     timers, this count accumulates while the application is not reading.
+ *     Returns EAGAIN in non-blocking mode if no expiration occurred.
+ *   - poll(2)/select(2)/epoll(7): Reports EPOLLIN when timer has expired.
+ *   - close(2): Releases the timer and associated resources.
+ *   - timerfd_settime(2): Arms or disarms the timer with an expiration value.
+ *   - timerfd_gettime(2): Queries the current timer setting.
+ *
+ *   The clockid parameter selects which system clock to use:
+ *   - CLOCK_REALTIME: System-wide wall-clock time. This clock is affected
+ *     by discontinuous jumps (e.g., NTP adjustments, manual changes).
+ *     Suitable when absolute wall-clock times matter.
+ *   - CLOCK_MONOTONIC: Monotonically increasing clock from an unspecified
+ *     starting point. Not affected by system time changes. Does not include
+ *     time spent in suspend. Recommended for measuring elapsed time.
+ *   - CLOCK_BOOTTIME: Like CLOCK_MONOTONIC but includes time spent in
+ *     system suspend. Useful for timers that should account for sleep time.
+ *     Available since Linux 3.15.
+ *   - CLOCK_REALTIME_ALARM: Like CLOCK_REALTIME but can wake the system
+ *     from suspend when the timer expires. Requires CAP_WAKE_ALARM.
+ *     Available since Linux 3.11.
+ *   - CLOCK_BOOTTIME_ALARM: Like CLOCK_BOOTTIME but can wake the system
+ *     from suspend when the timer expires. Requires CAP_WAKE_ALARM.
+ *     Available since Linux 3.11.
+ *
+ *   The flags parameter is a bitwise OR of optional flags:
+ *   - TFD_CLOEXEC: Set the close-on-exec (FD_CLOEXEC) flag on the new file
+ *     descriptor. This prevents the file descriptor from being inherited
+ *     by child processes after exec(). Recommended for most applications.
+ *   - TFD_NONBLOCK: Set the O_NONBLOCK flag on the new file descriptor.
+ *     This causes read() to return EAGAIN instead of blocking when no
+ *     timer expiration has occurred.
+ *
+ *   Timer files are preserved across fork() - child processes inherit
+ *   references to the same timer object. The timer state (armed/disarmed,
+ *   expiration count) is shared. The file descriptor persists across exec()
+ *   unless TFD_CLOEXEC is set.
+ *
+ *   When a CLOCK_REALTIME or CLOCK_REALTIME_ALARM timer is set with absolute
+ *   time (TFD_TIMER_ABSTIME) and TFD_TIMER_CANCEL_ON_SET is used in
+ *   timerfd_settime(), the timer will be canceled (returning ECANCELED from
+ *   read()) if the system clock is discontinuously changed. This allows
+ *   applications to detect clock changes and recompute their timeouts.
+ *
+ *   For alarm timers (CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM), the
+ *   system uses the alarm timer infrastructure that can schedule wakeups
+ *   via the RTC or other platform wake sources. These timers are useful
+ *   for implementing scheduled wakeup functionality but require elevated
+ *   privileges (CAP_WAKE_ALARM) to prevent unprivileged users from
+ *   preventing system suspend.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: clockid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be one of CLOCK_MONOTONIC (1), CLOCK_REALTIME (0),
+ *     CLOCK_BOOTTIME (7), CLOCK_REALTIME_ALARM (8), or CLOCK_BOOTTIME_ALARM (9).
+ *     Other clock values such as CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
+ *     CLOCK_MONOTONIC_COARSE, CLOCK_PROCESS_CPUTIME_ID, or CLOCK_THREAD_CPUTIME_ID
+ *     are not supported and return EINVAL. The alarm clocks additionally require
+ *     CAP_WAKE_ALARM capability.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: TFD_CLOEXEC | TFD_NONBLOCK
+ *   constraint: Must be a bitwise OR of zero or more valid flags. Setting any
+ *     bits other than TFD_CLOEXEC or TFD_NONBLOCK causes EINVAL. The value 0
+ *     is valid and results in a file descriptor with neither close-on-exec
+ *     nor non-blocking mode set.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns a new file descriptor referring to the timer
+ *     object. This is the lowest-numbered file descriptor not currently open
+ *     for the calling process. The returned fd can be used with read(),
+ *     poll(), select(), epoll(), timerfd_settime(), timerfd_gettime(), and
+ *     close(). The timer is initially disarmed (will not expire until armed
+ *     via timerfd_settime()).
+ *
+ * error: EINVAL, Invalid clock ID or flags
+ *   desc: The clockid is not one of the supported clock types (CLOCK_MONOTONIC,
+ *     CLOCK_REALTIME, CLOCK_BOOTTIME, CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM),
+ *     or the flags contain bits other than TFD_CLOEXEC and TFD_NONBLOCK. Note
+ *     that valid POSIX clocks like CLOCK_MONOTONIC_RAW or CLOCK_PROCESS_CPUTIME_ID
+ *     are intentionally not supported for timerfd.
+ *
+ * error: EPERM, Operation not permitted for alarm clocks
+ *   desc: The clockid was CLOCK_REALTIME_ALARM or CLOCK_BOOTTIME_ALARM and
+ *     the calling process does not have the CAP_WAKE_ALARM capability. Alarm
+ *     clocks can wake the system from suspend, so they require elevated
+ *     privileges to prevent unprivileged users from interfering with power
+ *     management. This check was added in Linux 3.11 to match timer_create()
+ *     behavior for POSIX alarm timers.
+ *
+ * error: ENOMEM, Kernel memory allocation failed
+ *   desc: Insufficient kernel memory to allocate the timerfd_ctx structure
+ *     (approximately 200 bytes) or supporting data structures such as the
+ *     dentry for the anonymous inode. This can occur under severe memory
+ *     pressure or if the kernel has exhausted its memory pools.
+ *
+ * error: EMFILE, Per-process file descriptor limit reached
+ *   desc: The calling process has already reached its maximum number of open
+ *     file descriptors as defined by RLIMIT_NOFILE. This limit can be queried
+ *     and modified via getrlimit(2)/setrlimit(2) or prlimit(2). The default
+ *     soft limit is typically 1024. Applications can increase this limit up
+ *     to the hard limit or request higher limits via PAM configuration.
+ *
+ * error: ENFILE, System-wide file table full
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is set by /proc/sys/fs/file-max. Even privileged
+ *     processes (CAP_SYS_ADMIN) cannot exceed this limit. This error is rare
+ *     on modern systems but can occur under extreme file descriptor usage.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's file descriptor table spinlock is acquired briefly
+ *     during file descriptor allocation in get_unused_fd_flags(). This lock
+ *     protects the fd table from concurrent modifications by other threads
+ *     in the same process. The lock is held only during the fd allocation
+ *     phase, not during the entire syscall.
+ *
+ * lock: ctx->wqh.lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: false
+ *   released: false
+ *   desc: The wait queue head spinlock is initialized during timerfd_create()
+ *     via init_waitqueue_head() but is not explicitly acquired during creation.
+ *     This lock protects the wait queue and timer state (ticks, expired flags)
+ *     during subsequent read() and timer callback operations.
+ *
+ * lock: ctx->cancel_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: false
+ *   released: false
+ *   desc: The cancel lock is initialized during timerfd_create() via
+ *     spin_lock_init() but is not acquired during creation. This lock
+ *     protects the might_cancel state and the cancel_list linkage when
+ *     timers are set with TFD_TIMER_CANCEL_ON_SET.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DISCARD
+ *   condition: During memory allocation
+ *   desc: The syscall uses GFP_KERNEL for memory allocation which can sleep
+ *     but uses TASK_UNINTERRUPTIBLE state. Signals delivered during memory
+ *     allocation remain pending and are handled after the syscall returns.
+ *     The syscall itself does not return EINTR.
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor
+ *   desc: Creates a new file descriptor in the calling process's file
+ *     descriptor table. The fd references an anonymous inode with the
+ *     timerfd_fops operations. The file descriptor remains valid until
+ *     explicitly closed via close(2) or until the process terminates.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: timerfd_ctx structure
+ *   desc: Allocates a timerfd_ctx structure (approximately 200 bytes) using
+ *     kzalloc() with GFP_KERNEL. This structure contains the hrtimer or alarm
+ *     timer, wait queue head, tick counter, clock ID, and synchronization
+ *     primitives. The memory is freed via kfree_rcu() when the file descriptor
+ *     is closed.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: hrtimer or alarm timer initialization
+ *   desc: For regular clocks (CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_BOOTTIME),
+ *     initializes an hrtimer via hrtimer_setup(). For alarm clocks
+ *     (CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM), initializes an alarm timer
+ *     via alarm_init(). The timer is created in a disarmed state and will not
+ *     fire until armed via timerfd_settime().
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Anonymous inode reference count
+ *   desc: Increments the reference count on the anonymous inode filesystem's
+ *     shared inode via ihold(). All timerfd file descriptors share a single
+ *     anonymous inode, reducing memory overhead. The reference is released
+ *     when the file is closed.
+ *   reversible: yes
+ *
+ * capability: CAP_WAKE_ALARM
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Creating timers with CLOCK_REALTIME_ALARM or CLOCK_BOOTTIME_ALARM
+ *   without: Returns -EPERM when attempting to use alarm clocks
+ *   condition: Only checked when clockid is CLOCK_REALTIME_ALARM or
+ *     CLOCK_BOOTTIME_ALARM. Not required for CLOCK_MONOTONIC, CLOCK_REALTIME,
+ *     or CLOCK_BOOTTIME. The capability check uses capable() which checks the
+ *     effective capability set of the calling process.
+ *
+ * constraint: Clock selection
+ *   desc: The clock must be explicitly selected at creation time and cannot
+ *     be changed later. The clock determines the time base for all subsequent
+ *     timer operations via timerfd_settime(). Applications should carefully
+ *     consider which clock to use based on their requirements for handling
+ *     system time changes and suspend/resume behavior.
+ *
+ * constraint: Resource limits
+ *   desc: Subject to the RLIMIT_NOFILE per-process limit on open file
+ *     descriptors and the system-wide /proc/sys/fs/file-max limit. Each
+ *     timerfd consumes one file descriptor and one file structure.
+ *
+ * constraint: Memory accounting
+ *   desc: The timerfd_ctx memory allocation is accounted to the calling
+ *     process's memory cgroup if memory cgroups are enabled. Under memory
+ *     pressure, the allocation may fail with ENOMEM even if system memory
+ *     is available but the cgroup is at its limit.
+ *
+ * examples: fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);  // Recommended usage
+ *   fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);  // Non-blocking real-time timer
+ *   fd = timerfd_create(CLOCK_BOOTTIME_ALARM, TFD_CLOEXEC);  // Wake-capable timer (needs CAP_WAKE_ALARM)
+ *   if (fd < 0) { perror("timerfd_create"); exit(1); }
+ *
+ * notes: The timerfd API was introduced in Linux 2.6.25 after significant
+ *   design discussions. The original 2.6.22 implementation was disabled in
+ *   2.6.23 due to interface concerns and was redesigned into the current
+ *   three-syscall API (timerfd_create, timerfd_settime, timerfd_gettime).
+ *
+ *   Unlike POSIX timers (timer_create), timerfd timers do not deliver signals.
+ *   This makes them safer to use in multi-threaded programs and easier to
+ *   integrate with event loops using poll/epoll.
+ *
+ *   The returned file descriptor shows up as "[timerfd]" in /proc/pid/fd/
+ *   and /proc/pid/fdinfo/ which provides timer details including the clock ID,
+ *   tick count, settime flags, and remaining/interval values.
+ *
+ *   For ARM architectures with OABI (old ABI), the timerfd syscalls are
+ *   available but may have different syscall numbers due to ABI constraints.
+ *
+ *   Thread safety: The timerfd_ctx structure is protected by spinlocks for
+ *   concurrent access from multiple threads. Multiple threads can safely
+ *   read from the same timerfd (though only one will get each expiration
+ *   notification) or call timerfd_settime/timerfd_gettime concurrently.
+ *
+ *   glibc provides timerfd_create() wrapper starting from version 2.8. The
+ *   wrapper is a thin syscall passthrough with no additional logic.
+ *
+ * since-version: 2.6.25
+ */
 SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
 {
 	struct timerfd_ctx *ctx __free(kfree) = NULL;
