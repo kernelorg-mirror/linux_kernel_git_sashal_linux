@@ -932,6 +932,335 @@ SYSCALL_DEFINE0(inotify_init)
 	return do_inotify_init(0);
 }
 
+/**
+ * sys_inotify_add_watch - Add or modify a watch on a filesystem object
+ * @fd: File descriptor referring to an inotify instance
+ * @pathname: Path to the filesystem object to watch
+ * @mask: Bitmask specifying which events to monitor and control flags
+ *
+ * long-desc: Adds a new watch, or modifies an existing watch, for the
+ *   filesystem object (inode) specified by @pathname to the inotify instance
+ *   referenced by @fd. The caller must have read permission on the target file.
+ *
+ *   The @mask argument specifies which filesystem events to monitor. Multiple
+ *   event types can be ORed together. Event flags include: IN_ACCESS (file
+ *   accessed), IN_MODIFY (file modified), IN_ATTRIB (metadata changed),
+ *   IN_CLOSE_WRITE (writable file closed), IN_CLOSE_NOWRITE (non-writable file
+ *   closed), IN_OPEN (file opened), IN_MOVED_FROM (file moved from watched
+ *   directory), IN_MOVED_TO (file moved to watched directory), IN_CREATE
+ *   (file/directory created), IN_DELETE (file/directory deleted),
+ *   IN_DELETE_SELF (watched object deleted), and IN_MOVE_SELF (watched object
+ *   moved). Convenience macros IN_CLOSE, IN_MOVE, and IN_ALL_EVENTS are also
+ *   available.
+ *
+ *   Control flags in @mask modify watch behavior: IN_ONLYDIR fails if the path
+ *   is not a directory, IN_DONT_FOLLOW prevents following symbolic links,
+ *   IN_EXCL_UNLINK excludes events for unlinked children, IN_MASK_ADD adds
+ *   events to an existing watch mask instead of replacing it, IN_MASK_CREATE
+ *   fails if a watch already exists (cannot be combined with IN_MASK_ADD), and
+ *   IN_ONESHOT removes the watch after delivering one event.
+ *
+ *   If @pathname was already being watched by this inotify instance, the
+ *   existing watch descriptor is returned and its mask is updated (replaced or
+ *   augmented based on IN_MASK_ADD). Otherwise, a new watch descriptor is
+ *   allocated. Watch descriptors are unique within an inotify instance and
+ *   identify the watched object in subsequent event notifications.
+ *
+ *   The inotify subsystem tracks watches by inode, not by path. Hard links to
+ *   the same file share a watch, and the watch persists even if the file is
+ *   renamed (generating IN_MOVE_SELF). The watch is automatically removed when
+ *   the watched file is deleted (generating IN_DELETE_SELF and IN_IGNORED) or
+ *   when the containing filesystem is unmounted (generating IN_UNMOUNT and
+ *   IN_IGNORED).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to an inotify
+ *     instance created by inotify_init(2) or inotify_init1(2). The file
+ *     descriptor must have been opened by the current process or inherited.
+ *     Passing a file descriptor for any other file type (regular file, socket,
+ *     pipe, etc.) results in EINVAL.
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated string in user address space,
+ *     not exceeding PATH_MAX (4096) bytes including the null terminator. The
+ *     path is resolved relative to the current working directory. Empty paths
+ *     are not permitted. The caller must have read permission (MAY_READ) on
+ *     the resolved file.
+ *
+ * param: mask
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE |
+ *     IN_CLOSE_NOWRITE | IN_OPEN | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE |
+ *     IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_Q_OVERFLOW |
+ *     IN_IGNORED | IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD |
+ *     IN_MASK_CREATE | IN_ISDIR | IN_ONESHOT
+ *   constraint: Must contain only valid inotify bits (ALL_INOTIFY_BITS). At
+ *     least one event bit must be set. IN_MASK_ADD and IN_MASK_CREATE cannot
+ *     be specified together. IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED, and
+ *     IN_ISDIR are output-only flags returned in events but accepted in input
+ *     for compatibility.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 1
+ *   desc: On success, returns a nonnegative watch descriptor (wd). If the
+ *     inode was already being watched, the existing wd is returned and the
+ *     mask is updated. Otherwise, a newly allocated wd is returned. Watch
+ *     descriptors start at 1 and are allocated cyclically via IDR. The wd
+ *     uniquely identifies the watch within this inotify instance and appears
+ *     in the wd field of inotify_event structures read from the instance.
+ *
+ * error: EINVAL, Invalid mask bits
+ *   desc: The @mask argument contains bits outside ALL_INOTIFY_BITS. Only
+ *     inotify-defined event and control flags are permitted. This check
+ *     prevents internal fsnotify flags from being set on watches.
+ *
+ * error: EINVAL, No event bits in mask
+ *   desc: The @mask argument does not contain any valid event bits to watch
+ *     for. At least one of the IN_* event flags must be set; a watch with no
+ *     events would generate no notifications.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The @fd argument is not a valid open file descriptor. This includes
+ *     negative values, values exceeding the process's file descriptor limit,
+ *     and values referring to closed file descriptors.
+ *
+ * error: EINVAL, Conflicting mask flags
+ *   desc: The @mask argument contains both IN_MASK_ADD and IN_MASK_CREATE.
+ *     These flags are mutually exclusive: IN_MASK_ADD modifies existing
+ *     watches while IN_MASK_CREATE requires that no watch exists. This
+ *     combination is reserved for future use.
+ *
+ * error: EINVAL, Not an inotify instance
+ *   desc: The file descriptor @fd does not refer to an inotify instance. This
+ *     occurs when @fd refers to a regular file, directory, pipe, socket, or
+ *     any file type other than an inotify file descriptor. The kernel checks
+ *     that f_op == &inotify_fops.
+ *
+ * error: EACCES, Read permission denied on target
+ *   desc: The calling process does not have read permission (MAY_READ) on the
+ *     file specified by @pathname. inotify requires read permission to watch
+ *     a file because watching events is conceptually similar to reading the
+ *     file's state. This is checked via path_permission() after path resolution.
+ *
+ * error: EACCES, LSM denied the watch
+ *   desc: A Linux Security Module (such as SELinux or AppArmor) denied
+ *     permission to set a watch on the specified path. The LSM hook
+ *     security_path_notify() is called after basic permission checks pass.
+ *     The specific policy violation depends on the active LSM configuration.
+ *
+ * error: EACCES, Permission denied during path resolution
+ *   desc: The calling process lacks execute (search) permission on a directory
+ *     component of @pathname, or the filesystem has unmapped UIDs/GIDs that
+ *     prevent access. Path traversal requires MAY_EXEC on each directory.
+ *
+ * error: EFAULT, Invalid pathname pointer
+ *   desc: The @pathname pointer is invalid or points to memory outside the
+ *     process's accessible address space. The kernel uses strncpy_from_user()
+ *     which fails with -EFAULT if the user-space pointer cannot be read.
+ *
+ * error: ENOENT, Pathname does not exist
+ *   desc: A component of @pathname does not exist, or @pathname is an empty
+ *     string, or @pathname is a dangling symbolic link (and IN_DONT_FOLLOW
+ *     is not set). This includes cases where an intermediate directory does
+ *     not exist.
+ *
+ * error: ENAMETOOLONG, Pathname too long
+ *   desc: The @pathname argument, or a component within it, exceeds the
+ *     maximum allowed length. The total path must be less than PATH_MAX
+ *     (4096 bytes), and each component must be less than NAME_MAX (255 bytes).
+ *
+ * error: ENOTDIR, Path component is not a directory
+ *   desc: A component used as a directory in @pathname is not actually a
+ *     directory. This also occurs when IN_ONLYDIR is specified and the final
+ *     path component is not a directory.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @pathname.
+ *     The kernel limits symbolic link traversal to MAXSYMLINKS (typically 40)
+ *     to prevent infinite loops. This can also indicate a symbolic link loop.
+ *
+ * error: EEXIST, Watch already exists with IN_MASK_CREATE
+ *   desc: The @mask contains IN_MASK_CREATE but the inode corresponding to
+ *     @pathname is already being watched by this inotify instance. This flag
+ *     is intended to atomically create new watches without risk of modifying
+ *     existing ones. Added in Linux 4.18.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate sufficient memory for internal data
+ *     structures. This includes memory for the inotify_inode_mark structure,
+ *     fsnotify connector objects, path lookup structures, or IDR entries.
+ *     All allocations use GFP_KERNEL and can trigger memory reclaim.
+ *
+ * error: ENOSPC, User watch limit exceeded
+ *   desc: The per-user limit on the number of inotify watches has been
+ *     reached. This limit is controlled by /proc/sys/fs/inotify/max_user_watches
+ *     (default calculated based on available memory, typically 8192-1048576).
+ *     The limit applies across all inotify instances owned by the user.
+ *
+ * lock: group->mark_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The fsnotify group's mark mutex is acquired via fsnotify_group_lock()
+ *     in inotify_update_watch() and held while checking for existing watches
+ *     and potentially adding a new watch. This serializes watch modifications
+ *     on the same inotify instance from concurrent threads. The lock also sets
+ *     PF_MEMALLOC_NOFS to prevent deadlock during memory reclaim.
+ *
+ * lock: group->inotify_data.idr_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The inotify IDR spinlock is acquired during watch descriptor
+ *     allocation in inotify_add_to_idr() and when looking up existing watches.
+ *     This protects the IDR mapping from watch descriptors to mark structures.
+ *
+ * lock: mark->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Individual mark spinlocks are acquired when updating mark masks or
+ *     flags, and when adding marks to the group's mark list. This provides
+ *     fine-grained protection for per-mark state.
+ *
+ * lock: connector->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The fsnotify connector lock is acquired when adding a mark to an
+ *     inode's connector list. This protects the per-inode list of marks from
+ *     concurrent modification.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: inotify watch (inotify_inode_mark)
+ *   desc: When creating a new watch, allocates an inotify_inode_mark structure
+ *     from a dedicated slab cache (inotify_inode_mark_cachep). This structure
+ *     contains the fsnotify_mark and the watch descriptor. The structure is
+ *     reference-counted and freed when the watch is removed.
+ *   reversible: yes
+ *   condition: New watch being created (not modifying existing)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Per-user watch count
+ *   desc: Increments the per-user count of inotify watches via the user
+ *     namespace ucount mechanism (UCOUNT_INOTIFY_WATCHES). This count is
+ *     tracked against the max_user_watches limit. The count is decremented
+ *     when the watch is removed.
+ *   reversible: yes
+ *   condition: New watch being created
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Existing watch mask
+ *   desc: When modifying an existing watch (path already watched), updates
+ *     the watch's event mask. By default, the new mask replaces the old mask.
+ *     With IN_MASK_ADD, the new events are ORed with the existing mask.
+ *   reversible: yes
+ *   condition: Watch already exists for the inode
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode fsnotify mask
+ *   desc: Updates the aggregate fsnotify mask on the target inode
+ *     (i_fsnotify_mask) via fsnotify_recalc_mask(). This mask is the OR of
+ *     all watch masks on the inode and is used for fast event filtering.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: fsnotify_mark_connector
+ *   desc: If the target inode does not already have an fsnotify connector,
+ *     one is allocated via kmem_cache_alloc(). The connector links all marks
+ *     watching this inode and persists until all marks are removed.
+ *   reversible: yes
+ *   condition: First watch on this inode
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: fsnotify_sb_info
+ *   desc: If the target filesystem's superblock does not have fsnotify info,
+ *     allocates an fsnotify_sb_info structure via kzalloc(). This structure
+ *     persists for the lifetime of the filesystem mount.
+ *   reversible: no
+ *   condition: First fsnotify watch on this filesystem
+ *
+ * constraint: max_user_watches
+ *   desc: The per-user limit /proc/sys/fs/inotify/max_user_watches limits how
+ *     many watches a single user can create across all inotify instances. The
+ *     default is calculated as 1% of available memory divided by the watch
+ *     cost, clamped to 8192-1048576. This limit is namespace-aware and can be
+ *     configured per user namespace.
+ *   expr: current_watches < max_user_watches
+ *
+ * constraint: Read permission
+ *   desc: The calling process must have read permission (MAY_READ) on the
+ *     target file. This is checked via path_permission() and includes both
+ *     standard UNIX permission checks and LSM hooks.
+ *
+ * constraint: Path validity
+ *   desc: The pathname must be resolvable to an existing inode. The path
+ *     resolution follows standard kernel semantics including symbolic link
+ *     handling (controlled by IN_DONT_FOLLOW) and mount point traversal.
+ *
+ * constraint: LSM policy
+ *   desc: The security_path_notify() LSM hook must permit the watch. SELinux
+ *     checks the watch permission, and other LSMs may impose additional
+ *     restrictions based on security policy.
+ *
+ * examples: wd = inotify_add_watch(fd, "/tmp/file", IN_MODIFY | IN_DELETE);
+ *   wd = inotify_add_watch(fd, ".", IN_CREATE | IN_DELETE | IN_ONLYDIR);
+ *   wd = inotify_add_watch(fd, path, IN_ALL_EVENTS | IN_ONESHOT);
+ *   wd = inotify_add_watch(fd, path, IN_MODIFY | IN_MASK_ADD);
+ *   wd = inotify_add_watch(fd, link, IN_ACCESS | IN_DONT_FOLLOW);
+ *   // Error handling: if (wd < 0) { perror("inotify_add_watch"); }
+ *
+ * notes: The inotify_add_watch() syscall was introduced in Linux 2.6.13 as
+ *   part of the original inotify implementation.
+ *
+ *   Watch descriptors are allocated using a cyclic IDR starting at 1, so
+ *   watch descriptors may be reused after watches are removed. Applications
+ *   should not assume watch descriptors are sequential or unique across the
+ *   lifetime of the process.
+ *
+ *   When watching a directory, events are generated for files within that
+ *   directory (with the name field populated), as well as for the directory
+ *   itself. The IN_ISDIR flag in event masks distinguishes directory events.
+ *   Watching is not recursive; subdirectories must be watched separately.
+ *
+ *   The IN_EXCL_UNLINK flag (added in Linux 2.6.36) is useful for avoiding
+ *   events on temporary files that are created and immediately unlinked while
+ *   still open. Without this flag, events continue for open unlinked files.
+ *
+ *   The IN_MASK_CREATE flag (added in Linux 4.18) allows atomically creating
+ *   a watch only if one does not already exist. This is useful for avoiding
+ *   accidental modification of watches in concurrent applications.
+ *
+ *   A race condition fix in commit e1e5a9f84e4d ensures that concurrent calls
+ *   to inotify_add_watch() for the same path are properly serialized. The
+ *   group mark_mutex prevents both watch count limit bypass and duplicate
+ *   watch creation.
+ *
+ *   Memory for inotify watches is charged to the memory cgroup of the process
+ *   that creates the watch (via GFP_KERNEL_ACCOUNT in the mark slab cache).
+ *
+ *   Unlike the related fanotify_mark() syscall, inotify_add_watch() does not
+ *   require any special capabilities. The only requirement is read permission
+ *   on the target file and any LSM policy restrictions.
+ *
+ *   The syscall does not block on signals during normal operation, but memory
+ *   allocation with GFP_KERNEL may trigger reclaim which could block. The
+ *   syscall cannot return EINTR as it does not use interruptible waits.
+ *
+ * since-version: 2.6.13
+ */
 SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
 		u32, mask)
 {
