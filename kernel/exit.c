@@ -1074,6 +1074,302 @@ void __noreturn make_task_dead(int signr)
 	do_exit(signr);
 }
 
+/**
+ * sys_exit - Terminate the calling thread
+ * @error_code: Exit status code returned to the parent process
+ *
+ * long-desc: Terminates the calling thread immediately, performing extensive
+ *   cleanup of kernel resources. Only the low 8 bits of error_code are used;
+ *   these bits are shifted left by 8 and stored as the wait status, making
+ *   them retrievable via wait(2), waitpid(2), or waitid(2) by the parent.
+ *
+ *   This syscall terminates only the calling thread, not the entire process.
+ *   In a multi-threaded process, other threads continue executing. To
+ *   terminate all threads in the thread group, use exit_group(2) instead.
+ *   Modern glibc (since version 2.3) implements _exit() using exit_group(2)
+ *   rather than this syscall for exactly this reason.
+ *
+ *   The exit status encoding follows UNIX conventions: the low 7 bits (0x7f)
+ *   of the wait status indicate termination by signal (0 means normal exit),
+ *   bit 0x80 indicates core dump, and bits 8-15 contain the exit code passed
+ *   to exit(). Since sys_exit shifts error_code left by 8, the value passed
+ *   to sys_exit becomes bits 8-15 of the wait status, indicating normal exit.
+ *
+ *   The cleanup sequence performed by do_exit() includes:
+ *   - Synchronizing with group exit (if other threads are exiting)
+ *   - Notifying ptrace debuggers via PTRACE_EVENT_EXIT
+ *   - Canceling io_uring operations
+ *   - Setting PF_EXITING flag to mark thread as exiting
+ *   - Releasing seccomp filters
+ *   - Recording process accounting data
+ *   - Stopping POSIX timers (if last thread in group)
+ *   - Releasing the memory address space (mm_struct)
+ *   - Releasing SysV semaphore undo structures
+ *   - Detaching from shared memory segments
+ *   - Closing all open file descriptors
+ *   - Releasing filesystem context (cwd, root)
+ *   - Disassociating from controlling terminal (if last thread)
+ *   - Leaving namespaces
+ *   - Executing pending task work
+ *   - Releasing thread-specific state
+ *   - Leaving cgroups
+ *   - Flushing hardware breakpoints
+ *   - Reparenting children to init or a subreaper
+ *   - Sending SIGCHLD to parent process
+ *   - Transitioning to zombie state
+ *   - Freeing remaining resources and scheduling final context switch
+ *
+ *   This syscall does not return - after cleanup completes, the thread
+ *   enters TASK_DEAD state and is scheduled away permanently.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: error_code
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: INT_MIN, INT_MAX
+ *   constraint: Any integer value is accepted. Only the low 8 bits
+ *     (error_code & 0xff) are used; all other bits are masked off. The
+ *     resulting value is shifted left by 8 before being stored as the
+ *     exit code, producing values in the range 0x0000-0xFF00. Conventionally,
+ *     values 0-255 are used, with 0 indicating success and non-zero values
+ *     indicating various error conditions defined by the application.
+ *     Values 126-128 have special conventional meanings in shells.
+ *
+ * return:
+ *   type: KAPI_TYPE_VOID
+ *   check-type: KAPI_RETURN_NO_RETURN
+ *   success: never returns
+ *   desc: This syscall never returns to the caller. The thread is terminated
+ *     and enters TASK_DEAD state. The exit status becomes available to the
+ *     parent process via wait(2) family calls. If the parent has set SIGCHLD
+ *     to SIG_IGN or used SA_NOCLDWAIT, the thread is automatically reaped
+ *     without becoming a zombie.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The signal handler spinlock is acquired multiple times during exit
+ *     processing: in synchronize_group_exit() to coordinate with other exiting
+ *     threads and check for pending coredumps, in exit_signals() to set
+ *     PF_EXITING and retarget shared pending signals, and in exit_notify()
+ *     when notifying the parent. The lock protects signal-related state
+ *     including the group exit code and quick_threads counter.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global task list rwlock is acquired for writing in exit_notify()
+ *     to safely reparent children, remove the task from process lists, and
+ *     notify the parent. It protects the parent/child relationships and task
+ *     list integrity. Also acquired for reading in exit_signals() if group
+ *     stop notification is needed.
+ *
+ * lock: mm->mmap_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The memory map read-write semaphore is acquired for reading in
+ *     exit_mm() during address space teardown. This synchronizes with other
+ *     threads accessing the memory map and ensures safe transition to lazy
+ *     TLB mode.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The file descriptor table spinlock is acquired in exit_files()
+ *     when closing file descriptors. Protects concurrent access to the
+ *     process's file descriptor table.
+ *
+ * signal: SIGCHLD
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When exiting thread is the thread group leader or is ptraced
+ *   desc: Sends SIGCHLD to the parent process to notify it of the child's
+ *     termination. The signal carries information about the exit status
+ *     (si_status), termination cause (CLD_EXITED for normal exit), and
+ *     resource usage. If parent has SIGCHLD set to SIG_IGN or SA_NOCLDWAIT,
+ *     no signal is sent and the task is auto-reaped.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * signal: SIGHUP
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When exit orphans a process group with stopped members
+ *   desc: Sends SIGHUP followed by SIGCONT to newly orphaned process groups
+ *     that have stopped members. This implements POSIX semantics for orphaned
+ *     process groups - stopped jobs in orphaned groups receive SIGHUP to
+ *     notify them they can no longer be continued by job control.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: SIGCONT
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_CONTINUE
+ *   condition: After SIGHUP to orphaned process group
+ *   desc: Sent immediately after SIGHUP to orphaned process groups with
+ *     stopped members. Allows stopped processes to wake up and handle the
+ *     SIGHUP signal rather than remaining stopped indefinitely.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: pdeath_signal
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When child processes are reparented and have pdeath_signal set
+ *   desc: If a child process has set a parent-death signal via prctl(2)
+ *     PR_SET_PDEATHSIG, that signal is sent to the child when this process
+ *     exits and the child is reparented.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE | KAPI_EFFECT_IRREVERSIBLE
+ *   target: Calling thread
+ *   desc: Terminates the calling thread. This is irreversible - once exit()
+ *     is called, the thread cannot be resumed or restarted. The thread's
+ *     task_struct transitions through EXIT_ZOMBIE state (waiting to be
+ *     reaped by parent) and eventually to EXIT_DEAD (fully released).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FREE_MEMORY
+ *   target: Address space (mm_struct)
+ *   desc: Releases the thread's reference to the address space. If this is
+ *     the last reference, all virtual memory mappings are unmapped, page
+ *     tables are freed, and physical pages are released. Anonymous pages
+ *     go to swap or are discarded; file-backed pages are written back if
+ *     dirty.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: File descriptors
+ *   desc: Closes all open file descriptors. For each fd, this decrements
+ *     the file reference count and may trigger close operations including
+ *     flushing buffers, releasing locks (flock, fcntl), and freeing
+ *     resources. Pending writes may block if O_SYNC or similar is set.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Child processes
+ *   desc: All child processes are reparented. The new parent is selected
+ *     in order: (1) another thread in the same thread group, (2) the
+ *     nearest ancestor marked as child_subreaper via prctl(), or (3)
+ *     the init process (PID 1) in the child's PID namespace. Zombie
+ *     children are immediately reparented to be reaped by the new parent.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: POSIX timers
+ *   desc: If this is the last thread in the thread group, all POSIX timers
+ *     created by timer_create(2) are destroyed. The real-time timer is
+ *     canceled via hrtimer_cancel().
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: SysV semaphore undo entries
+ *   desc: Releases all SysV semaphore undo entries (struct sem_undo).
+ *     Pending semaphore adjustments from semop() with SEM_UNDO are applied.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: io_uring instances
+ *   desc: Cancels all pending io_uring operations and releases io_uring
+ *     state associated with this task.
+ *   reversible: no
+ *
+ * state-trans: task->__state
+ *   from: TASK_RUNNING
+ *   to: TASK_DEAD
+ *   condition: Always, at end of do_exit()
+ *   desc: The task's scheduling state transitions from TASK_RUNNING (or
+ *     any runnable state) to TASK_DEAD. In TASK_DEAD state, the task is
+ *     removed from the run queue and will never be scheduled again. The
+ *     final context switch releases the task_struct.
+ *
+ * state-trans: task->exit_state
+ *   from: 0
+ *   to: EXIT_ZOMBIE
+ *   condition: When entering exit_notify()
+ *   desc: The exit_state transitions from 0 (not exiting) to EXIT_ZOMBIE,
+ *     indicating the task has exited but its exit status has not yet been
+ *     collected by the parent. In zombie state, most resources are freed
+ *     but the task_struct remains for status collection.
+ *
+ * state-trans: task->exit_state
+ *   from: EXIT_ZOMBIE
+ *   to: EXIT_DEAD
+ *   condition: When parent ignores SIGCHLD or performs wait()
+ *   desc: If the parent has SIGCHLD set to SIG_IGN or SA_NOCLDWAIT, or
+ *     when the parent calls wait() to collect the status, the exit_state
+ *     transitions to EXIT_DEAD. In EXIT_DEAD state, release_task() frees
+ *     the remaining task_struct memory.
+ *
+ * state-trans: task->flags PF_EXITING
+ *   from: unset
+ *   to: set
+ *   condition: During exit_signals()
+ *   desc: The PF_EXITING flag is set to mark the task as exiting. This
+ *     flag prevents the task from receiving new group-wide signals and
+ *     is checked by various subsystems to avoid operating on exiting
+ *     tasks.
+ *
+ * constraint: Thread vs Process Termination
+ *   desc: This syscall only terminates the calling thread. In multi-threaded
+ *     programs, use exit_group(2) to terminate all threads. The C library
+ *     _exit() function typically calls exit_group(2), not this syscall.
+ *     Direct use of sys_exit in multi-threaded programs leaves other
+ *     threads running, which may not be the intended behavior.
+ *
+ * constraint: Init process protection
+ *   desc: If the last thread of the global init process (PID 1) calls exit,
+ *     the kernel panics with "Attempted to kill init!" rather than allowing
+ *     system shutdown. This is intentional - init must be killed via
+ *     reboot(2) or similar mechanisms that properly shut down the system.
+ *     Container init processes in PID namespaces can exit normally.
+ *
+ * constraint: Coredump synchronization
+ *   desc: If a coredump is in progress when exit() is called, the exiting
+ *     thread waits for the coredump to complete before proceeding with
+ *     exit cleanup. This ensures the coredump captures consistent state.
+ *     The thread blocks in coredump_task_exit() until the core_state
+ *     completion is signaled.
+ *
+ * examples: exit(0);  // Normal successful exit
+ *   exit(1);  // Exit with error status
+ *   exit(EXIT_FAILURE);  // Portable error exit (typically 1)
+ *   syscall(SYS_exit, 42);  // Direct syscall, terminates only this thread
+ *
+ * notes: This is the raw kernel syscall that terminates a single thread.
+ *   Applications should normally use the C library exit() or _exit()
+ *   functions, which handle thread group termination properly.
+ *
+ *   The difference between exit(3), _exit(2), and sys_exit is critical:
+ *   - exit(3): C library function that flushes stdio buffers, calls atexit
+ *     handlers, then calls _exit()
+ *   - _exit(2): glibc wrapper that calls exit_group(2) to terminate all
+ *     threads in the process (since glibc 2.3)
+ *   - sys_exit: Raw kernel syscall that terminates only the calling thread
+ *
+ *   The exit_group(2) syscall was added in Linux 2.5.35 specifically to
+ *   support POSIX thread semantics where exit() should terminate all
+ *   threads. Before that, terminating a multi-threaded process required
+ *   userspace thread libraries to manually signal all threads.
+ *
+ *   The 8-bit exit code limitation is a historical UNIX constraint.
+ *   waitpid(2) and friends encode termination information in a 16-bit
+ *   status word where bits 0-7 indicate signal number (0 for exit()),
+ *   bit 0x80 indicates core dump, and bits 8-15 contain the exit code.
+ *
+ *   Zombie processes consume minimal resources (just task_struct and
+ *   some accounting structures) but should still be reaped promptly.
+ *   A process that ignores SIGCHLD or has SA_NOCLDWAIT set does not
+ *   create zombies - children are auto-reaped.
+ *
+ *   The syscall performs WARN_ON checks at entry to catch callers from
+ *   invalid contexts (interrupts disabled, block I/O plug held).
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(exit, int, error_code)
 {
 	do_exit((error_code&0xff)<<8);
