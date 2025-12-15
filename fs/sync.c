@@ -108,6 +108,221 @@ void ksys_sync(void)
 		laptop_sync_completion();
 }
 
+/**
+ * sys_sync - Commit all filesystem buffers to persistent storage
+ *
+ * long-desc: Synchronizes all modified in-core data and metadata to all
+ *   mounted filesystems and block devices. This syscall causes all dirty
+ *   file data, filesystem metadata, and block device buffers to be written
+ *   to their backing storage devices.
+ *
+ *   The synchronization proceeds in multiple phases for correctness:
+ *   1. Wakes background writeback (flusher) threads to begin writing dirty
+ *      pages across all backing devices in parallel.
+ *   2. Iterates through all mounted superblocks and syncs inodes that have
+ *      dirty data, using sync_inodes_sb() for each filesystem.
+ *   3. Calls each filesystem's sync_fs() callback twice - first without
+ *      waiting (to initiate I/O), then with waiting (for completion).
+ *   4. Syncs all block devices: first initiates writes (sync_bdevs(false)),
+ *      then waits for I/O completion (sync_bdevs(true)).
+ *   5. In laptop mode, cancels pending writeback timers since data is now
+ *      synchronized.
+ *
+ *   Unlike the POSIX specification which only requires scheduling writes,
+ *   Linux waits for all I/O to complete before returning. This provides
+ *   stronger guarantees equivalent to calling fsync() on every open file
+ *   in the system.
+ *
+ *   IMPORTANT: This syscall silently ignores all errors from individual
+ *   filesystems or block devices. Even if some filesystems fail to sync
+ *   (e.g., due to I/O errors, disconnected devices, or full disks), the
+ *   syscall still returns success. Applications requiring error detection
+ *   should use syncfs() or fsync() on individual file descriptors instead.
+ *
+ *   The syscall uses TASK_UNINTERRUPTIBLE for all wait operations, meaning
+ *   it cannot be interrupted by signals. In cases of very slow or hung
+ *   storage devices, the calling process may appear to hang indefinitely.
+ *   The kernel will log a warning after hung_task_timeout_secs (default 120
+ *   seconds) if the sync has not completed.
+ *
+ *   Read-only filesystems are skipped during synchronization. Filesystems
+ *   marked with SB_I_SKIP_SYNC (like some pseudo-filesystems) have their
+ *   sync_fs callback skipped, but their inodes are still synced.
+ *
+ *   The syscall can be called by any user without special privileges.
+ *   There are no security implications since it only writes data that the
+ *   user has already caused to be modified through normal file operations.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Always returns 0 regardless of whether the synchronization actually
+ *     succeeded. All errors from underlying filesystems and block devices are
+ *     silently ignored. This behavior is intentional and matches the syscall's
+ *     historical semantics. Applications needing error reporting should use
+ *     syncfs(2) (per-filesystem) or fsync(2) (per-file) instead, which do
+ *     report errors. The void return type in POSIX (sync() returns void in
+ *     user space) is mapped to a 0 return value at the kernel interface.
+ *
+ * lock: sb_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Global spinlock protecting the super_blocks list. Acquired briefly
+ *     during iteration over all mounted filesystems in iterate_supers(). The
+ *     lock is dropped while processing each individual superblock to allow
+ *     concurrent mount/unmount operations. Acquired and released multiple
+ *     times during the sync operation (once for each iterate_supers call).
+ *
+ * lock: sb->s_umount
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Per-superblock read-write semaphore protecting against concurrent
+ *     unmount operations. Acquired in read mode (down_read) for each mounted
+ *     filesystem during iteration. This prevents the filesystem from being
+ *     unmounted while sync operations are in progress. The lock is held
+ *     while calling sync_inodes_one_sb() and sync_fs_one_sb() callbacks.
+ *
+ * lock: sb->s_sync_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Per-superblock mutex acquired during wait_sb_inodes() to serialize
+ *     waiting for inode writeback completion. This prevents multiple sync
+ *     operations from interfering with each other's tracking of in-flight
+ *     inode writes.
+ *
+ * lock: sb->s_inode_wblist_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-superblock spinlock protecting the s_inodes_wb list that tracks
+ *     inodes with pending writeback. Acquired with interrupts disabled
+ *     (spin_lock_irq) during wait_sb_inodes() when iterating over and waiting
+ *     for inodes under writeback.
+ *
+ * lock: bdi->wb_switch_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Per-BDI (backing device info) read-write semaphore acquired in write
+ *     mode during sync_inodes_sb() to protect against inode writeback context
+ *     switching (cgroup writeback). Ensures stable wb (writeback) association
+ *     while submitting and waiting for writeback work.
+ *
+ * lock: blockdev_superblock->s_inode_list_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Spinlock protecting the list of block device inodes. Acquired during
+ *     sync_bdevs() when iterating over all block devices to sync their page
+ *     caches. The lock is dropped temporarily while performing I/O on each
+ *     block device to allow concurrent block device operations.
+ *
+ * lock: bdev->bd_disk->open_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Per-block-device mutex acquired during sync_bdevs() before syncing
+ *     each block device. Ensures the block device is not being closed or
+ *     opened concurrently. Only devices with at least one opener are synced.
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DISCARD
+ *   condition: During any wait operation
+ *   desc: All wait operations in sync() use TASK_UNINTERRUPTIBLE state, making
+ *     the syscall completely non-interruptible by signals. Signals delivered
+ *     during the sync remain pending and will be handled after the syscall
+ *     returns. This can cause the process to appear hung if storage is slow
+ *     or unresponsive. There is no way to abort a sync() in progress.
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: All mounted filesystems
+ *   desc: Writes all dirty file data and filesystem metadata (inodes, directory
+ *     entries, superblocks, journals, allocation bitmaps, etc.) from kernel
+ *     page cache to underlying block devices. The exact metadata written
+ *     depends on each filesystem's implementation of writeback_inodes_sb(),
+ *     sync_inodes_sb(), and sync_fs() operations.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_HARDWARE
+ *   target: All block devices
+ *   desc: Initiates and waits for I/O completion on all block devices that
+ *     have dirty page cache data. This includes both filesystem block devices
+ *     and any block devices with direct I/O buffered data. Uses
+ *     filemap_fdatawrite() to initiate writes and filemap_fdatawait_keep_errors()
+ *     to wait for completion.
+ *   condition: Block devices must have at least one opener (bd_openers > 0)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Writeback timer state (laptop mode only)
+ *   desc: When laptop_mode is enabled (non-zero /proc/sys/vm/laptop_mode),
+ *     cancels any pending writeback timers for all backing devices via
+ *     laptop_sync_completion(). This prevents unnecessary disk spin-ups
+ *     after an explicit sync since data is now on disk.
+ *   condition: Only when laptop_mode sysctl is non-zero
+ *   reversible: yes (timers will be rescheduled on next dirty data)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Flusher threads and calling process
+ *   desc: Wakes all per-BDI flusher threads via wakeup_flusher_threads() to
+ *     begin parallel writeback. The calling process then blocks waiting for
+ *     writeback completion using wait_event() with TASK_UNINTERRUPTIBLE.
+ *     The process may sleep for extended periods if there is significant
+ *     dirty data or slow storage devices.
+ *   reversible: no
+ *
+ * constraint: Hung task detection
+ *   desc: If the sync operation takes longer than hung_task_timeout_secs
+ *     (default 120 seconds), the kernel logs a warning message identifying
+ *     the waiting task. This is informational only; the sync continues
+ *     waiting. This can indicate storage problems or very large amounts of
+ *     dirty data.
+ *
+ * constraint: Read-only filesystems skipped
+ *   desc: Filesystems mounted read-only (sb_rdonly() returns true) are skipped
+ *     during sync operations since they cannot have dirty data. This is a
+ *     performance optimization that reduces unnecessary lock acquisition.
+ *
+ * constraint: SB_I_SKIP_SYNC filesystems
+ *   desc: Filesystems with the SB_I_SKIP_SYNC internal flag set (such as
+ *     overlayfs passthrough and certain pseudo-filesystems) have their
+ *     sync_fs() callback skipped. Their inodes are still synced via
+ *     sync_inodes_one_sb(). This prevents redundant syncs for stacked
+ *     filesystems.
+ *
+ * examples: sync();
+ *
+ * notes: Historical behavior: Before Linux 1.3.20, sync() returned before I/O
+ *   completed, matching POSIX minimum requirements. Modern Linux waits for
+ *   completion, providing stronger guarantees.
+ *
+ *   The double-sync pattern (calling sync() twice) seen in some shutdown scripts
+ *   is a historical artifact from when sync() only scheduled writes. With modern
+ *   Linux semantics, a single sync() call is sufficient.
+ *
+ *   For data integrity, applications should prefer fsync() or fdatasync() on
+ *   specific files, or syncfs() on specific filesystems. These syscalls report
+ *   errors and provide targeted synchronization rather than system-wide sync.
+ *
+ *   Disk caches: sync() writes data to block devices but does not guarantee
+ *   data has reached persistent media if devices have write caching enabled.
+ *   Use hdparm -W0 or filesystem mount options like barrier/flush to ensure
+ *   write-through behavior for data integrity.
+ *
+ *   Performance impact: sync() can cause significant I/O load and may take
+ *   a long time to complete on systems with large amounts of dirty data or
+ *   many mounted filesystems. Consider syncfs() for targeted synchronization.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE0(sync)
 {
 	ksys_sync();
