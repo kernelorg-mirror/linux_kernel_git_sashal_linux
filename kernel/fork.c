@@ -1778,6 +1778,169 @@ static void copy_seccomp(struct task_struct *p)
 #endif
 }
 
+/**
+ * sys_set_tid_address - Set the clear_child_tid address for the calling thread
+ * @tidptr: User-space pointer where thread ID will be cleared on exit
+ *
+ * long-desc: Sets the clear_child_tid attribute for the calling thread to
+ *   the specified user-space address. When the thread terminates and shares
+ *   its address space with other threads (mm_users > 1), the kernel writes
+ *   zero to this address and performs a futex wake operation on it.
+ *
+ *   This syscall is primarily used by threading libraries (such as glibc's
+ *   NPTL) to implement efficient thread synchronization primitives like
+ *   pthread_join(). The mechanism works as follows:
+ *
+ *   1. The threading library allocates a per-thread integer variable
+ *   2. Before creating a thread with clone(), or after creation, the thread
+ *      calls set_tid_address() to register this variable's address
+ *   3. Another thread waiting to join can use futex_wait() on this address
+ *   4. When the thread exits, the kernel writes 0 and calls futex_wake(),
+ *      waking the joining thread
+ *
+ *   The clear_child_tid attribute can also be set during thread creation
+ *   via clone(2) with the CLONE_CHILD_CLEARTID flag. This syscall allows
+ *   changing the address after thread creation or setting it for threads
+ *   not created with CLONE_CHILD_CLEARTID.
+ *
+ *   At thread exit time (in mm_release()), if clear_child_tid is non-NULL
+ *   and the thread shares its address space with other threads, the kernel:
+ *   1. Writes 0 to the address via put_user(0, clear_child_tid)
+ *   2. Calls do_futex(..., FUTEX_WAKE, 1, ...) to wake one waiter
+ *   3. Sets clear_child_tid to NULL
+ *
+ *   Errors from put_user() and futex_wake() are silently ignored. If the
+ *   pointer becomes invalid (e.g., the memory is unmapped), the write
+ *   simply fails silently. This is intentional - the exiting thread cannot
+ *   handle such errors anyway.
+ *
+ *   During execve(), the clear_child_tid is cleared to prevent writing to
+ *   memory that belonged to the previous program's address space. This fix
+ *   was introduced in commit 9c8a8228d0827 to prevent memory corruption.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: tidptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Any user-space pointer or NULL. The pointer is stored
+ *     without validation; invalid pointers will cause silent failures at
+ *     thread exit time when put_user() is called. NULL is valid and
+ *     disables the clear-on-exit behavior. The pointer should reference
+ *     a naturally-aligned int in user memory that remains valid until
+ *     thread termination.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: Thread ID of caller
+ *   desc: Always returns the thread ID (TID) of the calling thread, as
+ *     seen from the caller's PID namespace. This is equivalent to the
+ *     return value of gettid(). The return value is always positive for
+ *     valid threads. This syscall never fails.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is briefly held during task_pid_vnr() to safely
+ *     access the thread's PID structure and namespace. The lock is
+ *     acquired and released within the return value computation and does
+ *     not affect the caller's state.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->clear_child_tid
+ *   desc: Stores the provided pointer in the calling thread's task_struct.
+ *     This pointer will be dereferenced at thread exit time to write 0
+ *     and wake futex waiters. The previous value is overwritten without
+ *     any notification or cleanup.
+ *   reversible: yes
+ *   condition: Always
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: User memory at tidptr (deferred)
+ *   desc: At thread exit time (not during this syscall), if tidptr was
+ *     non-NULL and the thread shares memory with other threads, the
+ *     kernel writes 0 to *tidptr. This is a deferred side effect that
+ *     occurs in mm_release() during thread termination.
+ *   reversible: no
+ *   condition: When thread exits with mm_users > 1
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Futex waiters (deferred)
+ *   desc: At thread exit time (not during this syscall), if tidptr was
+ *     non-NULL and the thread shares memory, the kernel calls
+ *     do_futex(tidptr, FUTEX_WAKE, 1, ...) to wake up to one thread
+ *     waiting on that futex address. This enables efficient pthread_join()
+ *     implementation.
+ *   reversible: no
+ *   condition: When thread exits with mm_users > 1
+ *
+ * state-trans: current->clear_child_tid
+ *   from: previous value (NULL or valid pointer)
+ *   to: tidptr
+ *   condition: Always
+ *   desc: The clear_child_tid field is unconditionally set to the new
+ *     value. The previous value is discarded without any cleanup or
+ *     notification.
+ *
+ * constraint: Memory validity
+ *   desc: The pointer is stored without validation. If tidptr points to
+ *     invalid memory (unmapped, read-only, or otherwise inaccessible),
+ *     the put_user() call at exit time will fail silently. Applications
+ *     should ensure the memory remains valid and writable until thread
+ *     termination.
+ *
+ * constraint: Address space lifetime
+ *   desc: During execve(), clear_child_tid is reset to NULL because the
+ *     address space is replaced. Any previously set tidptr becomes
+ *     invalid after execve(). This prevents the kernel from writing to
+ *     memory addresses that belonged to the pre-exec program.
+ *
+ * constraint: Single-threaded processes
+ *   desc: If the thread is the only user of its address space (mm_users
+ *     == 1 at exit time), the clear_child_tid mechanism is not triggered.
+ *     The write to user memory and futex wake only occur when other
+ *     threads share the address space.
+ *
+ * examples: syscall(SYS_set_tid_address, &tid);  // Set clear address
+ *   syscall(SYS_set_tid_address, NULL);  // Disable clear-on-exit
+ *
+ * notes: This syscall has no glibc wrapper function; it must be invoked
+ *   using syscall(2). However, applications typically do not call this
+ *   directly - threading libraries handle it internally.
+ *
+ *   The syscall was introduced in Linux 2.5.48-49 as part of the NPTL
+ *   (Native POSIX Threads Library) support infrastructure. The mechanism
+ *   provides a race-free way to detect thread termination.
+ *
+ *   The kernel maintains two related per-thread attributes:
+ *   - set_child_tid: Set via clone(CLONE_CHILD_SETTID), written with TID
+ *     immediately after thread creation
+ *   - clear_child_tid: Set via clone(CLONE_CHILD_CLEARTID) or this syscall,
+ *     cleared to 0 at thread exit
+ *
+ *   Both can use the same address when both clone flags are set, which is
+ *   the common pattern for pthread_create().
+ *
+ *   The return value (thread ID) makes this syscall useful as a combined
+ *   "set clear address and get TID" operation, though gettid(2) is the
+ *   standard way to obtain the thread ID.
+ *
+ *   A prctl(2) operation (PR_GET_TID_ADDRESS) exists to retrieve the
+ *   current clear_child_tid value, but it requires CONFIG_CHECKPOINT_RESTORE
+ *   to be enabled in the kernel.
+ *
+ *   Corner cases:
+ *   - NULL pointer: Valid, disables clear-on-exit behavior
+ *   - Unaligned pointer: Stored as-is; put_user() may fail on some arches
+ *   - Read-only memory: Stored; put_user() will fail silently at exit
+ *   - Memory unmapped before exit: put_user() fails silently
+ *   - Thread not sharing memory at exit: No write or wake occurs
+ *
+ * since-version: 2.5.48
+ */
 SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr)
 {
 	current->clear_child_tid = tidptr;
