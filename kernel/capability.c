@@ -126,13 +126,163 @@ static inline int cap_get_target_pid(pid_t pid, kernel_cap_t *pEp,
 }
 
 /**
- * sys_capget - get the capabilities of a given process.
- * @header: pointer to struct that contains capability version and
- *	target pid data
- * @dataptr: pointer to struct that contains the effective, permitted,
- *	and inheritable capabilities that are returned
+ * sys_capget - Get the capability sets of a process
+ * @header: Pointer to user-space structure containing protocol version
+ *	and target process ID
+ * @dataptr: Pointer to user-space structure(s) to receive capability data
  *
- * Returns 0 on success and < 0 on error.
+ * long-desc: Retrieves the effective, permitted, and inheritable capability
+ *   sets of a specified process. Linux capabilities provide a mechanism for
+ *   partitioning the privileges traditionally associated with superuser (root)
+ *   into distinct units that can be independently enabled and disabled.
+ *
+ *   The @header parameter points to a cap_user_header_t structure that
+ *   contains:
+ *   - version: A magic number indicating the capability protocol version.
+ *     Must be _LINUX_CAPABILITY_VERSION_1 (0x19980330),
+ *     _LINUX_CAPABILITY_VERSION_2 (0x20071026, deprecated), or
+ *     _LINUX_CAPABILITY_VERSION_3 (0x20080522, preferred).
+ *   - pid: The process ID whose capabilities are to be retrieved, or 0
+ *     to query the calling thread's own capabilities.
+ *
+ *   The @dataptr parameter points to one or two cap_user_data_t structures
+ *   (depending on the protocol version) that receive the capability sets:
+ *   - effective: Capabilities currently in effect for the process
+ *   - permitted: Capabilities the process is allowed to assume
+ *   - inheritable: Capabilities preserved across execve()
+ *
+ *   Version 1 supports only the first 32 capabilities and requires a single
+ *   __user_cap_data_struct. Versions 2 and 3 support 64 capabilities and
+ *   require an array of two __user_cap_data_struct elements. Version 2 is
+ *   deprecated; version 3 is functionally identical but with a different
+ *   magic number to avoid source compatibility issues with version 1.
+ *
+ *   This syscall can be used to query the kernel's preferred capability
+ *   version by passing an invalid version in header->version with @dataptr
+ *   set to NULL. The kernel will return 0 and update header->version to
+ *   _LINUX_CAPABILITY_VERSION_3.
+ *
+ *   When querying another process (pid != 0 and pid != current), the syscall
+ *   uses RCU to safely access the target process's credentials. The operation
+ *   is atomic with respect to capability changes made by the target process.
+ *
+ *   Note: Any process can read any other process's capabilities without
+ *   requiring special privileges. This is by design, as capability information
+ *   is not considered sensitive.
+ *
+ *   For version 1, upper 32 bits of 64-bit capabilities are silently dropped.
+ *   This provides backwards compatibility but means older applications cannot
+ *   see capabilities beyond CAP_AUDIT_CONTROL (30). The recommended approach
+ *   is to always use version 3.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: header
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a cap_user_header_t structure
+ *     in user space. The version field is read to determine protocol version
+ *     and may be written to indicate the kernel's preferred version on error.
+ *     The pid field is read to determine the target process. Cannot be NULL.
+ *
+ * param: dataptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: May be NULL for version query, otherwise must point to valid
+ *     user-space memory. For version 1, must point to a single
+ *     __user_cap_data_struct (12 bytes). For versions 2 and 3, must point
+ *     to an array of two __user_cap_data_struct elements (24 bytes total).
+ *     Memory must be writable.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The capability sets have been written to
+ *     the memory pointed to by @dataptr (if non-NULL). For a version query
+ *     (invalid version with NULL dataptr), header->version is updated to
+ *     indicate the kernel's preferred version.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: The @header pointer is invalid or points to unmapped memory,
+ *     preventing the kernel from reading the version or pid fields.
+ *     Also returned if @dataptr is non-NULL but points to invalid or
+ *     read-only memory where capability data cannot be written. This error
+ *     can originate from get_user() reading header fields, put_user()
+ *     updating header->version, or copy_to_user() writing capability data.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in two cases: (1) The header->version field contains an
+ *     unrecognized capability protocol version and @dataptr is non-NULL.
+ *     When version is invalid, the kernel updates header->version to
+ *     _LINUX_CAPABILITY_VERSION_3 before returning this error. (2) The
+ *     header->pid field contains a negative value. Process IDs must be
+ *     non-negative; use 0 to query the calling thread's own capabilities.
+ *
+ * error: ESRCH, No such process
+ *   desc: The process specified by header->pid does not exist in the
+ *     caller's PID namespace. This includes the case where the process
+ *     has already terminated. When pid is 0 or matches the caller's own
+ *     PID, this error cannot occur. The lookup is performed using
+ *     find_task_by_vpid() which respects PID namespace boundaries.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired when querying another process's capabilities (pid != 0
+ *     and pid != current). Protects the task lookup via find_task_by_vpid()
+ *     and the subsequent credential access in security_capget(). Also
+ *     acquired by cap_capget() when reading the target task's credentials
+ *     via __task_cred(). The RCU read lock ensures the target task and its
+ *     credentials remain valid during the operation.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DISCARD
+ *   condition: During user-space memory access
+ *   desc: The syscall may block during get_user(), put_user(), or
+ *     copy_to_user() operations if pages need to be faulted in. These
+ *     operations use TASK_UNINTERRUPTIBLE state and cannot be interrupted
+ *     by signals. Any signals delivered during the syscall remain pending
+ *     and are handled after the syscall returns.
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: header->version in user space
+ *   desc: When an unrecognized capability version is provided in
+ *     header->version, the kernel writes _LINUX_CAPABILITY_VERSION_3
+ *     (0x20080522) to header->version before returning. This allows
+ *     applications to discover the kernel's preferred capability version
+ *     by calling capget() with an invalid version and @dataptr set to NULL.
+ *   condition: header->version is not a recognized capability version
+ *   reversible: yes
+ *
+ * examples: struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+ *   struct __user_cap_data_struct data[2];
+ *   syscall(__NR_capget, &hdr, data);  // Get own capabilities
+ *
+ * notes: The glibc library does not provide a wrapper for this syscall.
+ *   Applications should use syscall(__NR_capget, ...) directly or use the
+ *   libcap library functions cap_get_proc() and cap_get_pid() for a more
+ *   portable interface.
+ *
+ *   Capability version 2 was introduced in Linux 2.6.25 but had API issues
+ *   with backwards compatibility. Version 3, introduced in Linux 2.6.26,
+ *   is identical to version 2 but uses a different magic number to prevent
+ *   source code compiled against old headers from accidentally using the
+ *   wrong version. Always use version 3 for new code.
+ *
+ *   The CONFIG_MULTIUSER kernel configuration option affects this syscall.
+ *   When disabled (embedded systems), the syscall infrastructure still exists
+ *   but the underlying implementation is simplified.
+ *
+ *   Unlike capset(), this syscall does not require any capabilities. Any
+ *   process can read any other process's capabilities.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE2(capget, cap_user_header_t, header, cap_user_data_t, dataptr)
 {
