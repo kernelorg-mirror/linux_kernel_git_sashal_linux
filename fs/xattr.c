@@ -1844,6 +1844,215 @@ SYSCALL_DEFINE6(getxattrat, int, dfd, const char __user *, pathname, unsigned in
 			       u64_to_user_ptr(args.value), args.size);
 }
 
+/**
+ * sys_getxattr - Retrieve an extended attribute value from a file
+ * @pathname: Path to the file from which to retrieve the attribute
+ * @name: Null-terminated name of the extended attribute (includes namespace prefix)
+ * @value: Buffer to receive the attribute value, or NULL for size query
+ * @size: Size of the value buffer in bytes, or 0 to query current size
+ *
+ * long-desc: Retrieves the value of an extended attribute identified by name
+ *   from the file specified by pathname. Extended attributes are name:value
+ *   pairs associated with inodes (files, directories, symbolic links, etc.)
+ *   that extend the normal attributes (stat data) associated with all inodes.
+ *
+ *   The attribute name must include a namespace prefix. Valid namespaces are:
+ *   - "user." - User-defined attributes (regular files and directories only)
+ *   - "trusted." - Trusted attributes (requires CAP_SYS_ADMIN to read)
+ *   - "security." - Security module attributes (e.g., SELinux, Smack, capabilities)
+ *   - "system." - System attributes (e.g., POSIX ACLs via system.posix_acl_access)
+ *
+ *   If size is specified as zero, the call returns the current size of the
+ *   attribute value without copying it to the buffer. This can be used to
+ *   determine an appropriate buffer size for a subsequent call. However, the
+ *   attribute value may change between calls (race condition with setxattr).
+ *
+ *   If size is non-zero and less than the actual attribute size, ERANGE is
+ *   returned and no data is copied.
+ *
+ *   This syscall follows symbolic links. Use lgetxattr() to operate on the
+ *   symbolic link itself, or fgetxattr() to operate on an open file descriptor.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pathname
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_USER_PATH
+ *   constraint: Must be a valid null-terminated path string in user memory.
+ *     The path is resolved following symbolic links. Maximum path length is
+ *     PATH_MAX (4096 bytes). The file must exist and the caller must have
+ *     search permission on all directory components.
+ *
+ * param: name
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_USER_STRING
+ *   range: 1, 255
+ *   constraint: Must be a valid null-terminated string in user memory containing
+ *     the extended attribute name with namespace prefix (e.g., "user.myattr").
+ *     The name (including prefix) must be between 1 and XATTR_NAME_MAX (255)
+ *     characters. An empty name returns ERANGE.
+ *
+ * param: value
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: When size is non-zero, must be a valid pointer to user memory
+ *     that can receive up to size bytes. Can be NULL only when size is 0.
+ *     The kernel writes the attribute value to this buffer on success.
+ *
+ * param: size
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, 65536
+ *   constraint: Size of the value buffer in bytes. If zero, the syscall returns
+ *     the current attribute size without copying data. If non-zero, must be at
+ *     least as large as the attribute value; smaller buffers cause ERANGE.
+ *     Values larger than XATTR_SIZE_MAX (65536) are silently clamped.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the size of the extended attribute value in bytes.
+ *     When size > 0, this is the number of bytes copied to the value buffer.
+ *     When size = 0, this is the current size of the attribute (size query).
+ *     The returned size may be 0 for attributes with empty values.
+ *
+ * error: ENODATA, Attribute not found
+ *   desc: The named extended attribute does not exist on the file. Also returned
+ *     when attempting to read user.* attributes on file types other than regular
+ *     files or directories (symlinks, devices, sockets, FIFOs). Also returned
+ *     when reading trusted.* namespace without CAP_SYS_ADMIN capability.
+ *
+ * error: ENOENT, File not found
+ *   desc: The file specified by pathname does not exist, or a directory component
+ *     in the path does not exist. Returned from path lookup (filename_lookup).
+ *
+ * error: ERANGE, Buffer too small
+ *   desc: The size parameter is non-zero but smaller than the actual attribute
+ *     value size. Also returned if the attribute name is empty (zero length) or
+ *     exceeds XATTR_NAME_MAX (255 characters).
+ *
+ * error: EACCES, Permission denied
+ *   desc: Permission denied during path resolution (search permission on a
+ *     directory component), or read permission on the file is denied based on
+ *     DAC permissions. Returned from inode_permission() check.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The filesystem does not support extended attributes (IOP_XATTR flag
+ *     not set), or no xattr handler exists for the given namespace prefix, or
+ *     the handler does not implement the get operation. Also returned for
+ *     direct POSIX ACL xattr reads (system.posix_acl_*) when processed through
+ *     the normal xattr path (use do_get_acl instead).
+ *
+ * error: E2BIG, Value too large
+ *   desc: The filesystem returned an attribute value larger than XATTR_SIZE_MAX
+ *     (65536 bytes). This indicates a filesystem bug or corruption, as values
+ *     exceeding this limit should not be storable.
+ *
+ * error: EFAULT, Bad address
+ *   desc: One of the user pointers (pathname, name, or value) is invalid or
+ *     points to memory that cannot be accessed. Returned from strncpy_from_user()
+ *     for pathname/name or copy_to_user() for value.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel could not allocate memory for the temporary buffer to hold
+ *     the attribute value (via kvzalloc). The allocation size is capped at
+ *     min(size, XATTR_SIZE_MAX).
+ *
+ * error: EIO, I/O error
+ *   desc: The inode is marked as bad (is_bad_inode), indicating filesystem
+ *     corruption or I/O failure. Also may be returned by filesystem-specific
+ *     xattr handler operations.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The xattr name format is invalid - it matches a handler prefix but
+ *     the remainder is malformed. Returned from xattr_resolve_name().
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered during path resolution
+ *     (more than MAXSYMLINKS, typically 40).
+ *
+ * error: ENAMETOOLONG, Filename too long
+ *   desc: The pathname or a component of the pathname exceeds the system limit
+ *     (PATH_MAX or NAME_MAX).
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component of the path prefix is not a directory.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: The file handle became stale during the operation (NFS). The syscall
+ *     automatically retries with LOOKUP_REVAL before returning this error.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Kernel buffer for attribute value
+ *   desc: When size > 0, a kernel buffer is allocated via kvzalloc() to hold
+ *     the attribute value before copying to userspace. This memory is freed
+ *     (kvfree) after the operation completes, regardless of success or failure.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Reading trusted.* namespace attributes
+ *   without: Reading trusted.* returns ENODATA (appears as if attribute does
+ *     not exist). This hides the existence and value of trusted attributes
+ *     from unprivileged processes.
+ *   condition: Attribute name starts with "trusted."
+ *
+ * constraint: Filesystem support
+ *   desc: The filesystem must support extended attributes (have IOP_XATTR flag
+ *     set and provide xattr handlers). Common filesystems supporting xattrs
+ *     include ext4, XFS, Btrfs, and tmpfs. Some filesystems (e.g., FAT, older
+ *     ext2) do not support extended attributes.
+ *
+ * constraint: user.* namespace restrictions
+ *   desc: The user.* namespace is only supported on regular files and directories.
+ *     Attempting to read user.* attributes from other file types (symlinks,
+ *     devices, sockets, FIFOs) returns ENODATA as if the attribute doesn't exist.
+ *
+ * constraint: LSM checks
+ *   desc: Linux Security Modules (SELinux, Smack, AppArmor) may impose additional
+ *     restrictions via security_inode_getxattr() hook. These can deny access to
+ *     certain attributes based on security policy. For security.* namespace
+ *     attributes, the LSM's own getsecurity handler may be used instead of the
+ *     filesystem's handler.
+ *
+ * examples: getxattr("/path/file", "user.comment", buf, sizeof(buf));  // Read user attr
+ *   getxattr("/path/file", "security.selinux", buf, sizeof(buf));  // Read SELinux label
+ *   getxattr("/path/file", "user.test", NULL, 0);  // Query attribute size
+ *
+ * notes: Extended attributes provide a way to retrieve arbitrary metadata from
+ *   files beyond the standard stat attributes. Common uses include:
+ *   - SELinux security contexts (security.selinux)
+ *   - File capabilities (security.capability)
+ *   - POSIX ACLs (system.posix_acl_access, system.posix_acl_default)
+ *   - User-defined metadata (user.* namespace)
+ *
+ *   The common pattern for reading an xattr of unknown size is:
+ *   1. Call getxattr() with size=0 to get the current size
+ *   2. Allocate a buffer of that size
+ *   3. Call getxattr() again with the buffer
+ *   Note: The attribute value may change between steps 1 and 3 if another
+ *   process modifies it. Handle ERANGE by retrying with a larger buffer.
+ *
+ *   The trusted.* namespace is designed for use by privileged processes to store
+ *   data that should not be readable by unprivileged users. Without CAP_SYS_ADMIN,
+ *   these attributes appear to not exist (ENODATA), hiding even their presence.
+ *
+ *   For POSIX ACL attributes (system.posix_acl_access, system.posix_acl_default),
+ *   the kernel handles translation between the internal ACL format and the
+ *   xattr representation. In user namespaces, uid/gid values in ACLs are mapped
+ *   appropriately.
+ *
+ *   Historical note: A bug fix (commit 82c9a927bc5d) corrected an issue where
+ *   user namespace ACL fixup was skipped when the buffer size had certain
+ *   alignment characteristics.
+ *
+ * since-version: 2.4
+ */
 SYSCALL_DEFINE4(getxattr, const char __user *, pathname,
 		const char __user *, name, void __user *, value, size_t, size)
 {
