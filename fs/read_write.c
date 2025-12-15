@@ -3269,6 +3269,365 @@ SYSCALL_DEFINE3(writev, unsigned long, fd, const struct iovec __user *, vec,
 	return do_writev(fd, vec, vlen, 0);
 }
 
+/**
+ * sys_preadv - Read data from a file at a given offset into multiple buffers
+ * @fd: File descriptor to read from
+ * @vec: Pointer to array of iovec structures describing destination buffers
+ * @vlen: Number of iovec structures in the array
+ * @pos_l: Low 32 bits of the file offset at which to begin reading
+ * @pos_h: High 32 bits of the file offset (combined with pos_l for 64-bit offset)
+ *
+ * long-desc: Performs positioned scatter input by reading data from the file
+ *   descriptor fd at the specified offset into multiple buffers specified by
+ *   the iovec array vec. This syscall combines the functionality of pread(2)
+ *   (positioned read) and readv(2) (scatter I/O), allowing vectored I/O at an
+ *   explicit file position.
+ *
+ *   The file offset argument is split into two 32-bit parts (pos_l and pos_h)
+ *   which are combined to form a 64-bit offset: ((pos_h << 32) | pos_l) on
+ *   64-bit architectures, or ((pos_h << HALF_LONG_BITS) << HALF_LONG_BITS) | pos_l
+ *   on 32-bit architectures. This encoding allows 64-bit offsets to be passed
+ *   through the syscall interface on all architectures.
+ *
+ *   The buffers are processed in array order: vec[0] is completely filled
+ *   before vec[1], and so on. Each iovec structure specifies a base address
+ *   (iov_base) and length (iov_len) for one buffer. The data transfer is atomic
+ *   with respect to other processes: the data read appears as a contiguous
+ *   block that is not intermingled with reads from other processes.
+ *
+ *   Unlike readv(), preadv() does NOT update the file offset (f_pos). The read
+ *   occurs at the specified position, and the current file position remains
+ *   unchanged. This makes preadv() inherently thread-safe: multiple threads
+ *   can read from different positions in the same file descriptor concurrently
+ *   without interfering with each other.
+ *
+ *   The file referred to by fd must support positioned reads (FMODE_PREAD flag).
+ *   Regular files, block devices, and most character devices support this.
+ *   Pipes, FIFOs, sockets, and terminals do NOT support positioned reads and
+ *   return ESPIPE. For such files, use readv() instead.
+ *
+ *   On Linux, preadv() transfers at most MAX_RW_COUNT (approximately 2GB minus
+ *   one page) bytes per call, regardless of the total length specified in the
+ *   iovec array. Individual iov_len values are clamped to ensure the total
+ *   does not exceed this limit. This is transparent to the caller.
+ *
+ *   The number of bytes read may be less than the total requested if fewer
+ *   bytes are available (e.g., near end-of-file), the read was interrupted
+ *   by a signal after some data was transferred, or the underlying file type
+ *   does not guarantee full reads.
+ *
+ *   preadv() was introduced in Linux 2.6.30 and is not part of POSIX, though
+ *   it is available on BSD systems. For additional per-operation control flags,
+ *   use preadv2() which extends preadv() with a flags argument.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Must be a valid, open file descriptor with read permission.
+ *     The file must have been opened with O_RDONLY or O_RDWR. Additionally,
+ *     the file must support positioned reads (FMODE_PREAD flag set). Regular
+ *     files and block devices support positioned reads; pipes, FIFOs, sockets,
+ *     and terminals do not. File descriptors opened with O_WRONLY, O_PATH, or
+ *     that have been closed return EBADF. Standard file descriptors 0 (stdin),
+ *     1 (stdout), 2 (stderr) are valid if open and readable, though stdin may
+ *     not support preadv if connected to a terminal or pipe. AT_FDCWD and other
+ *     special directory values are not valid. Despite being unsigned long,
+ *     values > INT_MAX may fail fdget().
+ *
+ * param: vec
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, readable user-space array of struct
+ *     iovec containing vlen elements. Each iovec structure contains:
+ *     - iov_base: pointer to a writable user-space buffer
+ *     - iov_len: size of the buffer (must be non-negative when cast to ssize_t)
+ *     NULL is valid only when vlen is 0 (returns 0 immediately). Each iov_base
+ *     must pass access_ok() validation; invalid addresses return EFAULT.
+ *     On compat syscalls (32-bit process on 64-bit kernel), the iovec structure
+ *     uses compat_uptr_t and compat_size_t for its members.
+ *
+ * param: vlen
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UIO_MAXIOV
+ *   constraint: Number of iovec structures in vec array. Must be <= UIO_MAXIOV
+ *     (1024); values > 1024 return EINVAL. A value of 0 returns 0 immediately
+ *     without reading any data or accessing the file (but fd must still be
+ *     valid). For vlen <= UIO_FASTIOV (8), the iovec array is copied to a
+ *     stack buffer; larger arrays require heap allocation which may fail with
+ *     ENOMEM under memory pressure.
+ *
+ * param: pos_l
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Low bits of the 64-bit file offset. On 64-bit systems, this is
+ *     the lower half of the 64-bit offset (bits 0-31). On 32-bit systems with
+ *     HALF_LONG_BITS=16, this is the lower 32 bits. Combined with pos_h to form
+ *     the complete offset. When the combined offset is negative, EINVAL is
+ *     returned.
+ *
+ * param: pos_h
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: High bits of the 64-bit file offset. On 64-bit systems, this is
+ *     the upper half of the 64-bit offset (bits 32-63). On 32-bit systems, this
+ *     is shifted by HALF_LONG_BITS twice. The combined offset (pos_h, pos_l)
+ *     must result in a non-negative loff_t value; if the combined value is
+ *     negative when interpreted as a signed 64-bit integer, EINVAL is returned.
+ *     For most use cases, pos_h should be 0 unless reading beyond 4GB offset.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes read (non-negative). Zero
+ *     indicates end-of-file (EOF) for regular files, no data available from
+ *     a non-blocking device, vlen was 0, or pos is at or beyond the file size.
+ *     The return value may be less than the total requested if fewer bytes were
+ *     available (short read). Partial reads are not errors and buffers may be
+ *     partially filled. On error, returns a negative error code.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid file descriptor, or fd was not opened for reading.
+ *     This includes file descriptors opened with O_WRONLY, O_PATH, or file
+ *     descriptors that have been closed. Also returned if the file structure
+ *     does not have FMODE_READ or FMODE_CAN_READ flags set.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) The combined offset (pos_l, pos_h)
+ *     results in a negative value. (2) vlen exceeds UIO_MAXIOV (1024).
+ *     (3) An iov_len value, when cast to ssize_t, is negative (indicating the
+ *     user passed an excessively large unsigned value). (4) The file does not
+ *     support reading (FMODE_CAN_READ not set). (5) The file was opened with
+ *     O_DIRECT and alignment requirements are not met. (6) For special files
+ *     that require specific buffer sizes (e.g., timerfd requires 8 bytes).
+ *     (7) The position plus total count would overflow for files without
+ *     unsigned offset support.
+ *
+ * error: ESPIPE, Illegal seek
+ *   desc: The file descriptor refers to a file type that does not support
+ *     positioned reads (FMODE_PREAD flag not set). This includes pipes, FIFOs,
+ *     sockets, and terminal devices. Use readv() instead for these file types.
+ *     This error is checked early, before any buffer validation.
+ *
+ * error: EFAULT, Bad address
+ *   desc: vec points outside the accessible address space, or one of the
+ *     iov_base pointers in the iovec array points to invalid memory. The
+ *     validation occurs via access_ok() in import_iovec() before any read
+ *     operation. Can also occur if copy_from_user() fails when reading the
+ *     iovec array itself, or copy_to_user() fails during data transfer.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed when vlen > UIO_FASTIOV (8). For small
+ *     iovec arrays (<= 8 elements), a stack-allocated buffer is used, avoiding
+ *     this error. Larger arrays require kmalloc_array() which can fail under
+ *     memory pressure. Rare in practice on systems with adequate memory.
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: The file position plus total count would exceed LLONG_MAX, causing
+ *     arithmetic overflow. This is checked in rw_verify_area() before the read
+ *     begins. For files without FOP_UNSIGNED_OFFSET, this also applies if the
+ *     position alone would cause issues.
+ *
+ * error: EISDIR, Is a directory
+ *   desc: fd refers to a directory. Directories cannot be read using preadv();
+ *     use getdents64() instead. This error is returned by the generic_read_dir()
+ *     handler installed for directory file operations.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: fd refers to a file (device, network filesystem) that is marked
+ *     non-blocking (O_NONBLOCK) and the read would block because no data is
+ *     available. Equivalent to EWOULDBLOCK. The application should retry later
+ *     or use select/poll/epoll to wait for data availability.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The call was interrupted by a signal before any data was read. This
+ *     only occurs if no data has been transferred; if some data was read before
+ *     the signal, the call returns the number of bytes read. The caller should
+ *     typically check for this error and restart the read.
+ *
+ * error: EIO, Input/output error
+ *   desc: A low-level I/O error occurred. For regular files, this typically
+ *     indicates a hardware error on the storage device, a filesystem error,
+ *     or a network filesystem timeout. May also indicate that the page could
+ *     not be read from disk (e.g., bad blocks).
+ *
+ * error: EACCES, Permission denied
+ *   desc: The security subsystem (LSM such as SELinux or AppArmor) denied
+ *     the read operation via security_file_permission(). This can occur even
+ *     if the file was successfully opened, as LSM policies may enforce per-
+ *     operation checks. The specific policy that denied access may be logged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned by fanotify permission events (CONFIG_FANOTIFY_ACCESS_PERMISSIONS)
+ *     when a user-space fanotify listener denies the read operation via
+ *     fsnotify_file_area_perm(). This allows user-space HSM or antivirus
+ *     programs to block reads.
+ *
+ * error: ENOBUFS, No buffer space available
+ *   desc: Returned when reading from pipe-based watch queues (CONFIG_WATCH_QUEUE)
+ *     when the buffer is too small to hold a complete notification, or when
+ *     reading packets from pipes with PIPE_BUF_FLAG_WHOLE set.
+ *
+ * error: ERESTARTSYS, Restart system call (internal)
+ *   desc: Internal error code indicating the syscall should be restarted. This
+ *     is typically translated to EINTR if SA_RESTART is not set on the signal
+ *     handler, or the syscall is transparently restarted if SA_RESTART is set.
+ *     User space should not see this error code directly.
+ *
+ * lock: Filesystem-specific locks
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's read_iter or read method may acquire additional locks.
+ *     For regular files, this typically includes the inode's i_rwsem (shared mode)
+ *     for certain operations, and the mapping's invalidate_lock. For O_DIRECT
+ *     reads, additional serialization with page cache may occur. These locks are
+ *     internal to the file operation and released before return.
+ *
+ * lock: RCU read-side
+ *   type: KAPI_LOCK_RCU
+ *   acquired: conditional
+ *   released: true
+ *   desc: Used during file descriptor lookup via fdget() (called through the
+ *     CLASS(fd, f) macro). RCU read lock protects access to the file descriptor
+ *     table. Released by fdput() at the end of the CLASS scope.
+ *
+ * signal: Any signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked waiting for data or I/O completion
+ *   desc: The syscall may be interrupted by signals while waiting for data to
+ *     become available or while waiting for I/O to complete. If interrupted
+ *     before any data is read, returns -EINTR or -ERESTARTSYS. If data has
+ *     already been read, returns the number of bytes read instead of an error.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode access time (atime)
+ *   condition: When read succeeds and O_NOATIME is not set
+ *   desc: Updates the file's access time (atime) via touch_atime(). The update
+ *     may be suppressed by mount options (noatime, relatime), the O_NOATIME
+ *     flag, or if the filesystem does not support atime. Relatime only updates
+ *     atime if it is older than mtime or ctime, or more than a day old.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task I/O accounting
+ *   condition: Always (after read attempt)
+ *   desc: Updates the current task's I/O accounting statistics. The rchar field
+ *     (read characters) is incremented by bytes read via add_rchar(). The syscr
+ *     field (syscall read count) is incremented via inc_syscr(). These statistics
+ *     are visible in /proc/[pid]/io. Updated regardless of success or failure
+ *     (syscr always incremented, rchar only on successful reads).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   condition: When read returns >= 0
+ *   desc: Generates an FS_ACCESS fsnotify event via fsnotify_access() allowing
+ *     inotify, fanotify, and dnotify watchers to be notified of the read. This
+ *     occurs after data transfer completes successfully.
+ *   reversible: no
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control on read permission
+ *   without: Standard DAC checks are enforced
+ *   condition: Checked via security_file_permission() during rw_verify_area()
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass read permission checks on regular files
+ *   without: Must have read permission on file
+ *   condition: Checked by LSM hooks during the read operation
+ *
+ * constraint: UIO_MAXIOV limit
+ *   desc: The vlen parameter must not exceed UIO_MAXIOV (1024). This limit is
+ *     defined by POSIX (IOV_MAX) and prevents excessive memory allocation for
+ *     the iovec array. Historical Linux kernels (2.0) had a limit of 16.
+ *   expr: vlen <= 1024
+ *
+ * constraint: MAX_RW_COUNT limit
+ *   desc: The total bytes to read (sum of all iov_len values) is clamped to
+ *     MAX_RW_COUNT (INT_MAX & PAGE_MASK, approximately 2GB minus one page) to
+ *     prevent integer overflow in internal calculations. This is transparent
+ *     to the caller; individual iov_len values are truncated as needed.
+ *   expr: actual_total = min(sum(iov_len), MAX_RW_COUNT)
+ *
+ * constraint: File must be open for reading
+ *   desc: The file descriptor must have been opened with O_RDONLY or O_RDWR.
+ *     Files opened with O_WRONLY or O_PATH cannot be read and return EBADF.
+ *     The file must have both FMODE_READ and FMODE_CAN_READ flags set.
+ *   expr: (file->f_mode & FMODE_READ) && (file->f_mode & FMODE_CAN_READ)
+ *
+ * constraint: File must support positioned reads
+ *   desc: The file must have FMODE_PREAD flag set, indicating it supports
+ *     reading at arbitrary positions. Regular files and block devices have
+ *     this flag set by default. Pipes, FIFOs, sockets, and terminals do not.
+ *     Some device drivers may or may not support positioned reads.
+ *   expr: file->f_mode & FMODE_PREAD
+ *
+ * constraint: Non-negative position
+ *   desc: The combined file offset (pos_h << 32 | pos_l) must be non-negative
+ *     when interpreted as a signed 64-bit integer (loff_t). Negative offsets
+ *     are invalid and return EINVAL. The position is not validated against
+ *     file size; reading beyond EOF simply returns 0 bytes.
+ *   expr: pos >= 0
+ *
+ * examples: n = preadv(fd, iov, 3, 4096);  // Read at offset 4096 into 3 buffers
+ *   struct iovec iov[2] = {{header, sizeof(header)}, {payload, payload_len}};
+ *   n = preadv(fd, iov, 2, record_offset);  // Read record at specific offset
+ *   n = preadv(fd, iov, iovcnt, pos_l, pos_h);  // 64-bit offset via split args
+ *
+ * notes: preadv() is particularly useful in multi-threaded applications where
+ *   multiple threads need to read from different positions in the same file
+ *   without interfering with each other. Unlike readv() followed by lseek(),
+ *   preadv() is atomic with respect to the file position.
+ *
+ *   Key differences from readv():
+ *   - Does NOT update the file position (f_pos) - the specified offset is used
+ *   - Requires the file to support positioned reads (FMODE_PREAD)
+ *   - No f_pos_lock contention between concurrent preadv() calls
+ *
+ *   Common use cases include:
+ *
+ *   - Database systems: Reading records at known offsets without position tracking
+ *
+ *   - Parallel file processing: Multiple threads reading different regions
+ *
+ *   - Log file analysis: Reading specific portions without affecting other readers
+ *
+ *   - File format parsing: Reading headers and data at known offsets
+ *
+ *   The split offset encoding (pos_l, pos_h) is necessary because some 32-bit
+ *   architectures (MIPS, PARISC, ARM, PowerPC) require 64-bit arguments to be
+ *   passed in aligned register pairs. The glibc wrapper typically handles this
+ *   encoding transparently, providing a single off_t parameter to applications.
+ *
+ *   For per-call behavior modifications (e.g., RWF_HIPRI for high-priority I/O,
+ *   RWF_NOWAIT for non-blocking attempts), use preadv2() which adds a flags
+ *   parameter. Note that preadv2() with a position of -1 falls back to readv()
+ *   semantics (using and updating the current file position).
+ *
+ *   Unlike pread(), which reads into a single buffer, preadv() can read into
+ *   multiple non-contiguous buffers atomically, making it ideal for reading
+ *   structured data with separate header and payload regions.
+ *
+ * since-version: 2.6.30
+ */
 SYSCALL_DEFINE5(preadv, unsigned long, fd, const struct iovec __user *, vec,
 		unsigned long, vlen, unsigned long, pos_l, unsigned long, pos_h)
 {
