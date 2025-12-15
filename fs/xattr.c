@@ -2791,6 +2791,189 @@ SYSCALL_DEFINE3(llistxattr, const char __user *, pathname, char __user *, list,
 	return path_listxattrat(AT_FDCWD, pathname, AT_SYMLINK_NOFOLLOW, list, size);
 }
 
+/**
+ * sys_flistxattr - list extended attribute names for an open file descriptor
+ * @fd: File descriptor of the open file whose extended attributes to list
+ * @list: User buffer to receive the list of attribute names
+ * @size: Size of the user buffer in bytes
+ *
+ * long-desc: Retrieves the list of extended attribute names associated with
+ *   the file referred to by the open file descriptor fd. This syscall is
+ *   functionally equivalent to listxattr() but operates on an already-open
+ *   file descriptor rather than a pathname, eliminating path resolution
+ *   overhead and race conditions between open() and attribute operations.
+ *
+ *   The attribute names are returned as a sequence of null-terminated strings
+ *   concatenated together in the list buffer. Each name includes its namespace
+ *   prefix (e.g., "user.myattr", "security.selinux", "trusted.overlay.opaque").
+ *
+ *   If size is 0 and list is NULL, returns the current size of the attribute
+ *   name list without copying any data. This allows the caller to determine
+ *   the required buffer size before allocating memory.
+ *
+ *   The list of attribute names may vary based on the caller's privileges:
+ *   - "trusted.*" attributes are only listed for processes with CAP_SYS_ADMIN
+ *   - Security labels from LSMs (security.*) are included based on LSM policy
+ *   - POSIX ACLs (system.posix_acl_*) are listed if present and supported
+ *
+ *   The maximum size of the attribute name list is limited to XATTR_LIST_MAX
+ *   (65536 bytes). If the actual list exceeds this limit, E2BIG is returned.
+ *
+ *   Using flistxattr() with an O_PATH file descriptor is supported and operates
+ *   on the file or directory referred to by the descriptor, even for files that
+ *   cannot normally be opened (like sockets or symlinks).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid, open file descriptor. The file descriptor
+ *     may be opened with any access mode (O_RDONLY, O_WRONLY, or O_RDWR) and
+ *     may be an O_PATH descriptor. The file type may be regular file, directory,
+ *     symbolic link, or other file types that support extended attributes.
+ *     Invalid or closed file descriptors result in EBADF.
+ *
+ * param: list
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: When size is non-zero, must be a valid pointer to a user
+ *     buffer of at least size bytes. When size is zero, may be NULL (used
+ *     to query required buffer size). The buffer receives null-terminated
+ *     attribute names concatenated together.
+ *
+ * param: size
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, 65536
+ *   constraint: Size of the list buffer in bytes. Zero is permitted and
+ *     returns the required buffer size without writing any data. Values
+ *     larger than XATTR_LIST_MAX (65536) are silently capped to that limit.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the size in bytes of the attribute name list.
+ *     This is the total length of all null-terminated strings including their
+ *     null terminators. If size was 0, returns the required buffer size. If
+ *     there are no extended attributes, returns 0.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The file descriptor fd is not a valid open file descriptor. This
+ *     occurs when fd is negative, refers to a closed file, or is beyond the
+ *     process's file descriptor limit. Returned by fdget() when looking up
+ *     the file structure.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Returned by LSM security_inode_listxattr() hook if the security
+ *     policy (e.g., SELinux, Smack, AppArmor) denies listing attributes on
+ *     the file. Note that unlike path-based operations, no path traversal
+ *     permission checks apply since the file is already open.
+ *
+ * error: ERANGE, Buffer too small
+ *   desc: The provided buffer (size > 0) is too small to hold the attribute name
+ *     list. Call with size=0 first to determine required size, then allocate
+ *     appropriate buffer. Note: list may change between calls if another
+ *     process modifies the file's attributes concurrently.
+ *
+ * error: E2BIG, List too large
+ *   desc: The total size of attribute names exceeds XATTR_LIST_MAX (65536 bytes).
+ *     This occurs when the filesystem returns -ERANGE with a buffer that is
+ *     already at the maximum size. The file has more extended attributes than
+ *     can be listed. This is a known limitation documented in the man page.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Kernel could not allocate memory for the intermediate buffer used to
+ *     retrieve attribute names from the filesystem (kvmalloc failed). The buffer
+ *     size is min(size, XATTR_LIST_MAX).
+ *
+ * error: EFAULT, Bad address
+ *   desc: The list buffer pointer is invalid and size is non-zero. Returned
+ *     from copy_to_user() when copying the attribute names to userspace.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The filesystem does not support extended attributes. This occurs when
+ *     the inode lacks the IOP_XATTR flag, has no listxattr operation, and
+ *     security_inode_listsecurity() returns no security labels. Common for
+ *     filesystems like FAT, VFAT, or older ext2 without xattr support.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from the filesystem, or the inode
+ *     is marked as bad (is_bad_inode). This is a filesystem-specific error that
+ *     may indicate hardware problems or filesystem corruption.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Kernel buffer for attribute names
+ *   desc: When size > 0, a kernel buffer is allocated via kvmalloc() to receive
+ *     attribute names from the filesystem before copying to userspace. This
+ *     memory is freed (kvfree) after the operation completes, regardless of
+ *     success or failure.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_ACCESS_RESOURCE
+ *   allows: Listing trusted.* namespace attributes
+ *   without: Attributes in the trusted.* namespace are silently omitted from
+ *     the returned list. The caller does not receive an error, but simply
+ *     does not see these attributes. This applies to filesystems using
+ *     simple_xattr_list() (tmpfs, ramfs, etc.). The capability check is
+ *     performed using ns_capable_noaudit() to avoid generating audit records.
+ *   condition: Filesystem uses simple_xattr_list() and has trusted.* attributes
+ *
+ * constraint: Filesystem support
+ *   desc: The filesystem must support extended attributes. Most modern
+ *     filesystems (ext4, XFS, Btrfs, NFS, tmpfs) support xattrs. Some
+ *     filesystems (FAT, older ext2) do not. When unsupported, either
+ *     EOPNOTSUPP is returned or an empty list (0 bytes).
+ *
+ * constraint: LSM checks
+ *   desc: Linux Security Modules (SELinux, Smack, AppArmor) may restrict
+ *     which attributes are visible via security_inode_listxattr() hook.
+ *     The LSM can deny the operation entirely (EACCES) or filter specific
+ *     attributes from the returned list.
+ *
+ * constraint: Race conditions with attribute changes
+ *   desc: The set of extended attributes may change between querying the
+ *     required size (size=0) and retrieving the actual list. If attributes
+ *     are added, the second call may return ERANGE. Applications should
+ *     handle this by retrying with a larger buffer.
+ *
+ * examples: flistxattr(fd, buf, sizeof(buf));  // List xattrs on open file
+ *   flistxattr(fd, NULL, 0);  // Query required buffer size
+ *
+ * notes: flistxattr() is useful when working with already-open files, avoiding
+ *   the overhead of path resolution and eliminating TOCTOU race conditions
+ *   that can occur between open() and listxattr(). It is particularly useful:
+ *   - When iterating over file descriptors from opendir/readdir
+ *   - In security-sensitive applications where the file identity matters
+ *   - When operating on files opened with O_PATH (sockets, symlinks, etc.)
+ *
+ *   The common pattern for listing extended attributes is:
+ *   1. Call flistxattr() with size=0 to get required buffer size
+ *   2. Allocate a buffer of that size
+ *   3. Call flistxattr() again with the buffer
+ *   4. Parse the returned list by scanning for null terminators
+ *
+ *   Be aware that:
+ *   - The attribute list may change between calls (handle ERANGE by retrying)
+ *   - trusted.* attributes are hidden from unprivileged callers
+ *   - Some filesystems may return an empty list even if they don't support xattrs
+ *   - The returned names include namespace prefixes (user., trusted., etc.)
+ *   - The file descriptor must remain open until the operation completes
+ *
+ *   Related syscalls:
+ *   - listxattr(): List attributes by path (follows symlinks)
+ *   - llistxattr(): List attributes by path (does not follow symlinks)
+ *   - fgetxattr(): Retrieve value of a specific attribute via fd
+ *   - fsetxattr(): Set value of an attribute via fd
+ *   - fremovexattr(): Remove an attribute via fd
+ *
+ * since-version: 2.4
+ */
 SYSCALL_DEFINE3(flistxattr, int, fd, char __user *, list, size_t, size)
 {
 	return path_listxattrat(fd, NULL, AT_EMPTY_PATH, list, size);
