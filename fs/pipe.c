@@ -1051,6 +1051,234 @@ static int do_pipe2(int __user *fildes, int flags)
 	return error;
 }
 
+/**
+ * sys_pipe2 - Create a pipe with configurable flags
+ * @fildes: Pointer to an array of two integers to receive the file descriptors
+ * @flags: Flags to modify pipe behavior (O_CLOEXEC, O_NONBLOCK, O_DIRECT,
+ *         O_NOTIFICATION_PIPE)
+ *
+ * long-desc: Creates a unidirectional data channel (pipe) that can be used for
+ *   interprocess communication. The pipe consists of two file descriptors:
+ *   fildes[0] is the read end and fildes[1] is the write end. Data written to
+ *   the write end is buffered by the kernel until read from the read end.
+ *
+ *   When @flags is 0, this syscall behaves identically to pipe(). The @flags
+ *   argument allows atomic configuration of the new file descriptors without
+ *   race conditions that would occur with separate fcntl() calls.
+ *
+ *   O_CLOEXEC sets the close-on-exec flag on both file descriptors, ensuring
+ *   they are automatically closed during exec(). This eliminates the race
+ *   window between pipe creation and fcntl(F_SETFD, FD_CLOEXEC) where another
+ *   thread could fork+exec and leak the descriptors.
+ *
+ *   O_NONBLOCK sets the non-blocking flag on both descriptors. Reads from an
+ *   empty pipe will return EAGAIN instead of blocking, and writes to a full
+ *   pipe will also return EAGAIN.
+ *
+ *   O_DIRECT (since Linux 3.4) enables "packet mode" where each write() creates
+ *   a discrete packet. Reads return data from at most one write, even if the
+ *   read buffer is larger. Writes larger than PIPE_BUF may be split into
+ *   multiple packets. Reads with insufficient buffer size silently discard
+ *   excess data from the packet.
+ *
+ *   O_NOTIFICATION_PIPE (since Linux 5.8) creates a pipe for receiving kernel
+ *   notifications. This is used with the watch_queue mechanism for event
+ *   monitoring. Requires CONFIG_WATCH_QUEUE to be enabled.
+ *
+ *   The pipe has a default capacity of 16 pages (typically 64KB). This can be
+ *   modified via fcntl(F_SETPIPE_SZ) up to /proc/sys/fs/pipe-max-size (default
+ *   1MB) for unprivileged users, or higher with CAP_SYS_RESOURCE.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fildes
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid user-space buffer capable of holding two
+ *     integers (int[2]). On success, fildes[0] contains the read end file
+ *     descriptor and fildes[1] contains the write end file descriptor. On
+ *     failure, the buffer contents are undefined. The pointer must be properly
+ *     aligned for int access.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE
+ *   constraint: Only O_CLOEXEC (0x80000), O_NONBLOCK (0x800), O_DIRECT (0x4000),
+ *     and O_NOTIFICATION_PIPE (0x80, same as O_EXCL) are valid. Any other bits
+ *     set will result in EINVAL. Pass 0 for default behavior (blocking I/O,
+ *     file descriptors not closed on exec, stream mode).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: On success, returns 0 and writes two new file descriptors to the
+ *     @fildes array. fildes[0] is open for reading (O_RDONLY) and fildes[1] is
+ *     open for writing (O_WRONLY). Both descriptors support poll/select/epoll
+ *     and have FMODE_NOWAIT set for io_uring compatibility.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flags argument contains bits other than O_CLOEXEC, O_NONBLOCK,
+ *     O_DIRECT, and O_NOTIFICATION_PIPE. The kernel validates flags with
+ *     (flags & ~(O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE)) and
+ *     rejects any unknown flags. This enables future kernel versions to add
+ *     new flags without breaking existing applications.
+ *
+ * error: EFAULT, Invalid fildes pointer
+ *   desc: The @fildes pointer is invalid or points to memory that cannot be
+ *     written. This error is detected during copy_to_user() after the pipe
+ *     and file descriptors have been created. In this case, all allocated
+ *     resources (file structures, file descriptors, pipe) are properly cleaned
+ *     up before returning.
+ *
+ * error: EMFILE, Per-process file descriptor limit reached
+ *   desc: The per-process limit on the number of open file descriptors has
+ *     been reached. This limit is determined by RLIMIT_NOFILE, which can be
+ *     queried via getrlimit(2) and modified via setrlimit(2) or prlimit(2).
+ *     The default soft limit is typically 1024. This error is returned from
+ *     get_unused_fd_flags() when alloc_fd() cannot find an available slot
+ *     below the limit. Note that pipe2() requires TWO file descriptors, so
+ *     this error can occur if only one slot is available.
+ *
+ * error: ENFILE, System-wide file limit reached
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is controlled by /proc/sys/fs/file-max (default
+ *     varies by system memory). Users with CAP_SYS_ADMIN capability can bypass
+ *     this limit. This error is returned from alloc_empty_file() when the
+ *     global file count (nr_files) exceeds files_stat.max_files. May also be
+ *     returned if memory allocation for the pipe inode or pipe_inode_info
+ *     structure fails.
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory for the required data
+ *     structures. Memory is allocated for: the pipe_inode_info structure
+ *     (via kzalloc), the pipe buffer array (via kcalloc), the inode (via
+ *     alloc_inode), dentry structures (via d_alloc_pseudo), and file
+ *     structures (via kmem_cache_alloc). This error may also occur if the
+ *     pipe buffer hard limit (/proc/sys/fs/pipe-user-pages-hard) is exceeded
+ *     for unprivileged users.
+ *
+ * error: ENOPKG, O_NOTIFICATION_PIPE not supported
+ *   desc: The O_NOTIFICATION_PIPE flag was specified but CONFIG_WATCH_QUEUE
+ *     is not enabled in the kernel configuration. This error is returned by
+ *     the stub watch_queue_init() function when the feature is compiled out.
+ *     To use notification pipes, rebuild the kernel with CONFIG_WATCH_QUEUE=y.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's file descriptor table spinlock is acquired twice
+ *     (once for each file descriptor) during fd allocation in alloc_fd().
+ *     This lock protects the fd table from concurrent modifications. The lock
+ *     is held briefly during fd slot reservation and bitmap updates. If the
+ *     fd table needs to be expanded, the lock may be released and reacquired.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: Anonymous pipe (pipe_inode_info)
+ *   desc: Creates a new pipe_inode_info structure containing the pipe's ring
+ *     buffer, wait queues, and metadata. The default configuration is 16
+ *     buffer slots (pages). The pipe is associated with an inode on the
+ *     internal pipefs filesystem.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: Two file descriptors
+ *   desc: Allocates and installs two file descriptors in the calling process's
+ *     file descriptor table. The read end (fildes[0]) has FMODE_READ and the
+ *     write end (fildes[1]) has FMODE_WRITE. Both are marked with FMODE_NOWAIT
+ *     and have fsnotify disabled by default.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: System-wide open file count
+ *   desc: Increments the global nr_files counter twice (once for each file
+ *     structure) via percpu_counter_inc(). This count is tracked against the
+ *     system-wide limit /proc/sys/fs/file-max.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Per-user pipe buffer count
+ *   desc: Increments the per-user pipe buffer count (user->pipe_bufs) tracked
+ *     via atomic_long_add_return(). This is checked against pipe-user-pages-soft
+ *     and pipe-user-pages-hard limits in /proc/sys/fs/.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Memory cgroup
+ *   desc: Memory allocations for the pipe structures and file structures are
+ *     charged to the calling process's memory cgroup via GFP_KERNEL_ACCOUNT.
+ *     This includes pipe_inode_info, pipe buffer array, and file structures.
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass system-wide file limit check
+ *   without: Subject to /proc/sys/fs/file-max limit (returns ENFILE when
+ *     exceeded)
+ *   condition: Checked in alloc_empty_file() when system file count exceeds
+ *     files_stat.max_files
+ *
+ * capability: CAP_SYS_RESOURCE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass per-user pipe buffer soft and hard limits
+ *   without: Subject to /proc/sys/fs/pipe-user-pages-soft and
+ *     /proc/sys/fs/pipe-user-pages-hard limits (pipe capacity may be reduced
+ *     or ENOMEM returned)
+ *   condition: Checked in alloc_pipe_info() via pipe_is_unprivileged_user()
+ *
+ * constraint: RLIMIT_NOFILE
+ *   desc: The per-process file descriptor limit controls the maximum file
+ *     descriptor number that can be allocated. Since pipe2() allocates two
+ *     descriptors, at least two slots must be available below this limit.
+ *     The soft limit defaults to 1024 and can be raised via setrlimit(2).
+ *
+ * constraint: pipe-user-pages-soft
+ *   desc: Soft limit on per-user pipe buffer pages in /proc/sys/fs/. When
+ *     exceeded by unprivileged users, new pipes are created with reduced
+ *     capacity (PIPE_MIN_DEF_BUFFERS = 2 instead of 16). Default is
+ *     PIPE_DEF_BUFFERS * INR_OPEN_CUR.
+ *
+ * constraint: pipe-user-pages-hard
+ *   desc: Hard limit on per-user pipe buffer pages in /proc/sys/fs/. When
+ *     exceeded by unprivileged users, pipe creation fails with ENOMEM.
+ *     Default is 0 (unlimited).
+ *
+ * constraint: pipe-max-size
+ *   desc: Maximum pipe capacity in /proc/sys/fs/ (default 1MB). This affects
+ *     fcntl(F_SETPIPE_SZ) but not initial pipe creation. Users with
+ *     CAP_SYS_RESOURCE can exceed this limit.
+ *
+ * examples: pipe2(fds, 0);  // Equivalent to pipe(fds)
+ *   pipe2(fds, O_CLOEXEC);  // Auto-close on exec
+ *   pipe2(fds, O_CLOEXEC | O_NONBLOCK);  // Non-blocking with auto-close
+ *   pipe2(fds, O_DIRECT);  // Packet mode pipe
+ *
+ * notes: The pipe2() syscall was introduced in Linux 2.6.27 to address race
+ *   conditions when setting close-on-exec flags in multi-threaded programs.
+ *   It is Linux-specific and not part of POSIX.
+ *
+ *   The pipe maintains separate read (rd_wait) and write (wr_wait) wait queues
+ *   for efficient poll/epoll notification.
+ *
+ *   On some architectures (Alpha, IA-64, MIPS, SuperH, SPARC), the original
+ *   pipe() syscall returned both file descriptors in registers rather than
+ *   via a pointer. pipe2() uses the pointer mechanism on all architectures.
+ *
+ *   When using O_DIRECT (packet mode), POSIX atomic write guarantees (PIPE_BUF
+ *   typically 4096 bytes) apply to each packet boundary. Writes larger than
+ *   PIPE_BUF are split at page boundaries.
+ *
+ *   The pipe() syscall is implemented as pipe2(fildes, 0) internally.
+ *
+ *   Audit logging: The file descriptor pair is recorded via audit_fd_pair()
+ *   for audit trail purposes when auditing is enabled.
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE2(pipe2, int __user *, fildes, int, flags)
 {
 	return do_pipe2(fildes, flags);
