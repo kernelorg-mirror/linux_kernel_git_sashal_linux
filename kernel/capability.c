@@ -346,22 +346,266 @@ static kernel_cap_t mk_kernel_cap(u32 low, u32 high)
 }
 
 /**
- * sys_capset - set capabilities for a process or (*) a group of processes
- * @header: pointer to struct that contains capability version and
- *	target pid data
- * @data: pointer to struct that contains the effective, permitted,
- *	and inheritable capabilities
+ * sys_capset - Set the capability sets of the current process
+ * @header: Pointer to user-space structure containing protocol version and
+ *	target process ID
+ * @data: Pointer to user-space structure(s) containing the new capability sets
  *
- * Set capabilities for the current process only.  The ability to any other
- * process(es) has been deprecated and removed.
+ * long-desc: Sets the effective, permitted, and inheritable capability sets
+ *   of the calling process. Linux capabilities provide a mechanism for
+ *   partitioning the privileges traditionally associated with superuser (root)
+ *   into distinct units that can be independently enabled and disabled.
  *
- * The restrictions on setting capabilities are specified as:
+ *   The @header parameter points to a cap_user_header_t structure that
+ *   contains:
+ *   - version: A magic number indicating the capability protocol version.
+ *     Must be _LINUX_CAPABILITY_VERSION_1 (0x19980330),
+ *     _LINUX_CAPABILITY_VERSION_2 (0x20071026, deprecated), or
+ *     _LINUX_CAPABILITY_VERSION_3 (0x20080522, preferred). If an invalid
+ *     version is specified, the kernel writes the preferred version
+ *     (_LINUX_CAPABILITY_VERSION_3) to header->version and returns -EINVAL.
+ *   - pid: Must be 0 or the calling thread's own PID. Since Linux 2.6.24,
+ *     modifying another process's capabilities is no longer permitted.
  *
- * I: any raised capabilities must be a subset of the old permitted
- * P: any raised capabilities must be a subset of the old permitted
- * E: must be set to a subset of new permitted
+ *   The @data parameter points to one or two cap_user_data_t structures
+ *   (depending on the protocol version) containing the new capability sets:
+ *   - effective: Capabilities to take effect immediately
+ *   - permitted: Capabilities the process is allowed to have
+ *   - inheritable: Capabilities preserved across execve()
  *
- * Returns 0 on success and < 0 on error.
+ *   Version 1 supports only the first 32 capabilities and requires a single
+ *   __user_cap_data_struct. Versions 2 and 3 support 64 capabilities and
+ *   require an array of two __user_cap_data_struct elements. The kernel
+ *   masks the capability values against CAP_VALID_MASK to ignore undefined
+ *   capability bits.
+ *
+ *   The following restrictions apply when setting capabilities:
+ *   - New permitted set must be a subset of old permitted set (can only drop)
+ *   - New effective set must be a subset of new permitted set
+ *   - New inheritable set must be a subset of (old inheritable | old bounding)
+ *   - Without CAP_SETPCAP: new inheritable must also be a subset of
+ *     (old inheritable | old permitted)
+ *
+ *   When capabilities are modified, the kernel automatically adjusts the
+ *   ambient capability set to be the intersection of the new permitted and
+ *   new inheritable sets. This ensures the ambient invariant is maintained:
+ *   ambient capabilities must always be both permitted and inheritable.
+ *
+ *   This syscall uses the credentials infrastructure to atomically update
+ *   the process's capability sets. The prepare_creds() function allocates
+ *   a new credential structure, security_capset() validates and applies
+ *   the changes, and commit_creds() atomically installs the new credentials.
+ *
+ *   The operation is audited via audit_log_capset() when auditing is enabled,
+ *   recording the new effective, permitted, inheritable, and ambient sets.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: header
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_INOUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a cap_user_header_t structure
+ *     in user space. The version field is read to determine protocol version
+ *     and may be written to indicate the kernel's preferred version on error.
+ *     The pid field must be 0 or equal to the calling thread's PID. Cannot
+ *     be NULL.
+ *
+ * param: data
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to valid user-space memory containing capability
+ *     data. For version 1, must point to a single __user_cap_data_struct
+ *     (12 bytes). For versions 2 and 3, must point to an array of two
+ *     __user_cap_data_struct elements (24 bytes total). Memory must be
+ *     readable. Cannot be NULL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The calling process's capability sets have
+ *     been updated to the specified values, subject to the constraints
+ *     described above. The ambient capability set may have been adjusted.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: The @header pointer is invalid or points to unmapped memory,
+ *     preventing the kernel from reading the version or pid fields. Also
+ *     returned if @data points to invalid or unreadable memory. This error
+ *     can originate from get_user() reading header->pid, put_user()
+ *     updating header->version on version mismatch, or copy_from_user()
+ *     reading capability data from @data. Additionally returned if the
+ *     internal buffer size check (copybytes > sizeof(kdata)) fails, which
+ *     would indicate kernel/userspace structure size mismatch.
+ *
+ * error: EINVAL, Invalid capability protocol version
+ *   desc: The header->version field contains an unrecognized capability
+ *     protocol version (not VERSION_1, VERSION_2, or VERSION_3). Before
+ *     returning this error, the kernel writes _LINUX_CAPABILITY_VERSION_3
+ *     (0x20080522) to header->version, allowing applications to discover
+ *     the kernel's preferred version. Also returned if the cap_capset()
+ *     security hook detects that the ambient capability invariant would
+ *     be violated (ambient not subset of permitted & inheritable), though
+ *     this is an internal sanity check with a WARN_ON.
+ *
+ * error: EPERM, Permission denied
+ *   desc: Returned in several cases: (1) The header->pid field is non-zero
+ *     and does not equal the calling thread's PID (task_pid_vnr(current)).
+ *     Since Linux 2.6.24, modifying another process's capabilities is not
+ *     permitted. (2) The new inheritable set contains capabilities not in
+ *     (old_inheritable | old_permitted) and the caller lacks CAP_SETPCAP
+ *     in their user namespace. (3) The new inheritable set contains
+ *     capabilities not in (old_inheritable | old_bounding_set). (4) The
+ *     new permitted set contains capabilities not in old_permitted (cannot
+ *     raise permitted capabilities). (5) The new effective set contains
+ *     capabilities not in new_permitted (effective must be subset of
+ *     permitted).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: The kernel failed to allocate memory for the new credential
+ *     structure via prepare_creds(). This allocation uses GFP_KERNEL and
+ *     can fail under memory pressure. The credential structure includes
+ *     capability sets, UIDs/GIDs, security labels, and keyring references.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DISCARD
+ *   condition: During credential allocation or user-space memory access
+ *   desc: The syscall may block during kmem_cache_alloc() in prepare_creds()
+ *     or during copy_from_user()/get_user() if pages need to be faulted in.
+ *     These operations use TASK_UNINTERRUPTIBLE state and cannot be
+ *     interrupted by signals. Any signals delivered during the syscall
+ *     remain pending and are handled after the syscall returns. The syscall
+ *     does not return EINTR or ERESTARTSYS.
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Current process credential capability sets
+ *   desc: Modifies the calling process's cap_effective, cap_permitted, and
+ *     cap_inheritable fields in its credential structure. The modification
+ *     is atomic from the perspective of other threads reading credentials.
+ *   condition: Always on success
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Current process ambient capability set
+ *   desc: The ambient capability set (cap_ambient) is automatically adjusted
+ *     to be the intersection of the new permitted and new inheritable sets.
+ *     This maintains the invariant that ambient capabilities must be both
+ *     permitted and inheritable. Capabilities in ambient that are no longer
+ *     in both sets are silently removed.
+ *   condition: When ambient capabilities exist that are no longer valid
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: header->version in user space
+ *   desc: When an unrecognized capability version is provided in
+ *     header->version, the kernel writes _LINUX_CAPABILITY_VERSION_3
+ *     (0x20080522) to header->version before returning -EINVAL. This allows
+ *     applications to discover the kernel's preferred capability version.
+ *   condition: header->version is not a recognized capability version
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: Process dumpability and ptrace state
+ *   desc: If the capability change results in a non-subset relationship
+ *     between old and new credentials (checked by cred_cap_issubset in
+ *     commit_creds), the process dumpability may be modified via
+ *     set_dumpable() and pdeath_signal is cleared. This affects whether
+ *     core dumps are produced and ptrace attachment permissions.
+ *   condition: When new capabilities are not a subset of old (privilege drop)
+ *   reversible: no
+ *
+ * state-trans: process_credentials
+ *   from: old capability sets (E, P, I, A)
+ *   to: new capability sets with E' subset of P', P' subset of P,
+ *       I' subset of (I | B), A' = A & P' & I'
+ *   condition: All capability constraints are satisfied
+ *   desc: The credential transition is atomic using RCU. Both task->cred
+ *     and task->real_cred are updated to point to the new credentials.
+ *     Old credentials are freed via RCU callback after grace period.
+ *
+ * capability: CAP_SETPCAP
+ *   type: KAPI_CAP_OVERRIDE_RESTRICTION
+ *   allows: Setting inheritable capabilities from permitted set even if
+ *     not already in inheritable set. Specifically, without CAP_SETPCAP,
+ *     the new inheritable set must be a subset of (old_inheritable |
+ *     old_permitted). With CAP_SETPCAP, this restriction is lifted.
+ *   without: The new inheritable set is constrained to be a subset of
+ *     (old_inheritable | old_permitted). This prevents unprivileged
+ *     processes from arbitrarily setting inheritable capabilities.
+ *   condition: Checked when validating inheritable capability changes
+ *
+ * constraint: Permitted Capability Constraint
+ *   desc: The new permitted capability set must be a subset of the old
+ *     permitted set. Capabilities can only be dropped from permitted,
+ *     never raised. This is a fundamental security property that prevents
+ *     privilege escalation.
+ *   expr: new_permitted subset_of old_permitted
+ *
+ * constraint: Effective Capability Constraint
+ *   desc: The new effective capability set must be a subset of the new
+ *     permitted set. A process cannot have effective capabilities that
+ *     are not permitted.
+ *   expr: new_effective subset_of new_permitted
+ *
+ * constraint: Inheritable Bounding Set Constraint
+ *   desc: The new inheritable capability set must be a subset of the union
+ *     of the old inheritable set and the capability bounding set. This
+ *     prevents adding inheritable capabilities beyond what the bounding
+ *     set allows.
+ *   expr: new_inheritable subset_of (old_inheritable | bounding_set)
+ *
+ * constraint: PID Restriction
+ *   desc: The pid field in the header must be either 0 (indicating the
+ *     calling thread) or equal to the calling thread's own PID. Modifying
+ *     other processes' capabilities was deprecated in Linux 2.6.24 when
+ *     VFS-based file capabilities became the standard mechanism.
+ *   expr: header->pid == 0 || header->pid == gettid()
+ *
+ * examples: struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+ *   struct __user_cap_data_struct data[2];
+ *   syscall(__NR_capget, &hdr, data);  // Get current capabilities first
+ *   data[0].effective &= ~(1 << CAP_NET_RAW);  // Drop CAP_NET_RAW from effective
+ *   syscall(__NR_capset, &hdr, data);  // Apply the change
+ *
+ * notes: The glibc library does not provide a wrapper for this syscall.
+ *   Applications should use syscall(__NR_capset, ...) directly or use the
+ *   libcap library functions cap_set_proc() for a more portable interface.
+ *
+ *   Historical note: Before Linux 2.6.24, when VFS-based file capabilities
+ *   were introduced, capset() could modify other processes' capabilities
+ *   if the caller had CAP_SETPCAP. This behavior was removed because it
+ *   conflicted with the original POSIX.1e intent of CAP_SETPCAP, which was
+ *   to allow changes to a process's own inheritable set. The current
+ *   behavior restores CAP_SETPCAP to its intended purpose.
+ *
+ *   Capability version 2 was introduced in Linux 2.6.25 but had API issues
+ *   with backwards compatibility. Version 3, introduced in Linux 2.6.26,
+ *   is functionally identical but uses a different magic number to prevent
+ *   source code compiled against old headers from accidentally using the
+ *   wrong version. Always use version 3 for new code.
+ *
+ *   The CONFIG_MULTIUSER kernel configuration option affects this syscall.
+ *   When CONFIG_MULTIUSER is disabled (some embedded systems), capability
+ *   checks are essentially bypassed - all capability tests return true.
+ *
+ *   Unlike capget(), this syscall requires appropriate privileges to make
+ *   changes. A process can always drop capabilities but cannot raise them
+ *   beyond what is already permitted. The CAP_SETPCAP capability allows
+ *   more flexibility with the inheritable set.
+ *
+ *   The syscall operates atomically from the perspective of other threads.
+ *   The credential update uses RCU (Read-Copy-Update) to ensure that
+ *   concurrent readers see either the old or new credentials, never a
+ *   partially updated state.
+ *
+ *   When using this syscall in a multi-threaded program, note that
+ *   capabilities are per-thread, not per-process. Each thread has its own
+ *   capability sets inherited from its parent at creation time.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE2(capset, cap_user_header_t, header, const cap_user_data_t, data)
 {
