@@ -6465,6 +6465,280 @@ out_putnames:
 	return error;
 }
 
+/**
+ * sys_symlinkat - create a symbolic link relative to a directory file descriptor
+ * @oldname: target path the symbolic link will point to
+ * @newdfd: directory file descriptor for relative path resolution
+ * @newname: pathname of the symbolic link to create
+ *
+ * long-desc: Creates a symbolic link (symlink) named @newname which contains the
+ *   string @oldname. The @newname is interpreted relative to the directory
+ *   referred to by @newdfd, unless @newname is absolute (starts with '/'), in
+ *   which case @newdfd is ignored. If @newdfd is the special value AT_FDCWD
+ *   (-100), the @newname is resolved relative to the current working directory.
+ *
+ *   Symbolic links are special files that contain a reference to another file
+ *   or directory. When the kernel encounters a symlink during pathname
+ *   resolution, it replaces the symlink component with its contents and
+ *   continues resolution. The target @oldname does NOT need to exist when
+ *   the symlink is created - no validation of @oldname is performed.
+ *
+ *   The symbolic link is owned by the effective user ID and group ID of the
+ *   calling process. The permissions on a symbolic link are irrelevant; the
+ *   ownership is used only when the link itself is being removed or renamed
+ *   in a sticky directory.
+ *
+ *   This syscall was added in Linux 2.6.16 as part of the *at() family of
+ *   system calls, enabling race-free filesystem traversal by allowing
+ *   operations relative to directory file descriptors rather than the
+ *   process's current working directory. It conforms to POSIX.1-2008.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: oldname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated string in user
+ *     space representing the target of the symbolic link. The string can be
+ *     any valid path (relative or absolute), but it is NOT validated for
+ *     existence. The target may point to a non-existent file (dangling
+ *     symlink), a file on a different filesystem, or even an invalid path.
+ *     The maximum length is PATH_MAX (4096) bytes including the null
+ *     terminator. An empty string is not permitted and returns ENOENT.
+ *
+ * param: newdfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, or
+ *     the special value AT_FDCWD (-100). If @newname is an absolute path,
+ *     @newdfd is ignored. When @newdfd is a valid file descriptor, it must
+ *     refer to a directory; otherwise ENOTDIR is returned. The directory must
+ *     have search (execute) permission for path resolution to proceed. O_PATH
+ *     file descriptors are supported as @newdfd.
+ *
+ * param: newname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. The path must not be empty. Path components are limited
+ *     to NAME_MAX (255) bytes each, and the total path length must not exceed
+ *     PATH_MAX (4096) bytes. The final component must be a normal name (not
+ *     ".", "..", or empty). Trailing slashes cause ENOENT since a symlink
+ *     is being created (not a directory).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The symbolic link has been created with the
+ *     specified target. The parent directory's timestamps have been updated.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Write access to the directory containing @newname is denied, or one
+ *     of the directories in the pathname prefix of @newname did not allow
+ *     search (execute) permission. Can also occur when a Linux Security Module
+ *     denies the operation (security_path_symlink() or security_inode_symlink()
+ *     returns an error).
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The @newdfd argument is not a valid file descriptor and @newname is
+ *     a relative path (not starting with '/').
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's quota of disk blocks or inodes on the filesystem has been
+ *     exhausted. This error is filesystem-dependent and may not be returned
+ *     by all filesystems.
+ *
+ * error: EEXIST, File exists
+ *   desc: A file or directory with the name @newname already exists. This
+ *     includes the case where @newname is an existing symbolic link (dangling
+ *     or not). The LOOKUP_EXCL flag in filename_create() ensures creation
+ *     fails if the target exists.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @oldname or @newname pointer points outside the process's
+ *     accessible address space. This is detected when copying the pathname
+ *     from user space via strncpy_from_user() in getname_flags().
+ *
+ * error: EIO, Input/output error
+ *   desc: An I/O error occurred while reading from or writing to the
+ *     filesystem. This is filesystem-dependent and indicates a hardware
+ *     or low-level filesystem error.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @newname.
+ *     The kernel limit is MAXSYMLINKS (typically 40 in a single path
+ *     resolution, with a maximum recursion depth of 8 for nested symlinks).
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: The @oldname, @newname, or one of their pathname components exceeds
+ *     the system limit. Individual components are limited to NAME_MAX (255)
+ *     bytes and the total path is limited to PATH_MAX (4096) bytes.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A directory component in @newname does not exist, a symbolic link
+ *     in the path points to a nonexistent target (dangling symlink), the
+ *     parent directory has been removed (IS_DEADDIR), @oldname is an empty
+ *     string, or @newname is an empty string.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available. This can occur during
+ *     pathname allocation (getname() via __getname()), dentry allocation
+ *     (d_alloc()), or inode allocation in the filesystem's symlink operation.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The device containing the filesystem has no room for the new
+ *     symbolic link. This includes both disk space exhaustion and inode
+ *     table exhaustion. Returned by the filesystem's symlink operation.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @newname is not a directory,
+ *     or @newdfd refers to a file that is not a directory when @newname is
+ *     a relative path.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The filesystem containing @newname does not support the creation
+ *     of symbolic links (the inode_operations->symlink callback is NULL).
+ *     This is common for certain pseudo-filesystems and older filesystem
+ *     types that do not support symbolic links.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The filesystem containing @newname is mounted read-only, or the
+ *     filesystem has been remounted read-only (e.g., due to errors). This is
+ *     checked via mnt_want_write() in filename_create() before attempting
+ *     the symlink operation.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The filesystem cannot represent the process's fsuid or fsgid. This
+ *     occurs with idmapped mounts when the mapped user/group ID cannot be
+ *     represented in the filesystem's ID space. Checked via
+ *     fsuidgid_has_mapping() in may_create().
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: On NFS and similar network filesystems, the file handle for a
+ *     directory in the path has become stale. The syscall automatically
+ *     retries with LOOKUP_REVAL flag to revalidate the path before returning
+ *     this error to userspace.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The syscall was interrupted by a signal while waiting for a
+ *     delegation to be broken on the parent directory. On NFS, if another
+ *     client holds a delegation (lease) on the directory, the kernel waits
+ *     for the delegation to be broken. This wait is interruptible by signals.
+ *
+ * lock: parent_directory->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The parent directory's inode read-write semaphore is acquired
+ *     exclusively (I_MUTEX_PARENT nesting level) in start_dirop() before
+ *     the final component lookup and symlink creation. This serializes
+ *     concurrent modifications to the directory. The lock is held while
+ *     performing the lookup, security checks, and the actual symlink
+ *     operation. Released in end_dirop() via end_creating_path() after
+ *     the operation completes or fails.
+ *
+ * lock: sb->s_umount (implicit)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock's s_umount semaphore is acquired for reading via
+ *     sb_start_write() in mnt_want_write(). This prevents filesystem freeze
+ *     operations during the modification. Released via sb_end_write() in
+ *     end_creating_path().
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When waiting for delegation to be broken (NFS lease)
+ *   desc: If a delegation exists on the parent directory (NFS server lease),
+ *     the syscall may block in break_deleg_wait() waiting for the delegation
+ *     holder to release it. This wait is interruptible by signals. If a
+ *     signal is received, the syscall returns -EINTR to userspace.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_CREATE
+ *   target: symbolic link inode and dentry
+ *   desc: Creates a new symbolic link inode and directory entry in the
+ *     filesystem. The inode is allocated by the filesystem's symlink
+ *     operation and contains the target path (@oldname). A dentry linking
+ *     the name to the inode is created and hashed into the dcache.
+ *     fsnotify_create() is called to notify filesystem monitors of the
+ *     creation.
+ *   condition: Successful completion
+ *   reversible: yes (via unlink/unlinkat)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: parent directory inode
+ *   desc: The parent directory's mtime and ctime are updated to reflect the
+ *     creation of a new entry. The parent directory inode is marked dirty.
+ *     Note: Unlike mkdir, symlink does NOT increment the parent's link count
+ *     because symlinks don't have ".." entries pointing back to parent.
+ *   condition: Successful completion
+ *   reversible: no (timestamps cannot be reverted)
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control checks on parent directory
+ *   without: Must have write and execute permission on parent directory
+ *   condition: Checked during inode_permission() on parent directory when
+ *     write permission is required for creating new entries
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass directory search (execute) permission checks
+ *   without: Must have execute permission on each directory in the path
+ *   condition: Checked during path traversal for each directory component
+ *     in @newname
+ *
+ * constraint: LSM security hooks
+ *   desc: Linux Security Modules (SELinux, AppArmor, Smack, TOMOYO, etc.) may
+ *     impose additional restrictions. The security_path_symlink() hook is
+ *     called in do_symlinkat() after path resolution, and
+ *     security_inode_symlink() is called within vfs_symlink(). These hooks
+ *     may return errors (typically EACCES or EPERM) based on security policy.
+ *
+ * constraint: Filesystem support
+ *   desc: The underlying filesystem must implement the symlink operation
+ *     (inode_operations->symlink must not be NULL). Filesystems like FAT,
+ *     minixfs (old versions), and some pseudo-filesystems do not support
+ *     symbolic links and return EPERM.
+ *
+ * constraint: Target path not validated
+ *   desc: The target path (@oldname) is stored verbatim in the symbolic link
+ *     without any validation. It may reference non-existent files, files on
+ *     different filesystems, or invalid paths. Validation only occurs when
+ *     the symlink is dereferenced, not when it is created.
+ *
+ * examples: symlinkat("/etc/passwd", AT_FDCWD, "passwd_link");  // Absolute target
+ *   symlinkat("../data", dirfd, "link");  // Relative target and path
+ *   symlinkat("nonexistent", AT_FDCWD, "dangling");  // Dangling symlink is valid
+ *
+ * notes: The @oldname (target) can be any string up to PATH_MAX-1 bytes; it is
+ *   not validated for existence or format at creation time. This allows
+ *   creation of dangling symlinks that may become valid later, or symlinks
+ *   to paths on not-yet-mounted filesystems.
+ *
+ *   Unlike hard links (created with link/linkat), symbolic links can cross
+ *   filesystem boundaries and can point to directories. However, symbolic
+ *   links introduce additional path resolution overhead and potential for
+ *   circular references (ELOOP).
+ *
+ *   The order of parameters differs from the POSIX symlink() function:
+ *   symlink(target, linkpath) vs symlinkat(target, dirfd, linkpath). The
+ *   dirfd parameter is inserted between the two path parameters.
+ *
+ *   On NFS, the parent directory delegation mechanism (added in Linux 6.16)
+ *   may cause the syscall to block waiting for other clients to release their
+ *   delegations. This is transparent to applications but may increase latency.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE3(symlinkat, const char __user *, oldname,
 		int, newdfd, const char __user *, newname)
 {
