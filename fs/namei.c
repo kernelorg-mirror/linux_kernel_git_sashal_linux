@@ -5065,6 +5065,326 @@ out1:
 	return error;
 }
 
+/**
+ * sys_mknodat - create a special or ordinary file relative to a directory
+ * @dfd: directory file descriptor for relative path resolution
+ * @filename: pathname of the node to create
+ * @mode: file type and permission bits
+ * @dev: device number (for block/character special files)
+ *
+ * long-desc: Creates a filesystem node (file, device special file, FIFO, or
+ *   socket) named @filename with attributes specified by @mode and @dev. The
+ *   @filename is interpreted relative to the directory referred to by @dfd,
+ *   unless @filename is absolute (starts with '/'), in which case @dfd is
+ *   ignored. If @dfd is the special value AT_FDCWD, the pathname is resolved
+ *   relative to the current working directory.
+ *
+ *   The file type must be specified in @mode using one of: S_IFREG (0100000)
+ *   for a regular file, S_IFCHR (0020000) for a character device, S_IFBLK
+ *   (0060000) for a block device, S_IFIFO (0010000) for a FIFO (named pipe),
+ *   or S_IFSOCK (0140000) for a UNIX domain socket. If @mode is 0 (no type
+ *   bits set), S_IFREG is assumed. S_IFDIR (0040000) is explicitly forbidden
+ *   as directories must be created with mkdir.
+ *
+ *   Permission bits in @mode are modified by the process's umask in the usual
+ *   way: the mode of the created node is (@mode & ~umask). The set-group-ID
+ *   bit may be inherited from the parent directory. If the parent directory
+ *   has the set-group-ID bit set and the filesystem supports it, the new file
+ *   will inherit the group of the parent directory.
+ *
+ *   For character and block special files, @dev specifies the device number
+ *   (major and minor combined via makedev()). For other file types, @dev is
+ *   ignored (typically passed as 0).
+ *
+ *   Creating device nodes (S_IFCHR or S_IFBLK) requires CAP_MKNOD capability
+ *   in the user namespace that owns the filesystem's superblock, except when
+ *   creating a whiteout device (character device 0:0 used by overlay
+ *   filesystems).
+ *
+ *   The newly created node is owned by the effective user ID of the calling
+ *   process. If the parent directory has the set-group-ID bit set, or the
+ *   filesystem is mounted with group semantics (e.g., grpid mount option),
+ *   the new file's group is inherited from the parent; otherwise, it is set
+ *   to the effective group ID of the process.
+ *
+ *   This syscall was added in Linux 2.6.16 as part of the *at() family of
+ *   system calls, enabling race-free filesystem traversal by allowing
+ *   operations relative to directory file descriptors rather than the
+ *   process's current working directory.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: dfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, or
+ *     the special value AT_FDCWD (-100). If @filename is an absolute path,
+ *     @dfd is ignored. When @dfd is a valid file descriptor, it must refer
+ *     to a directory; otherwise ENOTDIR is returned. The directory must have
+ *     execute permission for path resolution to proceed. O_PATH file
+ *     descriptors are supported as @dfd.
+ *
+ * param: filename
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. The path must not be empty unless the process has the
+ *     appropriate privileges. Path components are limited to NAME_MAX (255)
+ *     bytes each, and the total path length must not exceed PATH_MAX (4096)
+ *     bytes. The final component must be a normal name (not ".", "..", or
+ *     empty). Trailing slashes are not permitted for regular file, device,
+ *     FIFO, or socket creation.
+ *
+ * param: mode
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: S_IFMT | S_IRWXU | S_IRWXG | S_IRWXO | S_ISUID | S_ISGID | S_ISVTX
+ *   constraint: The file type field (S_IFMT mask, bits 0170000) must be one
+ *     of: 0 (defaults to S_IFREG), S_IFREG (0100000), S_IFCHR (0020000),
+ *     S_IFBLK (0060000), S_IFIFO (0010000), or S_IFSOCK (0140000). Using
+ *     S_IFDIR (0040000) returns EPERM. Invalid type values return EINVAL.
+ *     S_IFLNK is not supported; use symlinkat() for symbolic links. Permission
+ *     bits (low 12 bits: 07777) may include read/write/execute for
+ *     user/group/other plus setuid/setgid/sticky bits.
+ *
+ * param: dev
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: For character and block special files (S_IFCHR, S_IFBLK),
+ *     specifies the device number encoded via makedev(major, minor). The
+ *     kernel decodes this using new_decode_dev() to extract major and minor
+ *     numbers. For regular files, FIFOs, and sockets, this parameter is
+ *     ignored and should be 0. Maximum major number is 2^12-1 (4095) and
+ *     maximum minor number is 2^20-1 (1048575) in the new device number
+ *     format.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The filesystem node has been created with the
+ *     requested type and permissions (as modified by umask). For device nodes,
+ *     the device number has been recorded in the inode.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The parent directory does not allow write permission to the process,
+ *     or one of the directories in the pathname prefix did not allow search
+ *     (execute) permission. Also returned if the filesystem does not support
+ *     the creation of the requested node type (e.g., socket creation on some
+ *     filesystems). Can also occur when an LSM denies the operation.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: The @dfd argument is not a valid file descriptor and @filename is
+ *     a relative path (not starting with '/'). Also returned if @dfd is valid
+ *     but does not refer to a directory when @filename is relative.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's quota of disk blocks or inodes on the filesystem has been
+ *     exhausted. This error is filesystem-dependent and may not be returned
+ *     by all filesystems.
+ *
+ * error: EEXIST, File exists
+ *   desc: A file or directory with the name @filename already exists. This
+ *     includes the case where @filename is a symbolic link (dangling or not).
+ *     Also returned for path components like "." or ".." that cannot be
+ *     created.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @filename pointer points outside the process's accessible
+ *     address space. This is detected when copying the pathname from user
+ *     space via strncpy_from_user().
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The @mode argument specifies an invalid file type in the S_IFMT
+ *     field. Valid types are: 0, S_IFREG, S_IFCHR, S_IFBLK, S_IFIFO, S_IFSOCK.
+ *     Also returned if the final pathname component is "." or "..".
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @filename.
+ *     The kernel limit is MAXSYMLINKS (typically 40 in a single path
+ *     resolution, 8 nested symlinks).
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: The @filename argument or one of its pathname components exceeds
+ *     the system limit. Individual components are limited to NAME_MAX (255)
+ *     bytes and the total path is limited to PATH_MAX (4096) bytes.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A directory component in @filename does not exist, or a symbolic
+ *     link in the path points to a nonexistent file (dangling symlink).
+ *     Also returned if the parent directory has been removed (IS_DEADDIR).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available. This can occur during
+ *     pathname allocation (getname()), dentry allocation (d_alloc()), or
+ *     inode allocation in the filesystem. Also returned when RCU-walk mode
+ *     cannot be completed and ref-walk allocation fails.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The filesystem has no room for the new node. This is returned by
+ *     the filesystem's mknod or create operation when disk space or inodes
+ *     are exhausted.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @filename is not a directory,
+ *     or @dfd refers to a file that is not a directory when @filename is
+ *     relative.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned in several cases: (1) @mode contains S_IFDIR (use mkdir
+ *     instead); (2) Creating a block or character special file requires
+ *     CAP_MKNOD and the process lacks this capability; (3) The filesystem
+ *     does not support the mknod operation (inode_operations->mknod is NULL);
+ *     (4) The parent directory is marked immutable (IS_IMMUTABLE); (5) The
+ *     device cgroup controller forbids creation of this device; (6) A Linux
+ *     Security Module denied the operation.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The parent directory resides on a read-only filesystem, or the
+ *     filesystem has been remounted read-only. This is checked both at the
+ *     mount level (mnt_want_write()) and superblock level.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The filesystem cannot represent the process's fsuid or fsgid. This
+ *     occurs with idmapped mounts when the mapped user/group ID cannot be
+ *     represented in the filesystem's ID space.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: On NFS and similar network filesystems, the file handle for a
+ *     directory in the path has become stale. The syscall will automatically
+ *     retry with LOOKUP_REVAL to revalidate the path.
+ *
+ * lock: parent_directory->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The parent directory's inode read-write semaphore is acquired
+ *     exclusively (I_MUTEX_PARENT nesting level) in start_dirop() before
+ *     the lookup and creation. This serializes concurrent modifications to
+ *     the directory. The lock is held while performing the lookup, security
+ *     checks, and the actual mknod/create operation. Released in end_dirop()
+ *     via end_creating_path() after the operation completes or fails.
+ *
+ * lock: sb->s_umount (implicit)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock's s_umount semaphore is acquired for reading via
+ *     sb_start_write() in mnt_want_write(). This prevents filesystem
+ *     freeze operations during the modification. Released via sb_end_write()
+ *     in end_creating_path().
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When waiting for a delegation to be broken (NFS lease)
+ *   desc: If a delegation exists on the parent directory (NFS server lease),
+ *     the syscall may block in break_deleg_wait() waiting for the delegation
+ *     holder to release it. This wait is interruptible by signals. If a
+ *     signal is received, the syscall returns -ERESTARTSYS which may be
+ *     translated to -EINTR for user space.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_CREATE
+ *   target: filesystem node (inode and dentry)
+ *   desc: Creates a new inode and directory entry in the filesystem. The
+ *     inode is allocated by the filesystem's mknod or create operation. A
+ *     dentry linking the name to the inode is created and hashed into the
+ *     dcache. The parent directory's modification and change times are
+ *     updated.
+ *   condition: Successful completion
+ *   reversible: yes (via unlink/rmdir)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: parent directory inode
+ *   desc: The parent directory's mtime and ctime are updated to reflect the
+ *     creation of a new entry. The directory's link count is not modified
+ *     (unlike mkdir). The parent directory inode is marked dirty.
+ *   condition: Successful completion
+ *   reversible: no
+ *
+ * capability: CAP_MKNOD
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Creation of block and character special files (device nodes)
+ *   without: Returns EPERM when attempting to create S_IFBLK or S_IFCHR
+ *     nodes (except whiteout devices with dev=WHITEOUT_DEV)
+ *   condition: Checked when mode & S_IFMT is S_IFCHR or S_IFBLK and the
+ *     device is not a whiteout (S_ISCHR && dev == WHITEOUT_DEV)
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control checks on parent directory
+ *   without: Must have write and execute permission on parent directory
+ *   condition: Checked during inode_permission() on parent directory
+ *
+ * constraint: Device cgroup controller
+ *   desc: If the device cgroup controller (CONFIG_CGROUP_DEVICE) is enabled
+ *     and the process is in a cgroup with device restrictions, creation of
+ *     block or character devices may be forbidden. The devcgroup_inode_mknod()
+ *     function checks whether the specific major:minor combination is allowed.
+ *     Returns EPERM if denied.
+ *
+ * constraint: LSM security hooks
+ *   desc: Linux Security Modules (SELinux, AppArmor, Smack, etc.) may impose
+ *     additional restrictions. The security_path_mknod() and
+ *     security_inode_mknod() hooks are called during the operation. These
+ *     hooks may return errors (typically EACCES) based on security policy.
+ *     For regular file creation (mode=0 or S_IFREG), security_path_post_mknod()
+ *     is called after successful creation to update inode security labels.
+ *
+ * constraint: Filesystem support
+ *   desc: The underlying filesystem must support the requested operation.
+ *     For device nodes, FIFOs, and sockets, inode_operations->mknod must be
+ *     implemented. For regular files, inode_operations->create must be
+ *     implemented. Filesystems like FAT do not support special files.
+ *     Returns EPERM or EACCES if unsupported.
+ *
+ * examples: mknodat(AT_FDCWD, "/dev/null", S_IFCHR | 0666, makedev(1, 3));
+ *   mknodat(dirfd, "myfifo", S_IFIFO | 0644, 0);  // Create FIFO
+ *   mknodat(dirfd, "regular.txt", 0644, 0);  // Create regular file (S_IFREG)
+ *   mknodat(AT_FDCWD, "mysocket", S_IFSOCK | 0755, 0);  // Create socket node
+ *
+ * notes: This syscall is POSIX.1-2008 compliant (specified as mknodat() in
+ *   the standard). It was added to Linux in version 2.6.16 as part of the
+ *   *at() family of syscalls, which enable race-free filesystem operations.
+ *
+ *   The traditional mknod() syscall is implemented as mknodat(AT_FDCWD, ...).
+ *
+ *   Creating a regular file with mknodat() is equivalent to using openat()
+ *   with O_CREAT | O_EXCL, except that mknodat() does not return a file
+ *   descriptor. For most use cases, open/openat with O_CREAT is preferred
+ *   for creating regular files.
+ *
+ *   Socket nodes created by mknod(S_IFSOCK) are not usable for network
+ *   communication. Unix domain sockets for IPC should be created via
+ *   socket(AF_UNIX) + bind(), which creates a different type of filesystem
+ *   node.
+ *
+ *   On NFS, mknodat() may interact with delegations (leases). If another
+ *   client holds a delegation on the parent directory, the operation may
+ *   block or retry while the delegation is recalled.
+ *
+ *   The @dev parameter format uses the new-style device number encoding:
+ *   bits 0-7 and 20-31 contain the minor number, bits 8-19 contain the
+ *   major number. Use makedev(3) to construct the value.
+ *
+ *   If @mode specifies S_IFREG or is 0, the syscall calls vfs_create()
+ *   internally instead of vfs_mknod(). This distinction matters because
+ *   different security hooks are invoked (security_inode_create vs
+ *   security_inode_mknod).
+ *
+ *   Unlike some other *at() syscalls, mknodat() does not accept flags
+ *   (AT_SYMLINK_NOFOLLOW, etc.). Symbolic links in the path are always
+ *   followed during resolution of parent directory components.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE4(mknodat, int, dfd, const char __user *, filename, umode_t, mode,
 		unsigned int, dev)
 {
