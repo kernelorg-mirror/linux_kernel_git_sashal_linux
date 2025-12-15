@@ -393,6 +393,238 @@ efault:
 	return false;
 }
 
+/**
+ * sys_getdents64 - Read directory entries into a user buffer
+ * @fd: File descriptor of an open directory
+ * @dirent: Pointer to user-space buffer for directory entries
+ * @count: Size of the user buffer in bytes
+ *
+ * long-desc: Reads multiple directory entries from a directory file descriptor
+ *   into a user-space buffer. Each entry is formatted as a struct linux_dirent64
+ *   containing the inode number (d_ino), offset to next entry (d_off), record
+ *   length (d_reclen), file type (d_type), and null-terminated filename (d_name).
+ *
+ *   The @fd must be a file descriptor obtained by opening a directory with open()
+ *   or openat(). The directory must have read permission for the calling process.
+ *
+ *   Entries are returned sequentially starting from the current file position.
+ *   The file position is automatically updated after each successful call.
+ *   Reading continues until the buffer cannot hold another complete entry or
+ *   the end of the directory is reached.
+ *
+ *   The d_type field indicates the file type using values from dirent.h:
+ *   DT_UNKNOWN (0), DT_FIFO (1), DT_CHR (2), DT_DIR (4), DT_BLK (6),
+ *   DT_REG (8), DT_LNK (10), DT_SOCK (12), DT_WHT (14). Not all filesystems
+ *   fill in d_type; if unknown, DT_UNKNOWN is returned and stat() should be
+ *   used to determine the file type.
+ *
+ *   The d_off field contains an opaque value that can be used with lseek(2)
+ *   to position the directory stream. It typically represents a cookie or
+ *   offset for the next entry but its exact meaning is filesystem-dependent.
+ *
+ *   Unlike getdents(), this syscall uses 64-bit types for d_ino and d_off,
+ *   avoiding overflow on filesystems with large inode numbers or offsets.
+ *   The d_reclen field is always aligned to 8 bytes.
+ *
+ *   If the directory contents change during iteration (files created or
+ *   deleted), the behavior is undefined - entries may be skipped or returned
+ *   multiple times. Applications should handle this if directory contents
+ *   may change.
+ *
+ *   The syscall may be interrupted by signals between directory entries.
+ *   However, some filesystems (e.g., FUSE) use FILLDIR_FLAG_NOINTR to prevent
+ *   signal interruption during the copying phase to userspace.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory that
+ *     was opened with read permission. The file descriptor table is accessed
+ *     via fdget_pos() which also acquires the file position lock to prevent
+ *     concurrent position modifications. If fd does not refer to a directory
+ *     (i.e., the file has no iterate_shared operation), ENOTDIR is returned.
+ *
+ * param: dirent
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid user-space buffer of at least @count
+ *     bytes. The buffer receives struct linux_dirent64 entries packed
+ *     sequentially. Each entry is variable-length due to the flexible d_name
+ *     array and is padded to 8-byte alignment. The buffer must remain valid
+ *     and writable throughout the syscall execution. A NULL or invalid pointer
+ *     causes EFAULT to be returned.
+ *
+ * param: count
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Size of the @dirent buffer in bytes. Must be large enough to
+ *     hold at least one struct linux_dirent64 entry (minimum ~24 bytes for a
+ *     single-character filename). If the first entry cannot fit in the buffer,
+ *     EINVAL is returned. A value of 0 will always return EINVAL since no
+ *     entries can be returned. Typical buffer sizes are 4096-32768 bytes for
+ *     efficient reading.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >=0
+ *   desc: On success, returns the number of bytes written to the @dirent buffer.
+ *     Returns 0 when the end of directory is reached (no more entries). The
+ *     return value indicates how much of the buffer was filled, not the number
+ *     of entries. Applications must parse the entries by following d_reclen
+ *     values until the return count is exhausted.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The @fd argument is not a valid open file descriptor. This is checked
+ *     early via fd_empty() after fdget_pos(). Can also occur if the file
+ *     descriptor table entry is empty or the fd number is out of range.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: The file descriptor @fd does not refer to a directory. This is
+ *     detected when the file's f_op->iterate_shared operation is NULL, which
+ *     is checked in iterate_dir(). Regular files, pipes, sockets, and other
+ *     non-directory file types will trigger this error.
+ *
+ * error: ENOENT, Directory removed
+ *   desc: The directory has been removed (unlinked) while still open. This is
+ *     detected via IS_DEADDIR(inode) after acquiring the inode lock. The
+ *     directory's contents are no longer accessible even though the file
+ *     descriptor is still valid.
+ *
+ * error: EFAULT, Bad user address
+ *   desc: The @dirent pointer is invalid or points to memory that cannot be
+ *     written. This is detected during user_write_access_begin() or put_user()
+ *     operations. Can occur at the start when setting up the initial entry or
+ *     when writing subsequent entries. If detected after some entries were
+ *     written, those bytes are lost.
+ *
+ * error: EINVAL, Buffer too small
+ *   desc: The @count parameter specifies a buffer that is too small to hold
+ *     even one directory entry. This occurs when the first entry's record
+ *     length (aligned name length plus fixed fields) exceeds @count. The
+ *     minimum practical buffer size depends on the longest filename in the
+ *     directory. Also returned if count is 0.
+ *
+ * error: EIO, Corrupted directory entry
+ *   desc: A directory entry has a corrupted name. This is detected by
+ *     verify_dirent_name() which rejects names containing '/' characters
+ *     (directory separators in pathnames) or names with invalid lengths
+ *     (<=0 or >= PATH_MAX). This indicates filesystem corruption that should
+ *     be investigated with fsck or similar tools.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The calling process does not have read permission on the directory.
+ *     This is checked via security_file_permission() with MAY_READ mask.
+ *     LSM modules (SELinux, AppArmor, etc.) may impose additional access
+ *     controls that result in this error.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: An LSM security module denied the operation. This can be returned by
+ *     security_file_permission() or fsnotify_file_perm() hooks. More specific
+ *     than EACCES and indicates policy-based denial rather than DAC permission
+ *     denial.
+ *
+ * lock: file->f_pos_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The file position mutex is acquired via fdget_pos() to serialize
+ *     directory reads on the same file descriptor from concurrent threads.
+ *     This ensures that file->f_pos updates are atomic with respect to the
+ *     directory iteration. The lock is held for the entire syscall duration
+ *     and released in fdput_pos().
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The directory inode's read-write semaphore is acquired for reading
+ *     via down_read_killable() in iterate_dir(). This protects the directory
+ *     contents from concurrent modifications (create, unlink, rename). The
+ *     lock acquisition is killable, meaning it can be interrupted by fatal
+ *     signals. The lock is downgraded or released before returning.
+ *
+ * signal: ANY
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Signal pending during inode lock acquisition or between entries
+ *   desc: The syscall can be interrupted by signals at two points. First,
+ *     during down_read_killable() on the inode lock, fatal signals will cause
+ *     immediate return. Second, between processing directory entries, a check
+ *     for signal_pending(current) allows any pending signal to interrupt
+ *     iteration. When interrupted, partial results (entries already copied)
+ *     are returned. If interrupted before any entries are copied, the error
+ *     from iterate_dir is returned. Some filesystems use FILLDIR_FLAG_NOINTR
+ *     to prevent signal checks between entries.
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_FILE_POSITION
+ *   target: File position (file->f_pos)
+ *   desc: The file position is updated to reflect the current position in the
+ *     directory after reading entries. The position is set from ctx->pos
+ *     which is updated by the filesystem's iterate_shared callback as entries
+ *     are emitted. The position value is opaque and filesystem-specific.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Directory inode access time
+ *   desc: The directory's access time (atime) is updated via file_accessed()
+ *     unless the file was opened with O_NOATIME or the filesystem is mounted
+ *     with noatime/relatime options. This modification is performed after
+ *     successful directory iteration. The update may be deferred based on
+ *     relatime rules.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify access event
+ *   desc: An FS_ACCESS fsnotify event is generated via fsnotify_access() after
+ *     successful directory iteration. This allows inotify/fanotify watchers
+ *     to be notified of directory reads. The event includes the directory's
+ *     dentry and inode information.
+ *   reversible: no
+ *
+ * constraint: File must be a directory
+ *   desc: The file descriptor must reference a directory that implements the
+ *     iterate_shared file operation. Regular files and other file types do not
+ *     support directory iteration and will return ENOTDIR.
+ *
+ * constraint: Minimum buffer size
+ *   desc: The buffer must be large enough to hold at least one directory entry.
+ *     The minimum size is the aligned size of struct linux_dirent64 plus the
+ *     shortest possible filename (1 byte) plus null terminator. In practice,
+ *     buffers should be at least several hundred bytes to efficiently read
+ *     typical directory entries.
+ *
+ * examples: getdents64(fd, buf, sizeof(buf));  // Read entries from directory fd
+ *   getdents64(dirfd, dirents, 4096);  // Typical buffer size for efficient reading
+ *
+ * notes: This is the preferred syscall for reading directory entries on 64-bit
+ *   systems. The older getdents() syscall may overflow on filesystems with
+ *   large inode numbers (returning EOVERFLOW). Applications should typically
+ *   use the POSIX readdir(3) wrapper from glibc which handles buffering and
+ *   provides a simpler interface. However, direct use of getdents64() can be
+ *   more efficient for applications that need to read many directory entries.
+ *
+ *   The d_off value written to the last entry's d_off field after the syscall
+ *   returns represents the position for the next entry. This is stored via
+ *   put_user() after all entries have been copied.
+ *
+ *   On some filesystems, the d_type field may be DT_UNKNOWN even when the
+ *   type is known, as filling in d_type requires additional disk reads on
+ *   some filesystem layouts. Applications must handle this by calling stat()
+ *   when d_type is DT_UNKNOWN and the type is needed.
+ *
+ *   The syscall was introduced in Linux 2.4 to handle large filesystems.
+ *   It is available on all modern Linux architectures. The x86_64 syscall
+ *   number is 217, and on i386 it is 220.
+ *
+ * since-version: 2.4
+ */
 SYSCALL_DEFINE3(getdents64, unsigned int, fd,
 		struct linux_dirent64 __user *, dirent, unsigned int, count)
 {
