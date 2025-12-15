@@ -6921,6 +6921,379 @@ out_putnames:
 	return error;
 }
 
+/**
+ * sys_linkat - create a hard link to a file relative to directory fds
+ * @olddfd: file descriptor of directory containing source, or AT_FDCWD
+ * @oldname: pathname of existing file to link to
+ * @newdfd: file descriptor of directory containing destination, or AT_FDCWD
+ * @newname: pathname for the new hard link
+ * @flags: behavior modifiers (AT_SYMLINK_FOLLOW, AT_EMPTY_PATH)
+ *
+ * long-desc: Creates a new hard link to an existing file. The new link
+ *   @newname is created in the directory referenced by @newdfd, pointing to
+ *   the existing file @oldname in the directory referenced by @olddfd. Both
+ *   paths are interpreted relative to their respective directory file
+ *   descriptors unless they are absolute paths (starting with '/'), in which
+ *   case the corresponding directory fd is ignored.
+ *
+ *   Hard links create additional directory entries for the same inode. The
+ *   source and destination must reside on the same mounted filesystem (hard
+ *   links cannot span mount points). The file's link count (i_nlink) is
+ *   incremented. When all links to a file are removed and no processes have
+ *   the file open, the inode and its data blocks are freed.
+ *
+ *   By default, if @oldname is a symbolic link, the link is created to the
+ *   symbolic link itself, not the target. Use AT_SYMLINK_FOLLOW to follow
+ *   symbolic links and create a link to the target file instead.
+ *
+ *   The AT_EMPTY_PATH flag (since Linux 2.6.39) allows @oldname to be an
+ *   empty string, in which case @olddfd must be a file descriptor referring
+ *   to the file to be linked. This is sometimes called "flink" functionality.
+ *   When using AT_EMPTY_PATH, either the file descriptor must have been
+ *   opened with the same credentials as the current process, or the caller
+ *   must have CAP_DAC_READ_SEARCH capability in the opener's user namespace.
+ *   This restriction prevents security bypasses where a privileged process
+ *   passes an fd to an unprivileged process which could then create a path
+ *   to the file in a location it shouldn't have access to.
+ *
+ *   Linux enforces hardlink restrictions (controlled by
+ *   /proc/sys/fs/protected_hardlinks, default enabled) to prevent
+ *   time-of-check-time-of-use vulnerabilities. When enabled, users can only
+ *   create hardlinks to files they own or have read/write access to, unless
+ *   they have CAP_FOWNER capability.
+ *
+ *   Creating hard links to directories is not permitted (returns EPERM).
+ *   Creating links to files with zero link count (unlinked but still open)
+ *   is forbidden unless the file was created with O_TMPFILE and has the
+ *   I_LINKABLE flag set.
+ *
+ *   This syscall was added in Linux 2.6.16 as part of the *at() family,
+ *   enabling race-free filesystem operations relative to directory fds.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: olddfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory or
+ *     a file (when AT_EMPTY_PATH is set), or the special value AT_FDCWD
+ *     (-100). If @oldname is an absolute path, @olddfd is ignored. When
+ *     @oldname is relative and AT_EMPTY_PATH is not set, @olddfd must refer
+ *     to a directory. When AT_EMPTY_PATH is set and @oldname is empty,
+ *     @olddfd must refer to the file to be linked (not a directory). O_PATH
+ *     file descriptors are supported.
+ *
+ * param: oldname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. Path components are limited to NAME_MAX (255) bytes
+ *     each, and the total path length must not exceed PATH_MAX (4096) bytes.
+ *     May be an empty string only if AT_EMPTY_PATH flag is specified, in
+ *     which case @olddfd must refer to the target file. Symbolic links in
+ *     the path are not followed unless AT_SYMLINK_FOLLOW is specified.
+ *
+ * param: newdfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a directory, or
+ *     the special value AT_FDCWD (-100). If @newname is an absolute path,
+ *     @newdfd is ignored. When @newname is relative, @newdfd must refer to a
+ *     directory; otherwise ENOTDIR is returned. The directory must have
+ *     execute permission for path resolution. O_PATH file descriptors are
+ *     supported.
+ *
+ * param: newname
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid pointer to a null-terminated pathname string
+ *     in user space. The path must not be empty. Path components are limited
+ *     to NAME_MAX (255) bytes each, and the total path length must not exceed
+ *     PATH_MAX (4096) bytes. The final component must be a normal name (not
+ *     ".", "..", or empty). Symbolic links are never followed on the final
+ *     component (the link target itself). The name must not already exist.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: AT_SYMLINK_FOLLOW | AT_EMPTY_PATH
+ *   constraint: Must be 0 or a bitwise OR of supported flags. AT_SYMLINK_FOLLOW
+ *     (0x400) causes symbolic links in @oldname to be dereferenced. AT_EMPTY_PATH
+ *     (0x1000) allows @oldname to be empty, treating @olddfd as the target file.
+ *     Any other bits set result in EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. A new directory entry has been created linking
+ *     @newname to the same inode as @oldname. The file's link count has been
+ *     incremented.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Write permission is denied for the directory containing @newname,
+ *     or search (execute) permission is denied for a directory in either
+ *     pathname prefix. Also returned when protected_hardlinks sysctl is
+ *     enabled and the caller lacks read/write permission to the source file
+ *     and doesn't own it. Can occur when an LSM denies the operation.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: @olddfd or @newdfd is not a valid file descriptor and the
+ *     corresponding path is relative (not starting with '/'). Also returned
+ *     when AT_EMPTY_PATH is used with an empty @oldname and @olddfd is not
+ *     a valid file descriptor.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's quota of disk blocks or inodes on the filesystem has
+ *     been exhausted. This is filesystem-dependent.
+ *
+ * error: EEXIST, File exists
+ *   desc: A file with the name @newname already exists. This includes
+ *     symbolic links (dangling or not). Hard links require the target name
+ *     to not exist.
+ *
+ * error: EFAULT, Bad address
+ *   desc: @oldname or @newname points outside the process's accessible
+ *     address space.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: The @flags argument contains bits other than AT_SYMLINK_FOLLOW and
+ *     AT_EMPTY_PATH. Also returned if the final component of @newname is
+ *     "." or "..".
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving @oldname
+ *     or @newname. The kernel limit is MAXSYMLINKS (typically 40 total in a
+ *     single path resolution, with at most 8 nested symlinks).
+ *
+ * error: EMLINK, Too many links
+ *   desc: The file to which @oldname refers already has the maximum number
+ *     of links. The limit is filesystem-dependent (e.g., 65000 on ext4,
+ *     65535 on btrfs).
+ *
+ * error: ENAMETOOLONG, File name too long
+ *   desc: @oldname or @newname, or a pathname component within them, is too
+ *     long. Individual components are limited to NAME_MAX (255) bytes, and
+ *     the total path is limited to PATH_MAX (4096) bytes.
+ *
+ * error: ENOENT, No such file or directory
+ *   desc: A directory component in @oldname or @newname does not exist, or
+ *     @oldname refers to a nonexistent file, or is a dangling symbolic link
+ *     (when AT_SYMLINK_FOLLOW is used). Also returned when AT_EMPTY_PATH is
+ *     used with mismatched credentials and the caller lacks CAP_DAC_READ_SEARCH.
+ *     Also returned if the source inode has zero link count (was deleted) and
+ *     is not I_LINKABLE.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory. Can occur during pathname allocation,
+ *     dentry allocation, or when RCU-walk fallback requires memory allocation.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The device containing @newname has no room for a new directory
+ *     entry.
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: A component used as a directory in @oldname or @newname is not a
+ *     directory. Also returned if @olddfd or @newdfd refers to a non-directory
+ *     when the corresponding pathname is relative and non-empty.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The source file's uid or gid cannot be represented in the
+ *     filesystem's ID space. Occurs with idmapped mounts when the mapped
+ *     user/group ID is invalid.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned in several cases: (1) @oldname refers to a directory
+ *     (hard links to directories are forbidden); (2) the source file has
+ *     the append-only (S_APPEND) or immutable (S_IMMUTABLE) attribute set;
+ *     (3) the filesystem does not support hard links (no link operation);
+ *     (4) protected_hardlinks is enabled and the caller doesn't own the
+ *     source file, doesn't have read/write access, and the source is not
+ *     a safe hardlink target (setuid/setgid/not regular file);
+ *     (5) the inode has HAS_UNMAPPED_ID set (unmapped uid/gid);
+ *     (6) an LSM denied the operation.
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The filesystem containing @newname is mounted read-only, or has
+ *     been remounted read-only.
+ *
+ * error: ESTALE, Stale file handle
+ *   desc: On NFS and similar network filesystems, a file handle for a
+ *     directory in the path has become stale. The syscall automatically
+ *     retries with LOOKUP_REVAL to revalidate the path.
+ *
+ * error: EXDEV, Cross-device link
+ *   desc: @oldname and @newname are on different mounted filesystems. Hard
+ *     links cannot span mount points.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The syscall was interrupted by a signal while waiting for a
+ *     delegation to be broken. This can occur on NFS when another client
+ *     holds a delegation on the source file or parent directory.
+ *
+ * lock: new_parent_directory->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The parent directory's inode read-write semaphore (containing
+ *     @newname) is acquired exclusively (I_MUTEX_PARENT nesting level) in
+ *     start_dirop() before the lookup and link creation. This serializes
+ *     concurrent modifications to the directory. Released in end_creating_path()
+ *     after the operation completes or fails.
+ *
+ * lock: source_inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The source file's inode semaphore is acquired via inode_lock() in
+ *     vfs_link() to serialize link count modifications and prevent races with
+ *     concurrent operations. Released via inode_unlock() before returning.
+ *
+ * lock: sb->s_umount (implicit)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The superblock's s_umount semaphore is acquired for reading via
+ *     sb_start_write() in mnt_want_write(). This prevents filesystem freeze
+ *     operations during the modification. Released via sb_end_write() in
+ *     end_creating_path().
+ *
+ * signal: Any catchable signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When waiting for a delegation to be broken (NFS lease)
+ *   desc: If a delegation exists on the source file or parent directory
+ *     (NFS server lease), the syscall may block in break_deleg_wait() waiting
+ *     for the delegation holder to release it. This wait is interruptible by
+ *     signals. If a signal is received, the syscall returns -EINTR.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_RESOURCE_CREATE
+ *   target: directory entry (dentry)
+ *   desc: Creates a new directory entry @newname that references the same
+ *     inode as @oldname. The dentry is created and hashed into the dcache.
+ *     No new inode is allocated; the existing inode gains an additional
+ *     reference through the new directory entry.
+ *   condition: Successful completion
+ *   reversible: yes (via unlink)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: source file inode
+ *   desc: The source file's link count (i_nlink) is incremented. The inode's
+ *     ctime is updated to the current time. If the inode had the I_LINKABLE
+ *     flag set (from O_TMPFILE creation), this flag is cleared.
+ *   condition: Successful completion
+ *   reversible: partially (unlink decrements link count but ctime change is permanent)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: new parent directory inode
+ *   desc: The parent directory's mtime and ctime are updated to reflect the
+ *     addition of a new entry. The directory inode is marked dirty.
+ *   condition: Successful completion
+ *   reversible: no
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Using AT_EMPTY_PATH with a file descriptor opened by different
+ *     credentials, bypassing the credential equality check for flink
+ *   without: When AT_EMPTY_PATH is used with an fd opened under different
+ *     credentials, returns ENOENT
+ *   condition: Checked when flags includes AT_EMPTY_PATH and the file's
+ *     open-time credentials don't match the current process credentials
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Creating hardlinks to files not owned by the caller when
+ *     protected_hardlinks is enabled, bypassing ownership restrictions
+ *   without: When protected_hardlinks sysctl is enabled (default), can only
+ *     hardlink to files owned by caller or with read/write access
+ *   condition: Checked in may_linkat() when source file is not owned by
+ *     caller and protected_hardlinks sysctl is set to 1
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypassing discretionary access control checks on directories
+ *     during path resolution and permission checking
+ *   without: Must have appropriate permissions (write+execute on parent
+ *     directory, read+write on source file for protected_hardlinks)
+ *   condition: Checked during inode_permission() calls on path components
+ *
+ * constraint: protected_hardlinks sysctl
+ *   desc: When /proc/sys/fs/protected_hardlinks is set to 1 (default), users
+ *     can only create hardlinks to files they own or have read/write access
+ *     to, unless they have CAP_FOWNER. This prevents a class of TOCTOU
+ *     attacks in world-writable directories. Additionally, setuid/setgid
+ *     files and non-regular files are considered unsafe for linking by
+ *     non-owners.
+ *
+ * constraint: LSM security hooks
+ *   desc: Linux Security Modules (SELinux, AppArmor, Smack, etc.) may impose
+ *     additional restrictions. Both security_path_link() and
+ *     security_inode_link() hooks are called during the operation. These
+ *     hooks may return errors (typically EACCES or EPERM) based on security
+ *     policy.
+ *
+ * constraint: Same filesystem
+ *   desc: Hard links can only be created within the same mounted filesystem.
+ *     Attempting to link across mount points (even if same underlying device)
+ *     returns EXDEV.
+ *
+ * constraint: No directory hardlinks
+ *   desc: Creating hard links to directories is forbidden by the kernel to
+ *     prevent filesystem corruption (directory loops). Returns EPERM if
+ *     @oldname refers to a directory.
+ *
+ * constraint: Link count limit
+ *   desc: Each filesystem has a maximum link count (s_max_links). When a
+ *     file reaches this limit, no more hardlinks can be created. The limit
+ *     is typically 65000 (ext4) or 65535 (btrfs). Returns EMLINK when limit
+ *     is reached.
+ *
+ * examples: linkat(AT_FDCWD, "existing.txt", AT_FDCWD, "newlink.txt", 0);
+ *   linkat(dirfd, "file", dirfd, "hardlink", 0);  // In same directory
+ *   linkat(srcfd, "a", dstfd, "b", 0);  // Different directories
+ *   linkat(fd, "", AT_FDCWD, "/tmp/newname", AT_EMPTY_PATH);  // flink pattern
+ *   linkat(AT_FDCWD, "symlink", AT_FDCWD, "link", AT_SYMLINK_FOLLOW);
+ *
+ * notes: This syscall is specified in POSIX.1-2008 and was added to Linux in
+ *   version 2.6.16.
+ *
+ *   The traditional link() syscall is implemented as linkat(AT_FDCWD, oldpath,
+ *   AT_FDCWD, newpath, 0).
+ *
+ *   Unlike many *at() syscalls, linkat() does not have an AT_SYMLINK_NOFOLLOW
+ *   flag because not following symlinks is the default behavior for the
+ *   source path. Use AT_SYMLINK_FOLLOW explicitly if dereferencing is desired.
+ *
+ *   The AT_EMPTY_PATH feature (flink) has had a complex history due to security
+ *   concerns about allowing unprivileged users to create paths to files they
+ *   only have file descriptors for. Since Linux 6.10, this is relaxed to allow
+ *   flink when the fd was opened with the same credentials as the linkat caller,
+ *   without requiring CAP_DAC_READ_SEARCH. This allows common patterns like
+ *   O_TMPFILE followed by linkat() to work without privileges.
+ *
+ *   On NFS, linkat() may interact with delegations (leases). If another client
+ *   holds a delegation on the source file or parent directory, the operation
+ *   may block while the delegation is recalled. The wait is interruptible.
+ *
+ *   Unlike symbolic links, hard links cannot span filesystems and cannot point
+ *   to directories. They share the same inode, so changes to file content are
+ *   visible through all links. Permissions, ownership, and timestamps are
+ *   properties of the inode, not the link, so all hard links share these.
+ *
+ *   When the source file was created with O_TMPFILE, it initially has link
+ *   count 0 but has the I_LINKABLE flag allowing it to be linked via linkat()
+ *   with AT_EMPTY_PATH. After successful linking, I_LINKABLE is cleared.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE5(linkat, int, olddfd, const char __user *, oldname,
 		int, newdfd, const char __user *, newname, int, flags)
 {
