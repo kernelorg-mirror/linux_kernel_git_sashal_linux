@@ -1409,10 +1409,235 @@ do_group_exit(int exit_code)
 	/* NOTREACHED */
 }
 
-/*
- * this kills every thread in the thread group. Note that any externally
- * wait4()-ing process will get the correct exit code - even if this
- * thread is not the thread group leader.
+/**
+ * sys_exit_group - Terminate all threads in the calling process
+ * @error_code: Exit status code returned to the parent process
+ *
+ * long-desc: Terminates all threads in the calling thread group (i.e., the
+ *   entire process) immediately. This is the syscall invoked by glibc's
+ *   _exit(2) wrapper since glibc 2.3, making it the standard way for
+ *   processes to terminate. Only the low 8 bits of error_code are used;
+ *   these bits are shifted left by 8 and stored as the wait status.
+ *
+ *   Unlike sys_exit which only terminates the calling thread, exit_group
+ *   ensures that all threads in the process are terminated atomically.
+ *   This is achieved by setting the SIGNAL_GROUP_EXIT flag and sending
+ *   SIGKILL to all other threads via zap_other_threads().
+ *
+ *   The exit code handling follows these rules:
+ *   - If SIGNAL_GROUP_EXIT is already set (another thread initiated group
+ *     exit first), the existing group_exit_code is used instead
+ *   - If an exec is in progress (group_exec_task is set), exit code is 0
+ *   - Otherwise, this thread's exit code becomes the group exit code
+ *
+ *   Any process waiting via wait4() or related calls will receive the
+ *   correct exit code regardless of which thread called exit_group, as
+ *   the group_exit_code is stored in the shared signal_struct.
+ *
+ *   The cleanup sequence is the same as sys_exit (via do_exit()) but
+ *   affects all threads:
+ *   - Send SIGKILL to all other threads in the thread group
+ *   - Synchronize with group exit and any pending coredump
+ *   - Notify ptrace debuggers via PTRACE_EVENT_EXIT
+ *   - Cancel io_uring operations
+ *   - Set PF_EXITING flag on each thread
+ *   - Release seccomp filters
+ *   - Record process accounting data
+ *   - Stop POSIX timers (when last thread exits)
+ *   - Release memory address space
+ *   - Release SysV semaphore undo structures
+ *   - Detach from shared memory segments
+ *   - Close all open file descriptors
+ *   - Release filesystem context
+ *   - Disassociate from controlling terminal
+ *   - Leave namespaces
+ *   - Reparent children to init or subreaper
+ *   - Send SIGCHLD to parent
+ *   - Transition to zombie state
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: error_code
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: INT_MIN, INT_MAX
+ *   constraint: Any integer value is accepted. Only the low 8 bits
+ *     (error_code & 0xff) are used; all other bits are masked off. The
+ *     resulting value is shifted left by 8 before being stored as the
+ *     exit code, producing values in the range 0x0000-0xFF00. Conventionally,
+ *     values 0-255 are used, with 0 indicating success and non-zero values
+ *     indicating various error conditions defined by the application.
+ *
+ * return:
+ *   type: KAPI_TYPE_VOID
+ *   check-type: KAPI_RETURN_NO_RETURN
+ *   success: never returns
+ *   desc: This syscall never returns to the caller. All threads in the
+ *     thread group are terminated. The exit status becomes available to
+ *     the parent process via wait(2) family calls. If the parent has set
+ *     SIGCHLD to SIG_IGN or used SA_NOCLDWAIT, the process is automatically
+ *     reaped without becoming a zombie.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The signal handler spinlock is acquired in do_group_exit() to
+ *     atomically check/set SIGNAL_GROUP_EXIT flag and store the group exit
+ *     code. Also acquired multiple times during do_exit() processing for
+ *     signal coordination, coredump synchronization, and parent notification.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global task list rwlock is acquired for writing in exit_notify()
+ *     to safely reparent children, remove tasks from process lists, and
+ *     notify the parent. Protects parent/child relationships and task
+ *     list integrity.
+ *
+ * lock: mm->mmap_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The memory map read-write semaphore is acquired for reading in
+ *     exit_mm() during address space teardown. Synchronizes with other
+ *     threads accessing the memory map.
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: Always sent to all other threads in the thread group
+ *   desc: zap_other_threads() adds SIGKILL to the pending signal set of
+ *     every other thread in the thread group and wakes them up. This
+ *     ensures all threads terminate regardless of their current state
+ *     (blocked, sleeping, etc.). Each thread will process the SIGKILL
+ *     and call do_exit() independently.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: SIGCHLD
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When the thread group leader exits (last thread to exit)
+ *   desc: Sends SIGCHLD to the parent process to notify it of the child's
+ *     termination. The signal carries information about the exit status
+ *     (si_status), termination cause (CLD_EXITED), and resource usage.
+ *     If parent has SIGCHLD set to SIG_IGN or SA_NOCLDWAIT, no signal is
+ *     sent and the process is auto-reaped.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * signal: SIGHUP
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When exit orphans a process group with stopped members
+ *   desc: Sends SIGHUP followed by SIGCONT to newly orphaned process groups
+ *     that have stopped members. This implements POSIX semantics for orphaned
+ *     process groups.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE | KAPI_EFFECT_IRREVERSIBLE
+ *   target: All threads in thread group
+ *   desc: Terminates all threads in the calling process. Each thread's
+ *     task_struct transitions through EXIT_ZOMBIE state and eventually to
+ *     EXIT_DEAD. This is irreversible - the entire process is terminated.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FREE_MEMORY
+ *   target: Address space (mm_struct)
+ *   desc: Releases all references to the address space. When the last thread
+ *     exits, all virtual memory mappings are unmapped, page tables are freed,
+ *     and physical pages are released.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: File descriptors
+ *   desc: Closes all open file descriptors for each thread. This may trigger
+ *     flush operations, release file locks, and free resources.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Child processes
+ *   desc: All child processes are reparented. The new parent is selected
+ *     in order: (1) a thread in the same thread group (but all are exiting),
+ *     (2) the nearest ancestor marked as child_subreaper, or (3) init (PID 1).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: POSIX timers
+ *   desc: When the last thread in the thread group exits, all POSIX timers
+ *     are destroyed and the real-time timer is canceled.
+ *   reversible: no
+ *
+ * state-trans: signal->flags SIGNAL_GROUP_EXIT
+ *   from: unset (or already set)
+ *   to: set
+ *   condition: First thread to call exit_group or receive fatal signal
+ *   desc: The SIGNAL_GROUP_EXIT flag is set atomically under siglock to
+ *     coordinate group-wide exit. If already set, the existing group_exit_code
+ *     is used. This ensures all threads exit with the same status.
+ *
+ * state-trans: task->exit_state
+ *   from: 0
+ *   to: EXIT_ZOMBIE
+ *   condition: When each thread enters exit_notify()
+ *   desc: Each thread's exit_state transitions to EXIT_ZOMBIE, indicating
+ *     it has exited but status has not been collected. The thread group
+ *     leader remains zombie until parent reaps it.
+ *
+ * state-trans: task->__state
+ *   from: TASK_RUNNING
+ *   to: TASK_DEAD
+ *   condition: At end of do_exit() for each thread
+ *   desc: Each thread's scheduling state transitions to TASK_DEAD and is
+ *     removed from the run queue permanently.
+ *
+ * constraint: Exec race handling
+ *   desc: If an exec() is in progress when exit_group() is called (indicated
+ *     by group_exec_task being set), the exit code is forced to 0. This
+ *     handles the race between exec and exit_group gracefully.
+ *
+ * constraint: Multiple exit_group race
+ *   desc: If multiple threads call exit_group() simultaneously, only the
+ *     first thread's exit code is used. Subsequent threads observe
+ *     SIGNAL_GROUP_EXIT already set and use the existing group_exit_code.
+ *     The siglock ensures atomicity of this check-and-set operation.
+ *
+ * constraint: Init process protection
+ *   desc: If the last thread of the global init process (PID 1) exits via
+ *     exit_group, the kernel panics with "Attempted to kill init!" rather
+ *     than allowing an uncontrolled system shutdown.
+ *
+ * constraint: Coredump synchronization
+ *   desc: If a coredump is in progress, exiting threads wait in
+ *     coredump_task_exit() until the dump completes. The PF_POSTCOREDUMP
+ *     flag is set to mark threads that have passed this synchronization.
+ *
+ * examples: _exit(0);  // glibc calls exit_group(0) internally
+ *   syscall(SYS_exit_group, 1);  // Direct syscall with error status
+ *   exit(EXIT_FAILURE);  // C library exit() eventually calls exit_group
+ *
+ * notes: This syscall is the preferred way to terminate a process. Since
+ *   glibc 2.3, the _exit() library function calls exit_group() rather than
+ *   the older sys_exit syscall. This ensures proper termination of all
+ *   threads in multi-threaded programs.
+ *
+ *   glibc does not provide a direct wrapper for exit_group(); callers must
+ *   use syscall(SYS_exit_group, status) or rely on _exit() which calls it.
+ *
+ *   The syscall was introduced specifically for NPTL (Native POSIX Thread
+ *   Library) to provide efficient thread group termination. Previously,
+ *   thread libraries had to manually signal each thread, which was slower
+ *   and had race conditions if threads were killed externally.
+ *
+ *   The return value of 0 in the syscall definition is never reached since
+ *   do_group_exit() is marked __noreturn. It exists only to satisfy the
+ *   SYSCALL_DEFINE macro requirements.
+ *
+ *   When a fatal signal (like SIGSEGV) kills a process, the kernel also
+ *   uses do_group_exit() to ensure all threads are terminated together.
+ *
+ * since-version: 2.5.35
  */
 SYSCALL_DEFINE1(exit_group, int, error_code)
 {
