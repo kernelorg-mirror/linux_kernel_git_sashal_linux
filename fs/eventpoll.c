@@ -3053,6 +3053,328 @@ static int do_epoll_pwait(int epfd, struct epoll_event __user *events,
 	return error;
 }
 
+/**
+ * sys_epoll_pwait - Wait for events on an epoll instance with signal mask
+ * @epfd: File descriptor referring to the epoll instance
+ * @events: Pointer to userspace buffer to receive ready events
+ * @maxevents: Maximum number of events to return
+ * @timeout: Timeout in milliseconds (-1 for infinite, 0 for immediate return)
+ * @sigmask: Signal mask to apply during the wait, or NULL for no change
+ * @sigsetsize: Size of the signal mask in bytes (must equal sizeof(sigset_t))
+ *
+ * long-desc: Waits for events on the epoll file descriptor @epfd, atomically
+ *   replacing the calling thread's signal mask with @sigmask while blocked.
+ *   This syscall enables safe waiting for either file descriptor readiness
+ *   or signal delivery, avoiding race conditions between signal checking
+ *   and entering the wait state.
+ *
+ *   The relationship between epoll_wait() and epoll_pwait() is analogous to
+ *   the relationship between select(2) and pselect(2). The call:
+ *
+ *     ready = epoll_pwait(epfd, events, maxevents, timeout, &sigmask, sigsetsize);
+ *
+ *   is equivalent to atomically executing:
+ *
+ *     sigset_t origmask;
+ *     pthread_sigmask(SIG_SETMASK, &sigmask, &origmask);
+ *     ready = epoll_wait(epfd, events, maxevents, timeout);
+ *     pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+ *
+ *   If @sigmask is NULL, epoll_pwait() behaves identically to epoll_wait().
+ *
+ *   The kernel examines the ready list maintained by epoll_ctl() and returns
+ *   information about file descriptors that have pending events. Events are
+ *   copied to the user-provided buffer up to @maxevents entries. Each entry
+ *   contains the events mask and the user data associated with the fd.
+ *
+ *   For level-triggered mode (default), file descriptors remain on the ready
+ *   list and are returned on subsequent calls as long as events persist. For
+ *   edge-triggered mode (EPOLLET), file descriptors are returned only once
+ *   when the condition changes. For EPOLLONESHOT mode, the events mask is
+ *   cleared after delivery, requiring epoll_ctl(EPOLL_CTL_MOD) to re-arm.
+ *
+ *   The timeout specifies the minimum wait time in milliseconds. A timeout
+ *   of -1 blocks indefinitely until events are available or a signal arrives.
+ *   A timeout of 0 returns immediately with any currently ready events
+ *   (non-blocking poll). Positive values specify the maximum wait time,
+ *   rounded up to system clock granularity. CLOCK_MONOTONIC is used for
+ *   timing to ensure consistent behavior across system clock adjustments.
+ *
+ *   When interrupted by a signal, the original signal mask is NOT restored
+ *   before returning -EINTR. Instead, the kernel sets TIF_RESTORE_SIGMASK
+ *   and the signal delivery mechanism restores the mask. This ensures the
+ *   signal handler runs with the @sigmask in effect, allowing proper signal
+ *   handling semantics.
+ *
+ *   The syscall may perform busy polling on network sockets if enabled via
+ *   /proc/sys/net/core/busy_poll or per-epoll settings via ioctl, which can
+ *   reduce latency for high-frequency network I/O at the cost of CPU usage.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: epfd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to an epoll instance
+ *     created by epoll_create() or epoll_create1(). The kernel verifies the
+ *     underlying file has eventpoll_fops file_operations via is_file_epoll().
+ *     Using a non-epoll fd returns EINVAL. Using an invalid fd returns EBADF.
+ *
+ * param: events
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a writable userspace buffer capable of holding
+ *     at least @maxevents struct epoll_event entries. Each entry is 12 bytes
+ *     on most architectures (4-byte events mask + 8-byte data). The kernel
+ *     validates write access via access_ok() before waiting. If the buffer
+ *     becomes inaccessible during event delivery, -EFAULT is returned and
+ *     some events may be lost. The events field contains the ready event
+ *     mask (EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, etc.) and the data field
+ *     contains the user data associated with the fd via epoll_ctl().
+ *
+ * param: maxevents
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, INT_MAX
+ *   constraint: Must be greater than zero and not exceed EP_MAX_EVENTS
+ *     (INT_MAX / sizeof(struct epoll_event), approximately 178 million on
+ *     64-bit systems). This limit prevents integer overflow when calculating
+ *     the buffer size. Passing 0 or negative values returns EINVAL. The
+ *     practical limit is typically determined by available memory for the
+ *     userspace buffer and the number of registered file descriptors.
+ *
+ * param: timeout
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Specifies the wait timeout in milliseconds. Value -1 means
+ *     block indefinitely until events are ready or interrupted by a signal.
+ *     Value 0 returns immediately with any ready events (non-blocking check).
+ *     Positive values specify the maximum wait time, rounded up to system
+ *     clock granularity (typically 1-4ms on most systems). Internally
+ *     converted to struct timespec64 via ep_timeout_to_timespec() and uses
+ *     CLOCK_MONOTONIC for timing. Very large values (approaching INT_MAX)
+ *     are handled correctly via timespec64_add_safe().
+ *
+ * param: sigmask
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: If non-NULL, must point to a readable sigset_t in userspace
+ *     specifying the signal mask to apply during the wait. The mask replaces
+ *     the current signal mask (SIG_SETMASK semantics) for the duration of
+ *     the wait. SIGKILL and SIGSTOP cannot be blocked and are always
+ *     deliverable. If NULL, the signal mask is not modified and the syscall
+ *     behaves like epoll_wait(). The original mask is saved in
+ *     current->saved_sigmask and restored appropriately based on whether
+ *     the call was interrupted by a signal.
+ *
+ * param: sigsetsize
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must equal sizeof(sigset_t) (8 bytes on most 64-bit systems,
+ *     4 bytes on some 32-bit systems). This parameter exists for ABI
+ *     compatibility and future extensibility. If @sigmask is NULL, this
+ *     parameter is not validated. If @sigmask is non-NULL and sigsetsize
+ *     does not match sizeof(sigset_t), -EINVAL is returned. The compat
+ *     syscall uses sizeof(compat_sigset_t) instead.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: 0 to maxevents
+ *   desc: On success, returns the number of file descriptors ready for I/O,
+ *     which may be zero if the timeout expired before any events occurred.
+ *     The events buffer contains information about each ready fd. The return
+ *     value is bounded by @maxevents. If more events are ready than can fit
+ *     in the buffer, remaining events stay on the ready list for the next
+ *     call. For level-triggered fds, the same fd may be returned on
+ *     subsequent calls if the condition persists.
+ *
+ * error: EBADF, Invalid epoll file descriptor
+ *   desc: The @epfd argument is not a valid file descriptor. This occurs when
+ *     epfd is negative, exceeds the process's file descriptor limit, or refers
+ *     to a file descriptor that has been closed. The kernel checks this via
+ *     fdget() early in do_epoll_wait(), before any locking or signal mask
+ *     modifications. Note: if epfd is valid but not an epoll fd, EINVAL is
+ *     returned instead.
+ *
+ * error: EFAULT, Invalid memory access
+ *   desc: Either @events points to memory outside the accessible address space,
+ *     @sigmask is non-NULL and points to unreadable memory, or the events
+ *     buffer became inaccessible during event delivery. For @events, access
+ *     is verified via access_ok() in ep_check_params(). For @sigmask, access
+ *     is verified via copy_from_user() in set_user_sigmask(). During event
+ *     delivery in ep_send_events(), if __put_user() fails, -EFAULT is returned
+ *     and some events may have already been written. The signal mask is
+ *     restored before returning in this case.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: A signal was delivered to the calling thread before any events
+ *     became ready and before the timeout expired. The signal mask specified
+ *     by @sigmask (if any) determines which signals can cause this interruption.
+ *     When interrupted, the original signal mask is NOT immediately restored;
+ *     instead, TIF_RESTORE_SIGMASK is set and the mask is restored during
+ *     signal delivery or before return to userspace. This allows the signal
+ *     handler to run with the @sigmask in effect. The application should
+ *     typically retry the call or handle the signal appropriately. SA_RESTART
+ *     does not apply to epoll_pwait(); the caller must always handle EINTR.
+ *
+ * error: EINVAL, Invalid parameters
+ *   desc: Returned for multiple invalid parameter conditions: (1) @epfd refers
+ *     to a valid file descriptor that is not an epoll instance (checked via
+ *     is_file_epoll() in ep_check_params()), (2) @maxevents is less than or
+ *     equal to zero, (3) @maxevents exceeds EP_MAX_EVENTS (INT_MAX /
+ *     sizeof(struct epoll_event)), (4) @sigmask is non-NULL but @sigsetsize
+ *     does not equal sizeof(sigset_t). The first three conditions are checked
+ *     in ep_check_params(), the fourth in set_user_sigmask(). These checks
+ *     happen before any signal mask modification, so the original mask is
+ *     preserved on error.
+ *
+ * lock: ep->mtx
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The per-epoll instance mutex is acquired in ep_send_events() via
+ *     mutex_lock(&ep->mtx) before scanning the ready list and released after
+ *     event delivery completes. This mutex serializes event collection with
+ *     epoll_ctl() operations and file cleanup, ensuring consistent state.
+ *     The mutex is held while copying events to userspace, which may sleep.
+ *     If no events are immediately available, the mutex is not held during
+ *     the wait period; it is acquired only when events are being delivered.
+ *
+ * lock: ep->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-epoll spinlock is acquired with IRQs disabled at several
+ *     points: (1) in ep_poll() when adding the wait entry to ep->wq and when
+ *     removing it, (2) in ep_start_scan() when stealing the ready list and
+ *     setting ovflist to NULL, (3) in ep_done_scan() when merging ovflist
+ *     back into the ready list. This spinlock protects ep->rdllist (ready
+ *     list), ep->ovflist (overflow list), and ep->wq (wait queue). It can be
+ *     taken from IRQ context in ep_poll_callback() during wakeups, hence
+ *     acquired with spin_lock_irq()/spin_lock_irqsave().
+ *
+ * signal: sigmask
+ *   direction: KAPI_SIGNAL_BLOCK
+ *   action: KAPI_SIGNAL_ACTION_CUSTOM
+ *   condition: When @sigmask is non-NULL
+ *   desc: The calling thread's signal mask is atomically replaced with the
+ *     mask specified by @sigmask via set_user_sigmask(). The original mask
+ *     is saved in current->saved_sigmask. Signals blocked in @sigmask cannot
+ *     interrupt the wait. Signals not blocked can interrupt the wait, causing
+ *     -EINTR to be returned. SIGKILL and SIGSTOP are never blockable.
+ *   restartable: no
+ *
+ * signal: EINTR handling
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Signal delivered while waiting
+ *   desc: If a non-blocked signal is delivered while waiting, -EINTR is
+ *     returned. The original signal mask is restored via TIF_RESTORE_SIGMASK
+ *     mechanism during signal delivery (not before return from syscall). This
+ *     allows the signal handler to see the @sigmask was in effect. The
+ *     restore_saved_sigmask_unless(error == -EINTR) call skips restoration
+ *     when interrupted, relying on signal delivery to handle it.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process signal mask
+ *   desc: If @sigmask is non-NULL, the calling thread's signal mask is
+ *     temporarily modified during the wait. The original mask is saved and
+ *     restored upon return (for normal returns) or during signal delivery
+ *     (for interrupted returns). This modification is per-thread and does
+ *     not affect other threads in the process.
+ *   condition: @sigmask is non-NULL
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: epitem event mask (for EPOLLONESHOT fds)
+ *   desc: When events are delivered for file descriptors registered with
+ *     EPOLLONESHOT, the events mask in the epitem is cleared (retaining only
+ *     EP_PRIVATE_BITS). This disables further event notifications until
+ *     epoll_ctl(EPOLL_CTL_MOD) re-arms the fd. This modification persists
+ *     across the syscall and affects future epoll_wait/epoll_pwait calls.
+ *   condition: Ready fd has EPOLLONESHOT set in its registered events
+ *   reversible: yes (via epoll_ctl EPOLL_CTL_MOD)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Ready list ordering
+ *   desc: For level-triggered file descriptors that remain ready after event
+ *     delivery, the epitem is moved to the tail of the ready list. This
+ *     ensures fair round-robin behavior when multiple fds are continuously
+ *     ready. Edge-triggered and EPOLLONESHOT fds are removed from the ready
+ *     list entirely upon delivery.
+ *   condition: Events delivered for level-triggered fds
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: Thread wait state
+ *   desc: The calling thread transitions to TASK_INTERRUPTIBLE state while
+ *     waiting for events (if timeout is non-zero and no events are immediately
+ *     available). This makes the thread schedulable and wakeup-able by signals
+ *     or event arrivals. CPU time is not consumed during the wait unless busy
+ *     polling is enabled.
+ *   condition: Non-zero timeout and no immediately available events
+ *   reversible: yes
+ *
+ * constraint: Memory for Events Buffer
+ *   desc: The userspace buffer @events must remain valid and writable for the
+ *     duration of the call. If the memory is unmapped or made read-only during
+ *     event delivery, -EFAULT is returned and some events may be lost. The
+ *     buffer must be able to hold at least @maxevents * sizeof(struct
+ *     epoll_event) bytes.
+ *
+ * constraint: Signal Mask Size
+ *   desc: If @sigmask is non-NULL, @sigsetsize must exactly equal
+ *     sizeof(sigset_t). This constraint exists for ABI stability and prevents
+ *     truncation or overflow of the signal mask structure. The size varies
+ *     by architecture (typically 8 bytes on 64-bit, 4 bytes on some 32-bit).
+ *
+ * constraint: File Descriptor Limit
+ *   desc: @epfd must be within the process's valid file descriptor range
+ *     (0 to RLIMIT_NOFILE - 1) and must refer to an open file.
+ *
+ * examples: epoll_pwait(epfd, events, 10, -1, NULL, 0);  // Like epoll_wait
+ *   epoll_pwait(epfd, events, 10, 1000, &mask, sizeof(mask));  // 1s timeout
+ *   epoll_pwait(epfd, events, 10, 0, &mask, sizeof(mask));  // Non-blocking
+ *   sigemptyset(&mask); epoll_pwait(epfd, events, 10, -1, &mask, sizeof(mask));
+ *
+ * notes: epoll_pwait() was introduced in Linux 2.6.19 (glibc 2.6) to enable
+ *   race-free signal handling during epoll waits. Without it, there is an
+ *   unavoidable race between unblocking signals and entering the wait state.
+ *
+ *   The signal mask restoration mechanism differs from pselect(). While
+ *   pselect() always restores the mask before returning, epoll_pwait() uses
+ *   TIF_RESTORE_SIGMASK for interrupted calls, allowing signal handlers to
+ *   see the modified mask in effect.
+ *
+ *   When using epoll in a multithreaded program with signals, consider that
+ *   signal delivery is per-thread. epoll_pwait() only affects the calling
+ *   thread's signal mask, not other threads waiting on the same epoll fd.
+ *
+ *   For nanosecond-precision timeouts, use epoll_pwait2() (Linux 5.11+) which
+ *   accepts struct timespec for the timeout parameter.
+ *
+ *   The SA_RESTART signal flag does NOT cause epoll_pwait() to automatically
+ *   restart. The caller must always be prepared to handle EINTR.
+ *
+ *   CLOCK_MONOTONIC is used for timeout tracking, ensuring reliable behavior
+ *   even if the system clock is adjusted during the wait.
+ *
+ *   The busy polling feature (if enabled) executes with interrupts enabled
+ *   and can be preempted. It is bounded by busy_poll_usecs to prevent
+ *   indefinite CPU consumption.
+ *
+ * since-version: 2.6.19
+ */
 SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
 		int, maxevents, int, timeout, const sigset_t __user *, sigmask,
 		size_t, sigsetsize)
