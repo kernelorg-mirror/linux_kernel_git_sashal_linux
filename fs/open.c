@@ -2582,6 +2582,293 @@ int ksys_fchown(unsigned int fd, uid_t user, gid_t group)
 	return vfs_fchown(fd_file(f), user, group);
 }
 
+/**
+ * sys_fchown - change ownership of an open file
+ * @fd: open file descriptor identifying the target file
+ * @user: new owner user ID, or (uid_t)-1 to leave unchanged
+ * @group: new owner group ID, or (gid_t)-1 to leave unchanged
+ *
+ * long-desc: Changes the owner and/or group of the file referred to by the
+ *   open file descriptor @fd. Unlike chown() and lchown() which operate on
+ *   pathnames, fchown() operates directly on an already-opened file,
+ *   eliminating any race conditions from pathname resolution.
+ *
+ *   The @user and @group parameters specify the new owner and group. Passing
+ *   the special value (uid_t)-1 for @user or (gid_t)-1 for @group leaves that
+ *   attribute unchanged. This allows changing only the owner or only the group.
+ *
+ *   Permission requirements: Only privileged processes (those with CAP_CHOWN
+ *   in a user namespace where the file's uid/gid are mapped) can change a
+ *   file's owner to an arbitrary value. Unprivileged users can only change
+ *   the group of files they own to a group they are a member of.
+ *
+ *   Setuid/setgid handling: When ownership is changed by a non-privileged user,
+ *   the set-user-ID and set-group-ID bits are automatically cleared from
+ *   regular files to prevent security issues. The kernel also clears file
+ *   capabilities (via ATTR_KILL_PRIV) on ownership changes for non-directories.
+ *
+ *   File descriptor handling: The file descriptor @fd must be valid and open.
+ *   Files opened with O_PATH can have their ownership changed since the
+ *   operation modifies the underlying inode, not the file description.
+ *   The file descriptor does not need to be opened with write permission.
+ *
+ *   NFS delegation handling: If the file has an NFSv4 delegation held by
+ *   another client, the kernel will break the delegation and wait for the
+ *   client to release it before proceeding with the ownership change.
+ *
+ *   POSIX.1-2001/2008 compliant. The uid_t and gid_t parameters are 32-bit
+ *   unsigned integers with (uid_t)-1 and (gid_t)-1 having special "no change"
+ *   meaning.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid open file descriptor. Any file type is
+ *     accepted: regular files, directories, symbolic links, block/character
+ *     devices, FIFOs, and sockets can all have their ownership changed.
+ *     File descriptors opened with O_PATH are accepted. The fd does not
+ *     need write permission on the file.
+ *
+ * param: user
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: New owner user ID, or the special value (uid_t)-1 (0xFFFFFFFF)
+ *     to leave the owner unchanged. The uid must be valid in the caller's user
+ *     namespace and must map to a valid uid in the filesystem's user namespace.
+ *     Changing to an arbitrary uid requires CAP_CHOWN capability.
+ *
+ * param: group
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: New owner group ID, or the special value (gid_t)-1 (0xFFFFFFFF)
+ *     to leave the group unchanged. The gid must be valid in the caller's user
+ *     namespace and must map to a valid gid in the filesystem's user namespace.
+ *     Unprivileged users can only change to a group they are a member of.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *     The ownership change is atomic with respect to other filesystem
+ *     operations on the same inode.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: @fd is not a valid open file descriptor. The file descriptor table
+ *     does not contain an entry for this descriptor number.
+ *
+ * error: EINVAL, Invalid user or group ID
+ *   desc: The @user or @group value cannot be converted to a valid kernel
+ *     uid/gid. This occurs when the value is not valid in the caller's user
+ *     namespace (cannot be mapped to a kuid_t or kgid_t).
+ *
+ * error: EROFS, Read-only filesystem
+ *   desc: The file resides on a read-only filesystem. This includes
+ *     filesystems mounted read-only and filesystems that have been remounted
+ *     read-only due to errors (errors=remount-ro mount option).
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The calling process does not have permission to change ownership.
+ *     This occurs when: (1) changing uid without CAP_CHOWN and not the file
+ *     owner changing to same uid, (2) changing gid without CAP_CHOWN and the
+ *     caller is not the file owner or not a member of the target group,
+ *     (3) the file has the immutable (chattr +i) or append-only (chattr +a)
+ *     attribute set, (4) an LSM policy denies the operation.
+ *
+ * error: EOVERFLOW, Value too large
+ *   desc: The @user or @group value cannot be represented in the target
+ *     filesystem's user namespace. This occurs when the uid/gid mapping
+ *     doesn't exist between the mount's idmap and the filesystem's user
+ *     namespace. Also returned if the file's current uid/gid is unmapped
+ *     and is not being changed to a valid value.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The syscall was interrupted by a fatal signal while waiting for the
+ *     inode lock or by any signal while waiting for an NFS delegation to be
+ *     released. The operation was not completed and can be retried.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred while reading from or writing to the
+ *     filesystem. This typically indicates hardware failure, network issues
+ *     on remote filesystems, or filesystem corruption.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to complete the operation or allocate
+ *     internal structures. This is a transient error.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: On filesystems with disk quotas enabled, the ownership change would
+ *     cause the new owner's or group's disk quota to be exceeded. The file's
+ *     current usage (blocks and inodes) would exceed the hard quota limits
+ *     for the target user or group.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired exclusively via inode_lock_killable() before modifying the
+ *     inode's ownership. This serializes ownership changes with other operations
+ *     that modify or depend on file attributes. The lock is held while calling
+ *     security hooks, clearing setuid/setgid bits, and the filesystem's setattr
+ *     operation. Released before waiting for delegation break and before return.
+ *
+ * lock: sb_writers (SB_FREEZE_WRITE level)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired via mnt_want_write_file() which calls sb_start_write() to
+ *     prevent filesystem freeze during the operation. This is a per-superblock
+ *     percpu read-write semaphore. Released via mnt_drop_write_file() after the
+ *     ownership change completes.
+ *
+ * signal: fatal_signals
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for the inode lock
+ *   desc: The inode_lock_killable() function allows fatal signals (SIGKILL,
+ *     SIGTERM, etc.) to interrupt the wait for the inode lock. If interrupted,
+ *     the syscall returns -EINTR (translated from -ERESTARTSYS).
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * signal: any_signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for NFS delegation break
+ *   desc: When the file has an NFSv4 delegation held by another client, the
+ *     kernel must break the delegation and wait for acknowledgment. This wait
+ *     via break_deleg_wait() is interruptible by any signal. If interrupted,
+ *     returns -EINTR.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_MODIFY_STATE
+ *   target: File inode uid/gid
+ *   desc: On success, the file's owner (i_uid) and/or group (i_gid) are changed
+ *     to the values specified in @user and @group (unless -1 was passed for
+ *     either). This change is persisted to storage synchronously or
+ *     asynchronously depending on filesystem mount options.
+ *   condition: Operation succeeds and @user/@group are not -1
+ *   reversible: yes (via another chown/fchown call)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode ctime
+ *   desc: The inode's change time (ctime) is updated to the current time to
+ *     reflect the metadata modification. This occurs even if @user and @group
+ *     are both -1 (no actual ownership change).
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Set-user-ID and set-group-ID bits
+ *   desc: For non-directory files, the set-user-ID (S_ISUID) bit is always
+ *     cleared on ownership change. The set-group-ID (S_ISGID) bit is cleared
+ *     if the file is group-executable and the caller lacks CAP_FSETID, or if
+ *     the file is not group-executable and the caller is not in the file's
+ *     group. This prevents security issues with setuid/setgid executables
+ *     after ownership changes.
+ *   condition: For regular files when ownership changes
+ *   reversible: yes (via chmod/fchmod)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File capabilities (security.capability xattr)
+ *   desc: File capabilities are cleared via ATTR_KILL_PRIV mechanism when
+ *     ownership changes on non-directory files. This is handled by the
+ *     security_inode_killpriv() hook which removes the security.capability
+ *     extended attribute.
+ *   condition: For non-directory files with file capabilities
+ *   reversible: no (capabilities must be re-set manually)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   desc: On successful completion, fsnotify_change() is called to generate
+ *     inotify IN_ATTRIB and fanotify FAN_ATTRIB events, notifying watchers
+ *     of the attribute change.
+ *   condition: Operation succeeds
+ *   reversible: no
+ *
+ * capability: CAP_CHOWN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Change the owner (uid) of any file to any value. Change the group
+ *     (gid) of any file to any value. Without this capability, users can only
+ *     change ownership in limited ways.
+ *   without: Users can only: (1) keep the current uid unchanged, (2) change
+ *     the gid of files they own to a group they are a member of. Attempting
+ *     to change uid or change gid to a non-member group returns -EPERM.
+ *   condition: Checked in chown_ok() and chgrp_ok() via capable_wrt_inode_uidgid()
+ *     during setattr_prepare(). The capability must be effective in a user
+ *     namespace where the file's uid/gid are mapped.
+ *
+ * capability: CAP_FSETID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Preserve set-group-ID bit on ownership change when the caller is
+ *     not a member of the file's new group.
+ *   without: The S_ISGID bit is cleared if the file is group-executable and
+ *     the caller is not in the file's group, preventing creation of setgid
+ *     executables with unexpected group ownership.
+ *   condition: Checked via capable() in setattr_should_drop_suidgid() and
+ *     in_group_or_capable() during attribute copying.
+ *
+ * constraint: Immutable and Append-only Files
+ *   desc: Files with the immutable attribute (FS_IMMUTABLE_FL, set via
+ *     chattr +i) or append-only attribute (FS_APPEND_FL, set via chattr +a)
+ *     cannot have their ownership changed. These attributes must be removed
+ *     first by root using chattr.
+ *   expr: !(inode->i_flags & (S_IMMUTABLE | S_APPEND))
+ *
+ * constraint: Filesystem Must Be Mounted Writable
+ *   desc: The filesystem containing the file must be mounted read-write.
+ *     Files on read-only filesystems or filesystems that have been emergency
+ *     remounted read-only cannot have their ownership changed.
+ *
+ * constraint: UID/GID Namespace Mapping
+ *   desc: The @user and @group values must be valid in the caller's user
+ *     namespace and must map to valid values in the filesystem's user namespace.
+ *     On idmapped mounts, the mount's idmap is also applied. Invalid or unmapped
+ *     IDs result in -EINVAL or -EOVERFLOW.
+ *
+ * constraint: LSM Hooks
+ *   desc: Linux Security Module hooks security_path_chown() and
+ *     security_inode_setattr() are called and may deny the operation based
+ *     on security policy (SELinux, AppArmor, TOMOYO, etc.). The exact errors
+ *     depend on the LSM configuration.
+ *
+ * examples: fchown(fd, 1000, 1000);  // Change owner and group
+ *   fchown(fd, 0, -1);  // Change owner to root, keep group
+ *   fchown(fd, -1, 100);  // Keep owner, change group to gid 100
+ *   fchown(fd, -1, -1);  // No change (but still updates ctime)
+ *
+ * notes: fchown() operates directly on an open file descriptor, avoiding race
+ *   conditions that can occur with path-based chown(). This is especially
+ *   important in security-sensitive applications where TOCTOU (time-of-check
+ *   to time-of-use) vulnerabilities must be avoided.
+ *
+ *   The fchown() syscall is equivalent to fchownat(fd, "", uid, gid, AT_EMPTY_PATH)
+ *   but is more efficient as it avoids path resolution entirely.
+ *
+ *   On NFS, ownership changes may be subject to root squashing where the server
+ *   maps root operations to an unprivileged user. This can cause unexpected
+ *   permission denials even when the caller has CAP_CHOWN locally.
+ *
+ *   The special values (uid_t)-1 and (gid_t)-1 are 0xFFFFFFFF. These are
+ *   distinct from uid/gid 65534 which is often used for "nobody".
+ *
+ *   For files with POSIX ACLs, ownership changes may affect the interpretation
+ *   of ACL entries and could require ACL updates for proper access control.
+ *
+ *   On some pseudo-filesystems (procfs, sysfs), ownership changes may silently
+ *   succeed but have no persistent effect, as these filesystems generate file
+ *   attributes dynamically.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE3(fchown, unsigned int, fd, uid_t, user, gid_t, group)
 {
 	return ksys_fchown(fd, user, group);
