@@ -14,8 +14,95 @@
     but tell gcc to not warn with -Wmissing-prototypes  */
 asmlinkage long sys_ni_syscall(void);
 
-/*
- * Non-implemented system calls get redirected here.
+/**
+ * sys_ni_syscall - Stub for non-implemented system calls
+ *
+ * long-desc: This is the universal fallback handler for system calls that are
+ *   not implemented in the running kernel. The syscall entry code redirects
+ *   all invalid or unimplemented syscall numbers to this function, which
+ *   unconditionally returns -ENOSYS to indicate the operation is not supported.
+ *
+ *   This function serves several critical roles in the syscall infrastructure:
+ *
+ *   1. Default handler for invalid syscall numbers: When userspace invokes a
+ *      syscall number that falls outside the valid range or corresponds to an
+ *      unassigned slot in the syscall table, the entry code dispatches to this
+ *      function via the sys_call_table's default case.
+ *
+ *   2. Placeholder for conditionally compiled syscalls: Many syscalls are only
+ *      available when specific kernel configuration options are enabled (e.g.,
+ *      CONFIG_AIO for io_setup, CONFIG_FUTEX for futex). The COND_SYSCALL macro
+ *      creates weak symbols that resolve to sys_ni_syscall when the actual
+ *      implementation is not compiled in. This allows userspace to probe for
+ *      feature availability at runtime by checking for ENOSYS.
+ *
+ *   3. Stub for deprecated or removed syscalls: Syscall numbers are never
+ *      reused once assigned, even after the syscall is removed. The syscall
+ *      table entry is pointed to sys_ni_syscall to maintain ABI stability
+ *      while clearly indicating the syscall is no longer available.
+ *
+ *   4. Architecture-specific syscall fallback: Some syscalls only make sense
+ *      on specific architectures (e.g., vm86 on x86-32, subpage_prot on
+ *      PowerPC). On other architectures, these slots point to sys_ni_syscall.
+ *
+ *   The ENOSYS error code is specifically reserved for this purpose. According
+ *   to POSIX and the kernel's errno header, syscall implementations should
+ *   refrain from returning -ENOSYS for any other reason, as userspace relies
+ *   on this error to distinguish "syscall does not exist" from "syscall failed
+ *   for other reasons". This allows robust feature detection patterns like:
+ *
+ *     ret = syscall(__NR_new_feature, ...);
+ *     if (ret == -1 && errno == ENOSYS) {
+ *         // Fall back to older API
+ *     }
+ *
+ *   Note that seccomp filters may also cause ENOSYS (or EPERM) to be returned
+ *   for syscalls that do exist, which can confuse feature detection. Container
+ *   runtimes using OCI's default seccomp profile return EPERM for blocked
+ *   syscalls rather than ENOSYS to preserve this distinction.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_ATOMIC
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: (none)
+ *   desc: Always returns -ENOSYS (errno 38, "Invalid system call number" or
+ *     "Function not implemented"). This function never succeeds; its sole
+ *     purpose is to report that the requested syscall is not available.
+ *
+ * error: ENOSYS, Function not implemented
+ *   desc: Always returned. Indicates that the syscall number used to invoke
+ *     this function does not correspond to an implemented system call in the
+ *     running kernel. This may be because: (1) the syscall number is invalid
+ *     or out of range, (2) the syscall was never implemented, (3) the syscall
+ *     requires a kernel config option that is disabled (e.g., CONFIG_AIO,
+ *     CONFIG_FUTEX, CONFIG_NET), (4) the syscall is deprecated or removed,
+ *     (5) the syscall is architecture-specific and not available on the
+ *     current architecture, or (6) the syscall table entry was explicitly
+ *     set to sys_ni_syscall. Userspace should interpret this error as a
+ *     definitive "this syscall does not exist" response and use fallback
+ *     mechanisms if available.
+ *
+ * notes: This function takes no parameters, acquires no locks, allocates no
+ *   memory, and has no side effects beyond returning an error code. It is
+ *   designed to be as simple and fast as possible since it may be called
+ *   frequently during syscall probing or when running binaries compiled for
+ *   newer kernel versions.
+ *
+ *   The function is declared with 'asmlinkage' to ensure the correct calling
+ *   convention for syscall entry points, even though it takes no arguments.
+ *   On architectures with syscall wrappers (CONFIG_ARCH_HAS_SYSCALL_WRAPPER),
+ *   there are also __x64_sys_ni_syscall and __ia32_sys_ni_syscall variants
+ *   that accept pt_regs but ignore them.
+ *
+ *   The cond_syscall() macro in include/linux/linkage.h creates weak symbol
+ *   aliases that point to sys_ni_syscall. This mechanism allows the syscall
+ *   table to reference syscall implementations that may or may not exist at
+ *   link time, with missing implementations automatically falling back to
+ *   this stub.
+ *
+ * since-version: 1.0
  */
 asmlinkage long sys_ni_syscall(void)
 {
