@@ -2632,6 +2632,298 @@ ssize_t do_tee(struct file *in, struct file *out, size_t len,
 	return ret;
 }
 
+/**
+ * sys_tee - Duplicate pipe content without consuming it
+ * @fdin: File descriptor of input pipe to read from
+ * @fdout: File descriptor of output pipe to write to
+ * @len: Maximum number of bytes to duplicate
+ * @flags: Behavioral modifier flags (SPLICE_F_* constants)
+ *
+ * long-desc: Duplicates up to @len bytes of data from the input pipe to the
+ *   output pipe without consuming the input data. Unlike splice(), which moves
+ *   data and consumes the source, tee() creates a copy by incrementing page
+ *   reference counts. The original data remains in the input pipe and can be
+ *   read or spliced subsequently.
+ *
+ *   This syscall is conceptually similar to the tee(1) command but operates on
+ *   pipes instead of files. It enables efficient data fanout patterns where the
+ *   same data needs to be sent to multiple destinations. A typical use case is
+ *   to tee() data from an input pipe to a secondary pipe, then splice() the
+ *   original data to its final destination while the copy goes elsewhere.
+ *
+ *   No actual data copying occurs. The kernel implements the duplication by
+ *   creating additional references to the underlying pages in the pipe buffers.
+ *   The output pipe's buffers point to the same physical pages as the input
+ *   pipe, with incremented reference counts. This makes tee() extremely
+ *   efficient for large data transfers.
+ *
+ *   Both @fdin and @fdout must refer to pipes. If either is not a pipe, or if
+ *   both refer to the same pipe, EINVAL is returned. Watch queue pipes (created
+ *   with O_NOTIFICATION_PIPE) cannot be used with tee().
+ *
+ *   The operation may transfer fewer bytes than requested if the input pipe
+ *   has less data available, the output pipe has insufficient space, or if the
+ *   requested @len exceeds what can fit in the remaining output buffer slots.
+ *   Each pipe buffer slot can hold data from one page, so the number of bytes
+ *   transferred depends on how the data is arranged in the input pipe's buffers.
+ *
+ *   If both pipes are empty or full respectively and SPLICE_F_NONBLOCK is not
+ *   set (and O_NONBLOCK is not set on either pipe), the syscall blocks until
+ *   data becomes available in the input pipe or space becomes available in the
+ *   output pipe. If the input pipe has no writers and is empty, 0 is returned.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fdin
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a pipe that is
+ *     open for reading (FMODE_READ). Cannot be a watch queue pipe (created with
+ *     O_NOTIFICATION_PIPE via pipe2()). If invalid, EBADF is returned. If not
+ *     a pipe, EINVAL is returned. The file descriptor is validated via
+ *     get_pipe_info() which checks both that it's a pipe and not a watch queue.
+ *
+ * param: fdout
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to a pipe that is
+ *     open for writing (FMODE_WRITE). Cannot be a watch queue pipe. Cannot be
+ *     the same pipe as @fdin (no self-tee). If invalid, EBADF is returned. If
+ *     not a pipe, EINVAL is returned. If same pipe as @fdin, EINVAL is returned.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, SIZE_MAX
+ *   constraint: Maximum number of bytes to duplicate from input to output pipe.
+ *     If zero, the syscall returns 0 immediately without any operation. The
+ *     actual number of bytes transferred may be less than requested due to
+ *     input pipe data availability or output pipe space constraints. Transfer
+ *     is limited by the number of available pipe buffer slots and the amount
+ *     of data in each input buffer.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT
+ *   constraint: Bitwise OR of zero or more SPLICE_F_* flags. SPLICE_F_NONBLOCK
+ *     (0x02) makes pipe operations non-blocking; if the input pipe is empty or
+ *     output pipe is full and would block, EAGAIN is returned. SPLICE_F_MOVE
+ *     (0x01), SPLICE_F_MORE (0x04), and SPLICE_F_GIFT (0x08) have no effect for
+ *     tee() but are accepted for consistency with splice(). Any bits outside
+ *     SPLICE_F_ALL (0x0f) cause EINVAL. Note: if O_NONBLOCK is set on either
+ *     pipe file descriptor, SPLICE_F_NONBLOCK behavior is automatically enabled.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes duplicated (non-negative).
+ *     This may be less than @len if the input pipe had less data or the output
+ *     pipe had less space. Returns 0 if @len is 0, or if the input pipe is
+ *     empty with no writers (end-of-pipe condition). On error, returns a
+ *     negative error code.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned when: (1) @flags contains invalid bits (any bits not in
+ *     SPLICE_F_ALL, checked first before any other validation); (2) @fdin
+ *     does not refer to a pipe (get_pipe_info returns NULL); (3) @fdout does
+ *     not refer to a pipe; (4) @fdin and @fdout refer to the same pipe (ipipe
+ *     == opipe); (5) either pipe is a watch queue pipe (has watch_queue set).
+ *     This is returned when the operation is fundamentally invalid.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: Returned when: (1) @fdin is not a valid open file descriptor
+ *     (fd_empty returns true); (2) @fdout is not a valid open file descriptor;
+ *     (3) @fdin is not open for reading (FMODE_READ not set); (4) @fdout is
+ *     not open for writing (FMODE_WRITE not set). The fd validity is checked
+ *     after flags validation but before pipe type validation.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: Returned when SPLICE_F_NONBLOCK was specified (or O_NONBLOCK is set
+ *     on either pipe) and the operation would block. This occurs when: (1) the
+ *     input pipe is empty but has writers (data may arrive later); (2) the
+ *     output pipe is full but has readers (space may become available). Without
+ *     the non-blocking flag, the syscall would sleep until the condition clears.
+ *
+ * error: EPIPE, Broken pipe
+ *   desc: Returned when attempting to write to a pipe that has no readers
+ *     (opipe->readers == 0). Before returning EPIPE, SIGPIPE is sent to the
+ *     calling process via send_sig(). This check occurs in both opipe_prep()
+ *     (when waiting for space) and link_pipe() (during the copy operation).
+ *     Applications should handle or ignore SIGPIPE to receive this error.
+ *
+ * error: ERESTARTSYS, Interrupted by signal (restartable)
+ *   desc: A signal was delivered to the calling thread while blocked waiting
+ *     for the input pipe to have data (in ipipe_prep) or output pipe to have
+ *     space (in opipe_prep). This error is handled by the kernel's signal
+ *     restart mechanism: if the signal handler was installed with SA_RESTART,
+ *     the syscall is automatically restarted; otherwise, -EINTR is returned
+ *     to user space. The signal_pending() check occurs in the wait loops.
+ *
+ * error: EFAULT, Bad address
+ *   desc: Returned if pipe_buf_get() fails to acquire a reference to a pipe
+ *     buffer page. This is rare and indicates a page reference counting issue,
+ *     such as the page being freed while still in use. The check occurs in
+ *     link_pipe() when attempting to duplicate each buffer.
+ *
+ * lock: pipe->mutex (input pipe)
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The input pipe's mutex is acquired via pipe_lock() during ipipe_prep()
+ *     to check for available data and during link_pipe() to access buffer
+ *     contents. The lock may be temporarily released in pipe_wait_readable() if
+ *     blocking. Always released before syscall returns.
+ *
+ * lock: pipe->mutex (output pipe)
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The output pipe's mutex is acquired via pipe_lock() during opipe_prep()
+ *     to check for available space and during link_pipe() to modify buffer
+ *     contents. The lock may be temporarily released in pipe_wait_writable() if
+ *     blocking. Always released before syscall returns.
+ *
+ * lock: pipe_double_lock ordering
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: In link_pipe(), both pipe mutexes are acquired using pipe_double_lock()
+ *     which orders acquisition by pipe address (lower address first). This
+ *     prevents ABBA deadlocks when two processes do concurrent tee() operations
+ *     in opposite directions (A->B vs B->A). The BUG_ON(pipe1 == pipe2) check
+ *     enforces that the pipes are different.
+ *
+ * signal: SIGPIPE
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Writing to pipe with no readers (opipe->readers == 0)
+ *   desc: When the output pipe has no readers, SIGPIPE is sent to the calling
+ *     process via send_sig() before returning -EPIPE. This occurs in both
+ *     opipe_prep() and link_pipe(). The default signal action terminates the
+ *     process. Applications should handle or ignore SIGPIPE if they want to
+ *     receive the EPIPE error instead of being killed.
+ *   error: -EPIPE
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: Any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Waiting for pipe to become readable or writable
+ *   desc: While blocked in pipe_wait_readable() or pipe_wait_writable() via
+ *     wait_event_interruptible(), any pending signal causes the wait to
+ *     terminate and signal_pending() to return true. The syscall then returns
+ *     -ERESTARTSYS, which the kernel converts to -EINTR or automatically
+ *     restarts depending on the SA_RESTART flag.
+ *   error: -ERESTARTSYS
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Output pipe buffers
+ *   desc: New pipe_buffer entries are added to the output pipe, each referencing
+ *     pages from the corresponding input pipe buffers. The output pipe's head
+ *     pointer advances. Page reference counts are incremented via pipe_buf_get().
+ *     The PIPE_BUF_FLAG_GIFT and PIPE_BUF_FLAG_CAN_MERGE flags are cleared on
+ *     output buffers to prevent issues with page ownership and subsequent merges.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Pipe waiters
+ *   desc: After successfully adding data to the output pipe (ret > 0),
+ *     wakeup_pipe_readers() is called which: (1) executes smp_mb() memory
+ *     barrier; (2) wakes processes blocked in read() or poll() via
+ *     wake_up_interruptible() on pipe->rd_wait; (3) sends SIGIO to processes
+ *     registered for async notification via kill_fasync() with POLL_IN.
+ *   condition: Only on successful transfer (ret > 0)
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: File metadata and fsnotify
+ *   desc: On successful transfer (ret > 0), fsnotify_access() is called on
+ *     the input file and fsnotify_modify() is called on the output file.
+ *     This generates inotify/fanotify events (IN_ACCESS, IN_MODIFY) for any
+ *     watchers monitoring these pipes.
+ *   condition: Only on successful transfer (ret > 0)
+ *
+ * state-trans: output pipe
+ *   from: has space (or empty)
+ *   to: more data (possibly full)
+ *   condition: Successful tee with ret > 0
+ *   desc: Data references are added to the output pipe. The pipe->head pointer
+ *     advances by the number of buffers used. Each new pipe_buffer entry
+ *     references the same page as the corresponding input buffer but with
+ *     potentially truncated length. Pipe readers may be woken if the pipe was
+ *     previously empty.
+ *
+ * state-trans: page reference counts
+ *   from: count N
+ *   to: count N+1 (for each page tee'd)
+ *   condition: Successful pipe_buf_get() call in link_pipe()
+ *   desc: For each buffer successfully duplicated, the underlying page's
+ *     reference count is incremented. This ensures the page remains valid
+ *     while both pipes reference it. The count is decremented when either
+ *     pipe releases the buffer (via pipe read or close).
+ *
+ * constraint: Both must be pipes
+ *   desc: Both @fdin and @fdout must refer to pipes. Regular files, sockets,
+ *     devices, and other file types are not supported. This is a fundamental
+ *     design constraint - tee() operates exclusively on pipe buffer internals.
+ *
+ * constraint: Different pipes
+ *   desc: @fdin and @fdout must refer to different pipes. Tee-ing a pipe to
+ *     itself would create circular references and is rejected with EINVAL.
+ *
+ * constraint: No watch queue pipes
+ *   desc: Pipes created with O_NOTIFICATION_PIPE (watch queues used for kernel
+ *     notifications) cannot be used with tee(). The get_pipe_info() function
+ *     returns NULL for such pipes when called with for_splice=true.
+ *
+ * constraint: Pipe capacity
+ *   desc: The amount of data that can be tee'd in a single call is limited by
+ *     the output pipe's available buffer slots (max_usage - current occupancy).
+ *     Default pipe capacity is 16 pages (65536 bytes) but can be changed via
+ *     F_SETPIPE_SZ fcntl. If output pipe is full, blocks or returns EAGAIN.
+ *
+ * examples: tee(pipefd_in[0], pipefd_out[1], 4096, 0);  // Duplicate up to 4K
+ *   tee(pipefd_in[0], pipefd_out[1], 65536, SPLICE_F_NONBLOCK);  // Non-blocking
+ *   n = tee(src[0], copy[1], INT_MAX, 0);  // Tee all available data
+ *   splice(src[0], NULL, dst, NULL, n, 0);  // Then splice original
+ *
+ * notes: The tee() syscall was added to complement splice() for data fanout
+ *   scenarios. A common pattern is: (1) tee() from input pipe to a copy pipe,
+ *   (2) splice() original data to final destination (e.g., socket), (3) process
+ *   the copy for logging/analysis. This achieves efficient zero-copy fanout.
+ *
+ *   Unlike the userspace tee(1) utility which reads from stdin and writes to
+ *   both stdout and a file, this syscall operates at a lower level on pipe
+ *   buffers. The name reflects the conceptual similarity (duplicating data
+ *   flow) rather than identical functionality.
+ *
+ *   A historical bug allowed two pipes to affect each other after tee() if
+ *   subsequent writes merged into tee'd buffers. This was fixed by marking
+ *   tee'd buffers as non-mergeable (clearing PIPE_BUF_FLAG_CAN_MERGE). The
+ *   fix ensures that after tee(), writes to either pipe cannot corrupt the
+ *   other pipe's view of the data.
+ *
+ *   The SPLICE_F_MOVE and SPLICE_F_GIFT flags are accepted for API consistency
+ *   with splice() but have no effect on tee() operations. Only SPLICE_F_NONBLOCK
+ *   is meaningful for controlling blocking behavior.
+ *
+ *   O_NONBLOCK set on either pipe file descriptor automatically enables
+ *   non-blocking behavior (equivalent to SPLICE_F_NONBLOCK). This was added
+ *   for consistency with how other I/O operations respect O_NONBLOCK.
+ *
+ *   Return value of 0 can mean either @len was 0, or the input pipe is empty
+ *   with no writers (end-of-pipe). Applications should check pipe->writers
+ *   or use poll() to distinguish these cases if needed.
+ *
+ * since-version: 2.6.17
+ */
 SYSCALL_DEFINE4(tee, int, fdin, int, fdout, size_t, len, unsigned int, flags)
 {
 	if (unlikely(flags & ~SPLICE_F_ALL))
