@@ -1318,6 +1318,202 @@ SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
 	return ret;
 }
 
+/**
+ * sys_inotify_rm_watch - Remove a watch from an inotify instance
+ * @fd: File descriptor referring to an inotify instance
+ * @wd: Watch descriptor to remove
+ *
+ * long-desc: Removes the watch associated with watch descriptor @wd from the
+ *   inotify instance referenced by file descriptor @fd. When the watch is
+ *   successfully removed, an IN_IGNORED event is generated for that watch
+ *   descriptor and queued to the inotify event queue.
+ *
+ *   The watch descriptor becomes invalid after this call and should not be
+ *   used in subsequent inotify_rm_watch() calls. Watch descriptors are
+ *   allocated from a pool and may be reused by future inotify_add_watch()
+ *   calls, though not immediately. Any pending unread events for the removed
+ *   watch descriptor remain available to read from the inotify file descriptor.
+ *
+ *   This syscall is the explicit method for removing watches. Watches are also
+ *   automatically removed when: the watched file is deleted (generating
+ *   IN_DELETE_SELF and IN_IGNORED), the filesystem containing the watched file
+ *   is unmounted (generating IN_UNMOUNT and IN_IGNORED), or the inotify file
+ *   descriptor is closed (no events generated in this case).
+ *
+ *   For watches created with IN_ONESHOT, the watch is automatically removed
+ *   after the first event is generated, so calling inotify_rm_watch() on such
+ *   a watch descriptor may return EINVAL if the watch has already been removed.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor referring to an inotify
+ *     instance created by inotify_init(2) or inotify_init1(2). The file
+ *     descriptor must be open and accessible to the calling process. Passing
+ *     a file descriptor for any other file type (regular file, socket, pipe,
+ *     directory, etc.) results in EINVAL.
+ *
+ * param: wd
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, INT_MAX
+ *   constraint: Must be a valid watch descriptor previously returned by
+ *     inotify_add_watch(2) on the same inotify instance. Watch descriptors
+ *     start at 1 and are allocated cyclically. A watch descriptor of 0 or
+ *     negative values, or a watch descriptor that has already been removed
+ *     or was never allocated, results in EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: On success, returns 0. The watch has been removed and an IN_IGNORED
+ *     event has been queued for the watch descriptor. The watch descriptor is
+ *     now invalid and should not be reused.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The @fd argument is not a valid open file descriptor. This includes
+ *     negative values, values exceeding the process's file descriptor limit,
+ *     and values referring to closed file descriptors. The kernel validates
+ *     the file descriptor via fdget() before any other checks.
+ *
+ * error: EINVAL, Not an inotify instance
+ *   desc: The file descriptor @fd does not refer to an inotify instance. This
+ *     occurs when @fd refers to a regular file, directory, pipe, socket, or
+ *     any file type other than an inotify file descriptor. The kernel checks
+ *     that f_op points to the inotify file operations structure.
+ *
+ * error: EINVAL, Invalid watch descriptor
+ *   desc: The watch descriptor @wd is not valid for the inotify instance
+ *     referenced by @fd. This occurs when @wd was never allocated for this
+ *     inotify instance, has already been removed (explicitly via a previous
+ *     inotify_rm_watch() call, or implicitly when the watched file was deleted
+ *     or the filesystem was unmounted), or was removed automatically due to
+ *     IN_ONESHOT. The kernel looks up @wd in the inotify instance's IDR and
+ *     returns EINVAL if the lookup fails.
+ *
+ * lock: group->inotify_data.idr_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The inotify IDR spinlock is acquired during watch descriptor lookup
+ *     in inotify_idr_find(). This protects the IDR data structure mapping
+ *     watch descriptors to inotify_inode_mark structures. The lock is held
+ *     briefly during the idr_find() call and while taking a reference on the
+ *     found mark.
+ *
+ * lock: group->mark_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: The fsnotify group's mark mutex is acquired via fsnotify_group_lock()
+ *     during mark destruction in fsnotify_destroy_mark(). This mutex serializes
+ *     mark modifications on the same inotify instance. While held, the kernel
+ *     sets PF_MEMALLOC_NOFS to prevent filesystem-related memory reclaim
+ *     deadlocks. The lock is released via fsnotify_group_unlock() after
+ *     detaching the mark from the group's list.
+ *
+ * lock: mark->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The individual mark's spinlock is acquired during mark detachment
+ *     in fsnotify_detach_mark() and during fsnotify_free_mark(). This protects
+ *     mark flags (FSNOTIFY_MARK_FLAG_ATTACHED, FSNOTIFY_MARK_FLAG_ALIVE) and
+ *     the group list membership. Acquired after mark_mutex in the locking order.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: inotify watch (inotify_inode_mark)
+ *   desc: Destroys the watch by detaching the fsnotify_mark from the group and
+ *     object lists, clearing the ATTACHED and ALIVE flags, and removing the
+ *     watch from the IDR. The actual memory deallocation is deferred via a
+ *     workqueue after an SRCU grace period to ensure safe concurrent access.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inotify event queue
+ *   desc: Queues an IN_IGNORED event to the inotify instance's notification
+ *     queue via inotify_ignored_and_remove_idr(). This event informs userspace
+ *     that the watch has been removed. The event is allocated with GFP_KERNEL
+ *     and may trigger memory reclaim. If allocation fails, an overflow event
+ *     is queued instead.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Per-user watch count
+ *   desc: Decrements the per-user count of inotify watches via the user
+ *     namespace ucount mechanism (UCOUNT_INOTIFY_WATCHES). This count is
+ *     tracked against the max_user_watches limit and is decremented in
+ *     inotify_ignored_and_remove_idr() via dec_inotify_watches().
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode fsnotify mask
+ *   desc: If this was the last mark watching the inode, updates the aggregate
+ *     fsnotify mask on the inode (i_fsnotify_mask) via fsnotify_recalc_mask().
+ *     This may change the events that the inode reports to the fsnotify
+ *     subsystem.
+ *   reversible: yes
+ *
+ * state-trans: inotify_inode_mark
+ *   from: FSNOTIFY_MARK_FLAG_ATTACHED | FSNOTIFY_MARK_FLAG_ALIVE
+ *   to: 0 (flags cleared)
+ *   condition: Watch successfully found and removed
+ *   desc: The mark transitions from attached/alive state to detached/dead state.
+ *     Once detached, the mark cannot be re-attached. The mark remains in memory
+ *     until all references are dropped and an SRCU grace period passes.
+ *
+ * state-trans: watch descriptor (wd)
+ *   from: valid (present in IDR)
+ *   to: invalid (removed from IDR)
+ *   condition: Watch successfully removed
+ *   desc: The watch descriptor is removed from the inotify instance's IDR,
+ *     making it invalid for future inotify_rm_watch() calls. The descriptor
+ *     may be reused by future inotify_add_watch() calls after the IDR cursor
+ *     cycles back to this value.
+ *
+ * examples: ret = inotify_rm_watch(fd, wd);  // Remove watch
+ *   if (ret < 0) { perror("inotify_rm_watch"); }
+ *   // IN_IGNORED event will be available to read from fd
+ *
+ * notes: inotify_rm_watch() was introduced in Linux 2.6.13 as part of the
+ *   original inotify implementation.
+ *
+ *   The syscall does not require any special capabilities. Any process that
+ *   has a valid file descriptor to an inotify instance can remove watches
+ *   from that instance.
+ *
+ *   Watch descriptors are recycled using a cyclic IDR allocator starting at 1.
+ *   After many watches are added and removed, a watch descriptor value may be
+ *   reused. This can theoretically cause confusion if an application has
+ *   unread events from an old watch with the same descriptor value as a new
+ *   watch. In practice, this is extremely unlikely to cause problems as it
+ *   requires cycling through billions of watch descriptors.
+ *
+ *   The IN_IGNORED event generated by inotify_rm_watch() will have wd set to
+ *   the removed watch descriptor and mask set to IN_IGNORED. The name_len
+ *   field will be 0 and no name will be present.
+ *
+ *   This syscall cannot be interrupted by signals. The mutex_lock() call in
+ *   fsnotify_destroy_mark() is not interruptible, and there are no other
+ *   blocking operations that check for pending signals. The syscall will
+ *   always complete once started.
+ *
+ *   Memory deallocation is deferred to a workqueue for safe RCU/SRCU handling.
+ *   The inotify_inode_mark structure is freed from the inotify_inode_mark_cachep
+ *   slab cache after an SRCU grace period via fsnotify_mark_destroy_workfn().
+ *
+ *   If the inotify file descriptor is shared between processes (via fork() or
+ *   SCM_RIGHTS), any process with access to the descriptor can remove watches.
+ *   The IN_IGNORED event will be visible to all processes reading from the
+ *   shared descriptor.
+ *
+ * since-version: 2.6.13
+ */
 SYSCALL_DEFINE2(inotify_rm_watch, int, fd, __s32, wd)
 {
 	struct fsnotify_group *group;
