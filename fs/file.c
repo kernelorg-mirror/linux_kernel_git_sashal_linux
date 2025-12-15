@@ -1474,6 +1474,159 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 	return ksys_dup3(oldfd, newfd, 0);
 }
 
+/**
+ * sys_dup - Duplicate a file descriptor
+ * @fildes: File descriptor to duplicate
+ *
+ * long-desc: Duplicates an existing file descriptor, creating a new file
+ *   descriptor that refers to the same open file description as the original.
+ *   The new file descriptor is guaranteed to be the lowest-numbered file
+ *   descriptor that was unused in the calling process.
+ *
+ *   The old and new file descriptors share the same open file description,
+ *   meaning they share the same file offset and file status flags. However,
+ *   they do not share file descriptor flags; specifically, the close-on-exec
+ *   flag (FD_CLOEXEC) is cleared for the new file descriptor.
+ *
+ *   This syscall uses fget_raw() to obtain the file, which allows duplicating
+ *   O_PATH file descriptors (unlike operations that require full file access).
+ *   This means dup() can duplicate any open file descriptor regardless of the
+ *   access mode used when the file was opened.
+ *
+ *   After a successful return, both file descriptors may be used interchangeably.
+ *   They refer to the same underlying struct file in the kernel, with the
+ *   reference count incremented. The file will not be truly closed until all
+ *   file descriptors referring to it have been closed.
+ *
+ *   Common use cases include: redirecting standard I/O by duplicating over
+ *   stdin/stdout/stderr after the target is closed, creating a backup of a
+ *   file descriptor before modifying it, and preparing file descriptors for
+ *   use in child processes.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fildes
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid, open file descriptor. The descriptor can refer
+ *     to any type of file (regular file, directory, pipe, socket, device, etc.)
+ *     and can be opened with any mode including O_PATH. Invalid or closed file
+ *     descriptors cause EBADF to be returned.
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns the new file descriptor number. This will be the
+ *     lowest-numbered unused file descriptor in the calling process. The returned
+ *     fd shares the same open file description as @fildes, with an independent
+ *     close-on-exec flag (initially cleared). The caller is responsible for
+ *     closing both file descriptors when done.
+ *
+ * error: EBADF, Invalid file descriptor
+ *   desc: The @fildes argument is not a valid open file descriptor. This occurs
+ *     if the file descriptor has never been opened, has already been closed, or
+ *     is outside the valid range of file descriptors for this process. The kernel
+ *     checks validity via fget_raw(), which looks up @fildes in the current
+ *     process's file descriptor table and returns NULL if not found.
+ *
+ * error: EMFILE, Per-process limit reached
+ *   desc: The per-process limit on the number of open file descriptors has been
+ *     reached. This limit is determined by RLIMIT_NOFILE, which can be queried
+ *     and modified via getrlimit(2)/setrlimit(2) or prlimit(2). The default soft
+ *     limit is typically 1024. This error is returned from get_unused_fd_flags()
+ *     when alloc_fd() cannot find an available slot below the limit. Note that
+ *     the system-wide limit (/proc/sys/fs/file-max) is checked when opening new
+ *     files, not when duplicating existing file descriptors.
+ *
+ * lock: files->file_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The process's file descriptor table spinlock is acquired briefly during
+ *     file descriptor allocation in alloc_fd(). This lock protects the fd table
+ *     from concurrent modifications by other threads in the same process. The
+ *     lock is held only during the fd allocation phase, not during the entire
+ *     syscall. If the fd table needs expansion, the lock may be released and
+ *     reacquired during the resize operation.
+ *
+ * lock: RCU read-side critical section
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: An RCU read-side critical section is used in fget_raw() via
+ *     __fget_files_rcu() to safely look up the file structure from the file
+ *     descriptor table without taking the file_lock for the common case. This
+ *     allows concurrent reads from the fd table. The fd_install() function also
+ *     uses RCU in its fast path when the table is not being resized.
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor
+ *   desc: Allocates a new file descriptor in the calling process's file
+ *     descriptor table. The new fd is the lowest available number. The fd
+ *     remains valid until explicitly closed via close(2), or until the process
+ *     exits, or until replaced by another dup2()/dup3() call.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File reference count
+ *   desc: Increments the reference count (f_ref) on the underlying struct file.
+ *     This ensures the file remains valid as long as either file descriptor is
+ *     open. The reference count is decremented when the file descriptor is
+ *     closed. The file's resources (buffers, locks, etc.) are only released
+ *     when the reference count drops to zero.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: files_struct.next_fd hint
+ *   desc: May update the next_fd field in the process's files_struct, which is
+ *     a hint used to speed up subsequent fd allocations. This is an internal
+ *     optimization and does not affect syscall semantics.
+ *   reversible: yes
+ *
+ * constraint: File Descriptor Limit
+ *   desc: The calling process must not have exhausted its per-process file
+ *     descriptor limit (RLIMIT_NOFILE). This limit can be viewed with
+ *     'ulimit -n' and modified with setrlimit(2) up to the hard limit.
+ *
+ * constraint: Valid Source Descriptor
+ *   desc: The @fildes argument must refer to a currently open file descriptor.
+ *     Unlike some operations, dup() works on any fd type including O_PATH
+ *     descriptors, since it uses fget_raw() rather than fget().
+ *
+ * examples: newfd = dup(oldfd);  // Duplicate oldfd to lowest available fd
+ *   if (newfd < 0) { perror("dup"); }  // Check for EBADF or EMFILE
+ *   // Redirect stdout: close(1); dup(fd); // newfd will be 1
+ *   // Both oldfd and newfd now refer to the same file
+ *
+ * notes: The dup() syscall is POSIX.1-2008 compliant and has existed since
+ *   Version 7 AT&T UNIX. It is one of the fundamental file descriptor operations.
+ *
+ *   Unlike dup2() and dup3(), dup() does not allow specifying the target file
+ *   descriptor number. Use dup2(oldfd, newfd) to duplicate to a specific fd,
+ *   or fcntl(oldfd, F_DUPFD, minfd) to get the lowest fd >= minfd.
+ *
+ *   The close-on-exec flag (FD_CLOEXEC) is always cleared on the new file
+ *   descriptor. To create a duplicate with close-on-exec set, use dup3() with
+ *   O_CLOEXEC flag, or fcntl(oldfd, F_DUPFD_CLOEXEC, 0).
+ *
+ *   This syscall does not check signals or have interruptible sleep points.
+ *   It completes quickly and atomically, making it safe to use in signal
+ *   handlers (it is async-signal-safe per POSIX).
+ *
+ *   The syscall interacts safely with concurrent close() or dup2() calls from
+ *   other threads, though the resulting behavior depends on timing. If another
+ *   thread closes @fildes concurrently, dup() may return EBADF. The kernel uses
+ *   RCU and spinlocks to ensure consistency of internal data structures.
+ *
+ *   O_PATH file descriptors: dup() can duplicate O_PATH fds because it uses
+ *   fget_raw() internally, which does not filter based on FMODE_PATH. This
+ *   allows O_PATH descriptors to be passed to other processes via SCM_RIGHTS.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(dup, unsigned int, fildes)
 {
 	int ret = -EBADF;
