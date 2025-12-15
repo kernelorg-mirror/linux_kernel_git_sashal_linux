@@ -2194,6 +2194,190 @@ static int do_epoll_create(int flags)
 	return fd_publish(fdf);
 }
 
+/**
+ * sys_epoll_create1 - Create an epoll file descriptor
+ * @flags: Bitmask of flags controlling the epoll instance behavior
+ *
+ * long-desc: Creates an epoll instance and returns a file descriptor referring
+ *   to it. The epoll instance provides a scalable I/O event notification
+ *   mechanism that is more efficient than poll(2) or select(2) for monitoring
+ *   large numbers of file descriptors.
+ *
+ *   The epoll interface consists of three syscalls: epoll_create1() (or the
+ *   deprecated epoll_create()) to create an epoll instance, epoll_ctl() to
+ *   add, modify, or remove file descriptors from the interest list, and
+ *   epoll_wait() or epoll_pwait() to wait for I/O events on the registered
+ *   file descriptors.
+ *
+ *   When the epoll instance is no longer needed, the file descriptor should
+ *   be closed using close(2). When all file descriptors referring to an epoll
+ *   instance have been closed, the kernel destroys the instance and releases
+ *   the associated resources.
+ *
+ *   The epoll instance maintains two lists internally:
+ *   - Interest list: A red-black tree of file descriptors being monitored,
+ *     added via epoll_ctl(EPOLL_CTL_ADD).
+ *   - Ready list: A linked list of file descriptors that are ready for I/O,
+ *     returned to userspace via epoll_wait().
+ *
+ *   The returned file descriptor itself supports poll/select/epoll, allowing
+ *   epoll instances to be nested (one epoll fd monitored by another). However,
+ *   the kernel limits nesting depth to prevent stack overflow and deadlock.
+ *
+ *   epoll_create1() supersedes epoll_create(), which required an ignored size
+ *   argument and did not support flags. New applications should use
+ *   epoll_create1() exclusively.
+ *
+ *   The epoll file descriptor can be inherited across fork(2) (unless
+ *   EPOLL_CLOEXEC is set), but the child process shares the same epoll
+ *   instance with the parent. This is typically not useful since both
+ *   processes would compete for events.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: flags
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: EPOLL_CLOEXEC
+ *   constraint: Bitmask of zero or EPOLL_CLOEXEC. EPOLL_CLOEXEC sets the
+ *     close-on-exec (FD_CLOEXEC) flag on the new file descriptor, ensuring
+ *     it is automatically closed when execve(2) is called. This prevents
+ *     file descriptor leaks to child processes. EPOLL_CLOEXEC is defined
+ *     as O_CLOEXEC (0x80000). Passing 0 creates an epoll fd without the
+ *     close-on-exec flag. Any bits other than EPOLL_CLOEXEC cause EINVAL.
+ *
+ * return:
+ *   type: KAPI_TYPE_FD
+ *   check-type: KAPI_RETURN_FD
+ *   success: >= 0
+ *   desc: On success, returns a new file descriptor referring to the epoll
+ *     instance. The file descriptor will be the lowest-numbered available fd
+ *     in the process's file descriptor table. The fd should be closed with
+ *     close(2) when no longer needed. The returned fd can be used with
+ *     epoll_ctl() to add/modify/remove monitored file descriptors and with
+ *     epoll_wait() to wait for events.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The @flags argument contains bits other than EPOLL_CLOEXEC. The
+ *     kernel validates flags before any resource allocation using the check
+ *     (flags & ~EPOLL_CLOEXEC). This error is returned immediately, before
+ *     any memory is allocated. This validation prevents undefined behavior
+ *     from unknown flag bits that might have different meanings in future
+ *     kernel versions.
+ *
+ * error: EMFILE, Per-process fd limit exceeded
+ *   desc: The per-process limit on the number of open file descriptors has
+ *     been reached. This limit is controlled by RLIMIT_NOFILE (default soft
+ *     limit typically 1024) and can be viewed with getrlimit(RLIMIT_NOFILE)
+ *     or "ulimit -n". The limit can be increased using setrlimit() or
+ *     "ulimit -n <value>" up to the hard limit. The kernel checks this in
+ *     get_unused_fd_flags() -> alloc_fd(). Additionally, EMFILE is returned
+ *     if the fd number would exceed sysctl_nr_open (/proc/sys/fs/nr_open).
+ *
+ * error: ENFILE, System-wide fd limit exceeded
+ *   desc: The system-wide limit on the total number of open files has been
+ *     reached. This limit is controlled by /proc/sys/fs/file-max and affects
+ *     all processes. Processes with CAP_SYS_ADMIN capability can exceed this
+ *     limit. This error is returned from alloc_empty_file() when the global
+ *     nr_files counter reaches files_stat.max_files.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory was available. Can occur when allocating:
+ *     (1) struct eventpoll via kzalloc in ep_alloc(), (2) struct file via
+ *     alloc_empty_file(), (3) dentry via d_alloc_pseudo(), or (4) expanding
+ *     the fd table via alloc_fdtable(). All use GFP_KERNEL allowing sleeping.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: eventpoll structure, struct file, dentry
+ *   desc: Allocates a struct eventpoll containing the internal epoll state
+ *     including a mutex (ep->mtx) for synchronization, a spinlock (ep->lock)
+ *     for IRQ-safe operations, wait queues for poll and epoll_wait, a
+ *     red-black tree root for the interest list, and various other fields.
+ *     Also allocates a struct file and associated dentry for the anonymous
+ *     inode. Additionally allocates a user_struct reference via
+ *     get_current_user(). All memory is freed when the last reference to
+ *     the file descriptor is released.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: File descriptor
+ *   desc: Allocates a new file descriptor in the calling process's file
+ *     descriptor table. The fd number is chosen as the lowest available value
+ *     starting from 0. If the fd table needs expansion, additional memory is
+ *     allocated. The file descriptor remains valid until explicitly closed
+ *     with close(2) or the process exits.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: Anonymous inode file
+ *   desc: Creates an anonymous inode file with the name "[eventpoll]" visible
+ *     in /proc/[pid]/fd/ and /proc/[pid]/fdinfo/. The file is created via
+ *     anon_inode_getfile() and shares a common anonymous inode with other
+ *     epoll instances to save memory. The file supports poll operations,
+ *     allowing the epoll fd to be monitored by another epoll instance or
+ *     by poll()/select().
+ *   reversible: yes
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Exceeding the system-wide file-max limit
+ *   without: Returns ENFILE if system-wide file limit (/proc/sys/fs/file-max)
+ *     is reached
+ *   condition: Checked in alloc_empty_file() when nr_files >= files_stat.max_files
+ *
+ * constraint: File Descriptor Limits
+ *   desc: The calling process must not have exhausted its per-process file
+ *     descriptor limit (RLIMIT_NOFILE). The system must not have exhausted
+ *     its system-wide file limit (/proc/sys/fs/file-max) unless the caller
+ *     has CAP_SYS_ADMIN capability. Additionally, the per-process fd number
+ *     cannot exceed /proc/sys/fs/nr_open (default 1048576).
+ *
+ * constraint: Memory Availability
+ *   desc: Sufficient kernel memory must be available for allocation of the
+ *     eventpoll structure and associated file structures. Allocations use
+ *     GFP_KERNEL which allows the kernel to reclaim memory and sleep if
+ *     necessary, but may still fail under extreme memory pressure.
+ *
+ * examples: epfd = epoll_create1(0);  // Basic epoll without close-on-exec
+ *   epfd = epoll_create1(EPOLL_CLOEXEC);  // With close-on-exec flag
+ *   if (epfd < 0) { perror("epoll_create1"); exit(1); }  // Error handling
+ *
+ * notes: epoll_create1() was introduced in Linux 2.6.27 to replace the older
+ *   epoll_create() syscall. The original epoll_create() required a "size"
+ *   hint argument that was ignored since Linux 2.6.8, making it vestigial.
+ *   epoll_create1() eliminates this unused argument and adds flags support.
+ *
+ *   The EPOLL_CLOEXEC flag is equivalent to O_CLOEXEC and follows the same
+ *   pattern as other *_CLOEXEC flags (e.g., SOCK_CLOEXEC, TFD_CLOEXEC) added
+ *   in the 2.6.27 kernel to support atomic close-on-exec semantics. Using
+ *   EPOLL_CLOEXEC is strongly recommended for security, as it prevents
+ *   accidental file descriptor inheritance to exec'd programs.
+ *
+ *   The epoll instance internally uses a red-black tree for O(log n) lookup
+ *   of monitored file descriptors and maintains a ready list for O(1) access
+ *   to events. This makes epoll particularly efficient for applications
+ *   monitoring thousands of connections where only a small subset are active.
+ *
+ *   The maximum number of file descriptors that can be registered with a
+ *   single epoll instance is limited only by available memory and the
+ *   per-user watch limit (/proc/sys/fs/epoll/max_user_watches). This limit
+ *   is calculated based on available low memory (1/25 of lowmem divided by
+ *   the cost per watch, approximately 160 bytes on 64-bit systems).
+ *
+ *   The file descriptor returned by epoll_create1() can itself be monitored
+ *   using poll(), select(), or another epoll instance. It reports POLLIN
+ *   when there are events pending. This allows integration with external
+ *   event loops or nesting of epoll instances, though nesting depth is
+ *   limited to EP_MAX_NESTS (4) to prevent stack overflow.
+ *
+ *   Historical note: A use-after-free bug in epoll_create1() was fixed in
+ *   commit 98022748f6c7b (2012) where the ep->file assignment could race
+ *   with another thread closing the fd. The current implementation uses
+ *   FD_PREPARE() pattern to safely handle this race.
+ *
+ * since-version: 2.6.27
+ */
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
 	return do_epoll_create(flags);
