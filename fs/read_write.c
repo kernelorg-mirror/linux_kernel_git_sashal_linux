@@ -1429,6 +1429,315 @@ ssize_t ksys_pread64(unsigned int fd, char __user *buf, size_t count,
 	return -ESPIPE;
 }
 
+/**
+ * sys_pread64 - Read data from a file descriptor at a specified position
+ * @fd: File descriptor to read from
+ * @buf: User-space buffer to read data into
+ * @count: Maximum number of bytes to read
+ * @pos: File offset at which to begin reading
+ *
+ * long-desc: Reads up to count bytes from file descriptor fd into the buffer
+ *   starting at buf, beginning at position pos in the file. Unlike read(),
+ *   pread64() does not modify the file offset (file position), making it ideal
+ *   for concurrent access by multiple threads without requiring external
+ *   synchronization of the file position.
+ *
+ *   The pread64() syscall is equivalent to atomically performing lseek() to
+ *   position pos, reading count bytes, and then restoring the original file
+ *   position - except that it is truly atomic and the file position is never
+ *   actually modified. This atomicity is crucial for multithreaded applications
+ *   that need to read from different parts of a file simultaneously.
+ *
+ *   On success, the number of bytes read is returned (zero indicates end of
+ *   file). It is not an error if this number is smaller than the number of
+ *   bytes requested; this may happen because fewer bytes are actually available
+ *   (e.g., near end-of-file), or because pread64() was interrupted by a signal.
+ *
+ *   On Linux, pread64() transfers at most MAX_RW_COUNT (0x7ffff000, approximately
+ *   2GB minus one page) bytes per call to prevent signed arithmetic overflow.
+ *
+ *   The file descriptor must refer to a file that supports positioned reads
+ *   (FMODE_PREAD flag). Regular files, block devices, and some character devices
+ *   support positioned reads. Pipes, FIFOs, sockets, and terminals do not support
+ *   positioned reads and will return ESPIPE.
+ *
+ *   POSIX permits reads that are interrupted after reading some data to either
+ *   return -1 with errno EINTR, or to return the bytes already read. Linux
+ *   follows the latter behavior: if data has been read before a signal arrives,
+ *   the call returns the number of bytes read rather than failing.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid, open file descriptor with read permission.
+ *     The file must have been opened with O_RDONLY or O_RDWR. The file must
+ *     support positioned reads (FMODE_PREAD); pipes, FIFOs, sockets, and
+ *     terminals return ESPIPE. File descriptors opened with O_WRONLY, O_PATH,
+ *     or that have been closed return EBADF. Standard file descriptors
+ *     0 (stdin), 1 (stdout), 2 (stderr) are valid if open and readable,
+ *     though stdin may not support pread if connected to a terminal or pipe.
+ *     AT_FDCWD and other special directory values are not valid.
+ *
+ * param: buf
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, writable user-space memory region of at
+ *     least count bytes. The buffer is validated via access_ok() before any
+ *     read operation. NULL is invalid and will return EFAULT. The buffer may
+ *     be partially written if an error occurs mid-read. For O_DIRECT reads,
+ *     the buffer may need to be aligned to the filesystem's block size (varies
+ *     by filesystem; query with statx() using STATX_DIOALIGN on Linux 6.1+).
+ *
+ * param: count
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, SIZE_MAX
+ *   constraint: Maximum number of bytes to read. Clamped internally to
+ *     MAX_RW_COUNT (INT_MAX & PAGE_MASK, approximately 0x7ffff000 bytes) to
+ *     prevent signed overflow. A count of 0 returns immediately with 0
+ *     without accessing the file (but may still detect errors). Large values
+ *     are not errors but will be clamped. Cast to ssize_t must not be negative.
+ *
+ * param: pos
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, LLONG_MAX
+ *   constraint: File offset at which to begin reading. Must be non-negative;
+ *     negative values return EINVAL. For files without unsigned offset support
+ *     (most regular files), pos + count must not overflow or exceed LLONG_MAX.
+ *     For files with FOP_UNSIGNED_OFFSET (some special files like /dev/mem),
+ *     the entire 64-bit range may be valid. The position is not validated
+ *     against the file size; reading beyond EOF simply returns 0 bytes.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes read (non-negative). Zero
+ *     indicates end-of-file (EOF) or that pos is at or beyond the file size.
+ *     The return value may be less than count if fewer bytes were available
+ *     (short read) or if interrupted by a signal after partial read. Partial
+ *     reads are not errors. On error, returns a negative error code.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) The pos argument is negative. (2) The
+ *     count argument, when cast to ssize_t, is negative. (3) The file descriptor
+ *     does not have a read or read_iter method (e.g., trying to read from a
+ *     write-only special file). (4) For O_DIRECT reads, the buffer alignment,
+ *     file offset, or count does not meet the filesystem's alignment requirements.
+ *     (5) For timerfd file descriptors, the buffer is smaller than 8 bytes.
+ *     (6) The file position plus count would overflow for files without unsigned
+ *     offset support.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid file descriptor, or fd was not opened for reading.
+ *     This includes file descriptors opened with O_WRONLY, O_PATH, or file
+ *     descriptors that have been closed. Also returned if the file structure
+ *     does not have FMODE_READ or FMODE_CAN_READ flags set.
+ *
+ * error: ESPIPE, Illegal seek
+ *   desc: The file descriptor refers to a file type that does not support
+ *     positioned reads (FMODE_PREAD flag not set). This includes pipes, FIFOs,
+ *     sockets, and terminal devices. Use read() instead for these file types,
+ *     or for pipes consider splice() for better performance.
+ *
+ * error: EFAULT, Bad address
+ *   desc: buf points outside the accessible address space. The buffer address
+ *     failed access_ok() validation. Can also occur if a fault happens during
+ *     copy_to_user() when transferring data to user space after the read
+ *     completes in kernel space.
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: The file position (pos) plus count would exceed LLONG_MAX, causing
+ *     arithmetic overflow. This is checked in rw_verify_area() before the read
+ *     begins. For files without FOP_UNSIGNED_OFFSET, this also applies if pos
+ *     alone would cause issues.
+ *
+ * error: EISDIR, Is a directory
+ *   desc: fd refers to a directory. Directories cannot be read using pread64();
+ *     use getdents64() instead. This error is returned by the generic_read_dir()
+ *     handler installed for directory file operations.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: fd refers to a file (device, network filesystem) that is marked
+ *     non-blocking (O_NONBLOCK) and the read would block because no data is
+ *     available. Also returned when using io_uring with IOCB_NOWAIT flag and
+ *     the read cannot complete immediately. Equivalent to EWOULDBLOCK. The
+ *     application should retry the read later or use select/poll/epoll.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The call was interrupted by a signal before any data was read. This
+ *     only occurs if no data has been transferred; if some data was read before
+ *     the signal, the call returns the number of bytes read. For regular files,
+ *     EINTR is rare but can occur during disk I/O waits if a fatal signal arrives.
+ *     The caller should typically restart the read.
+ *
+ * error: EIO, Input/output error
+ *   desc: A low-level I/O error occurred. For regular files, this typically
+ *     indicates a hardware error on the storage device, filesystem corruption,
+ *     or a network filesystem timeout. May also indicate that the page could
+ *     not be read from disk (e.g., bad blocks).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to allocate necessary data structures for
+ *     the read operation, such as page cache folios. This is rare under normal
+ *     circumstances but can occur under memory pressure.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The security subsystem (LSM such as SELinux or AppArmor) denied
+ *     the read operation via security_file_permission(). This can occur even
+ *     if the file was successfully opened, as LSM policies may enforce per-
+ *     operation checks. The specific policy that denied access may be logged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned by fanotify permission events (CONFIG_FANOTIFY_ACCESS_PERMISSIONS)
+ *     when a user-space fanotify listener denies the read operation via
+ *     fsnotify_file_area_perm(). This allows user-space HSM or antivirus
+ *     programs to block reads.
+ *
+ * error: ENOBUFS, No buffer space available
+ *   desc: Returned when reading from pipe-based watch queues (CONFIG_WATCH_QUEUE)
+ *     when the buffer is too small to hold a complete notification, or when
+ *     reading packets from pipes with PIPE_BUF_FLAG_WHOLE set.
+ *
+ * lock: Filesystem-specific locks
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's read_iter or read method may acquire additional locks.
+ *     For regular files, this typically includes the inode's i_rwsem (shared mode)
+ *     for certain operations, and the mapping's invalidate_lock. For O_DIRECT
+ *     reads, additional serialization with page cache may occur. These locks are
+ *     internal to the file operation and released before return.
+ *
+ * lock: RCU read-side
+ *   type: KAPI_LOCK_RCU
+ *   acquired: conditional
+ *   released: true
+ *   desc: Used during file descriptor lookup via fdget(). RCU read lock protects
+ *     access to the file descriptor table. Released by fdput() at syscall exit.
+ *
+ * signal: Any signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked waiting for data or during disk I/O
+ *   desc: The syscall may be interrupted by signals while waiting for data to
+ *     become available from disk I/O or network operations. If interrupted
+ *     before any data is read, returns -EINTR or -ERESTARTSYS. If data has
+ *     already been read, returns the number of bytes read. Fatal signals
+ *     (SIGKILL, SIGSTOP) cause immediate return during killable waits.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode access time (atime)
+ *   condition: When read succeeds and O_NOATIME is not set
+ *   desc: Updates the file's access time (atime) via touch_atime(). The update
+ *     may be suppressed by mount options (noatime, relatime), the O_NOATIME
+ *     flag, or if the filesystem does not support atime. Relatime only updates
+ *     atime if it is older than mtime or ctime, or more than a day old.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task I/O accounting
+ *   condition: Always
+ *   desc: Updates the current task's I/O accounting statistics. The rchar field
+ *     (read characters) is incremented by bytes read via add_rchar(). The syscr
+ *     field (syscall read count) is incremented via inc_syscr(). These statistics
+ *     are visible in /proc/[pid]/io. Updated regardless of success or failure.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   condition: When read returns > 0
+ *   desc: Generates an FS_ACCESS fsnotify event via fsnotify_access() allowing
+ *     inotify, fanotify, and dnotify watchers to be notified of the read. This
+ *     occurs after data transfer completes successfully.
+ *   reversible: no
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control on read permission
+ *   without: Standard DAC checks are enforced
+ *   condition: Checked via security_file_permission() during rw_verify_area()
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass read permission checks on regular files
+ *   without: Must have read permission on file
+ *   condition: Checked by LSM hooks during the read operation
+ *
+ * constraint: MAX_RW_COUNT
+ *   desc: The count parameter is silently clamped to MAX_RW_COUNT (INT_MAX &
+ *     PAGE_MASK, approximately 2GB minus one page) to prevent integer overflow
+ *     in internal calculations. This is transparent to the caller; the syscall
+ *     succeeds but reads at most MAX_RW_COUNT bytes per call.
+ *   expr: actual_count = min(count, MAX_RW_COUNT)
+ *
+ * constraint: File must be open for reading
+ *   desc: The file descriptor must have been opened with O_RDONLY or O_RDWR.
+ *     Files opened with O_WRONLY or O_PATH cannot be read and return EBADF.
+ *     The file must have both FMODE_READ and FMODE_CAN_READ flags set.
+ *   expr: (file->f_mode & FMODE_READ) && (file->f_mode & FMODE_CAN_READ)
+ *
+ * constraint: File must support positioned reads
+ *   desc: The file must have FMODE_PREAD flag set, indicating it supports
+ *     reading at arbitrary positions. Regular files and block devices have
+ *     this flag set by default. Pipes, FIFOs, sockets, and terminals do not.
+ *     Some device drivers may or may not support positioned reads.
+ *   expr: file->f_mode & FMODE_PREAD
+ *
+ * examples: n = pread64(fd, buf, sizeof(buf), 0);  // Read from start of file
+ *   n = pread64(fd, buf, 4096, offset);  // Read 4KB at specific offset
+ *   while ((n = pread64(fd, buf, sizeof(buf), pos)) > 0) { pos += n; }  // Sequential
+ *   pread64(fd, &header, sizeof(header), 0);  // Read file header
+ *
+ * notes: pread64() is essential for multithreaded file I/O because it provides
+ *   atomic positioned reads without modifying the shared file offset:
+ *
+ *   - Thread safety: Multiple threads can call pread64() concurrently on the
+ *     same file descriptor without race conditions on the file position. Each
+ *     call specifies its own independent position.
+ *
+ *   - Unlike read(), pread64() does NOT acquire or need the f_pos_lock mutex
+ *     because it never accesses or modifies file->f_pos. This eliminates a
+ *     potential serialization point.
+ *
+ *   - Database applications commonly use pread64() to read different pages of
+ *     a database file from multiple threads without coordination.
+ *
+ *   - For pipes, sockets, and terminals, positioned reads make no sense, so
+ *     ESPIPE is returned. Use read() for these file types.
+ *
+ *   - The pos parameter is of type loff_t (64-bit signed), supporting files
+ *     larger than 4GB. The syscall name includes "64" to distinguish from
+ *     the older 32-bit pread() on some architectures.
+ *
+ *   - O_DIRECT reads bypass the page cache and typically require aligned
+ *     buffers and positions. Use statx() with STATX_DIOALIGN to query
+ *     alignment requirements (Linux 6.1+).
+ *
+ *   - Some special files in /proc and /sys support pread64() to allow reading
+ *     at position 0 to restart reading from the beginning, as these files
+ *     often generate content dynamically.
+ *
+ *   - Race condition: While pread64() itself is atomic with respect to file
+ *     position, concurrent writes to the same file region can still race with
+ *     reads. Use file locking (flock, fcntl) if consistency is required.
+ *
+ *   - The return value semantics match read(): zero means EOF, positive means
+ *     bytes read (possibly less than requested), negative means error.
+ *
+ * since-version: 2.2
+ */
 SYSCALL_DEFINE4(pread64, unsigned int, fd, char __user *, buf,
 			size_t, count, loff_t, pos)
 {
