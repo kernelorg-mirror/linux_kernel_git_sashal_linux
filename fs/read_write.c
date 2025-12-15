@@ -1823,6 +1823,315 @@ static ssize_t do_pwritev(unsigned long fd, const struct iovec __user *vec,
 	return ret;
 }
 
+/**
+ * sys_readv - Read data from a file into multiple buffers (scatter read)
+ * @fd: File descriptor to read from
+ * @vec: Pointer to array of iovec structures describing buffers
+ * @vlen: Number of iovec structures in the array
+ *
+ * long-desc: Performs scatter input by reading data from the file descriptor
+ *   fd into multiple buffers specified by the iovec array vec. This syscall
+ *   reads iovcnt buffers from the file associated with fd into the buffers
+ *   described by vec, processing them in order from vec[0] to vec[vlen-1].
+ *   Each iovec structure specifies a base address and length for one buffer.
+ *
+ *   The readv() syscall works like read(2) except that multiple buffers are
+ *   filled. The buffers are filled in array order: vec[0] is completely filled
+ *   before vec[1], and so on. This allows efficient scatter I/O where data
+ *   naturally breaks into multiple non-contiguous memory regions (e.g., a
+ *   header and payload in separate buffers).
+ *
+ *   The data transfer performed by readv() is atomic: the data read appears as
+ *   a contiguous block that is not intermingled with reads in other processes.
+ *   For seekable files, the read begins at the current file offset, which is
+ *   then incremented by the number of bytes read. For non-seekable files
+ *   (pipes, sockets, FMODE_STREAM), the file offset is not used.
+ *
+ *   On Linux, readv() transfers at most MAX_RW_COUNT (approximately 2GB minus
+ *   one page) bytes per call, regardless of the total length specified in the
+ *   iovec array. Individual iov_len values are clamped to ensure the total
+ *   does not exceed this limit. This is transparent to the caller.
+ *
+ *   The number of bytes read may be less than the total requested if fewer
+ *   bytes are available (e.g., near end-of-file), the read was interrupted
+ *   by a signal after some data was transferred, or the underlying file type
+ *   does not guarantee full reads (pipes, sockets, terminals).
+ *
+ *   POSIX requires that readv() fail with EINVAL if the sum of iov_len values
+ *   overflows ssize_t. Linux prevents this overflow by clamping to MAX_RW_COUNT.
+ *   POSIX also permits readv() to fail if iovcnt is <= 0 or > IOV_MAX; Linux
+ *   returns 0 for iovcnt == 0 and EINVAL for iovcnt > UIO_MAXIOV (1024).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Must be a valid, open file descriptor with read permission.
+ *     The file must have been opened with O_RDONLY or O_RDWR. File descriptors
+ *     opened with O_WRONLY, O_PATH, or that have been closed return EBADF.
+ *     Standard file descriptors 0 (stdin), 1 (stdout), 2 (stderr) are valid if
+ *     open and readable. AT_FDCWD and other special values are not valid.
+ *     Despite being unsigned long, values > INT_MAX may fail fdget().
+ *
+ * param: vec
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, readable user-space array of struct
+ *     iovec containing vlen elements. Each iovec structure contains:
+ *     - iov_base: pointer to a writable user-space buffer
+ *     - iov_len: size of the buffer (must be non-negative when cast to ssize_t)
+ *     NULL is valid only when vlen is 0 (returns 0 immediately). Each iov_base
+ *     must pass access_ok() validation; invalid addresses return EFAULT.
+ *     On compat syscalls (32-bit process on 64-bit kernel), the iovec structure
+ *     uses compat_uptr_t and compat_size_t for its members.
+ *
+ * param: vlen
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UIO_MAXIOV
+ *   constraint: Number of iovec structures in vec array. Must be <= UIO_MAXIOV
+ *     (1024); values > 1024 return EINVAL. A value of 0 returns 0 immediately
+ *     without reading any data or accessing the file (but fd must still be
+ *     valid). For vlen <= UIO_FASTIOV (8), the iovec array is copied to a
+ *     stack buffer; larger arrays require heap allocation which may fail with
+ *     ENOMEM under memory pressure.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes read (non-negative). Zero
+ *     indicates end-of-file (EOF) for regular files, no data available from
+ *     a non-blocking device, or vlen was 0. The return value may be less than
+ *     the total requested if fewer bytes were available (short read). Partial
+ *     reads are not errors and buffers may be partially filled. On error,
+ *     returns a negative error code.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid file descriptor, or fd was not opened for reading.
+ *     This includes file descriptors opened with O_WRONLY, O_PATH, or file
+ *     descriptors that have been closed. Also returned if the file structure
+ *     does not have FMODE_READ set.
+ *
+ * error: EFAULT, Bad address
+ *   desc: vec points outside the accessible address space, or one of the
+ *     iov_base pointers in the iovec array points to invalid memory. The
+ *     validation occurs via access_ok() in import_iovec() before any read
+ *     operation. Can also occur if copy_from_user() fails when reading the
+ *     iovec array itself, or copy_to_user() fails during data transfer.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) vlen exceeds UIO_MAXIOV (1024).
+ *     (2) An iov_len value, when cast to ssize_t, is negative (indicating the
+ *     user passed an excessively large unsigned value). (3) The file does not
+ *     support reading (FMODE_CAN_READ not set). (4) The file was opened with
+ *     O_DIRECT and alignment requirements are not met. (5) For special files
+ *     that require specific buffer sizes (e.g., timerfd requires 8 bytes).
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed when vlen > UIO_FASTIOV (8). For small
+ *     iovec arrays (<= 8 elements), a stack-allocated buffer is used, avoiding
+ *     this error. Larger arrays require kmalloc_array() which can fail under
+ *     memory pressure. Rare in practice on systems with adequate memory.
+ *
+ * error: EISDIR, Is a directory
+ *   desc: fd refers to a directory. Directories cannot be read using readv();
+ *     use getdents64() instead. This error is returned by the generic_read_dir()
+ *     handler installed for directory file operations.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: fd refers to a file (pipe, socket, device) that is marked non-blocking
+ *     (O_NONBLOCK) and the read would block because no data is available.
+ *     Equivalent to EWOULDBLOCK. The application should retry later or use
+ *     select/poll/epoll to wait for data availability.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The call was interrupted by a signal before any data was read. This
+ *     only occurs if no data has been transferred; if some data was read before
+ *     the signal, the call returns the number of bytes read. The caller should
+ *     typically check for this error and restart the read.
+ *
+ * error: EIO, Input/output error
+ *   desc: A low-level I/O error occurred. For regular files, this typically
+ *     indicates a hardware error on the storage device, a filesystem error,
+ *     or a network filesystem timeout. For terminals, this may indicate the
+ *     controlling terminal has been closed for a background process.
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: The file position plus total count would exceed LLONG_MAX. Also
+ *     returned when reading from certain special files where the position would
+ *     overflow. For files without FOP_UNSIGNED_OFFSET, negative positions are
+ *     not allowed after the operation would complete.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The security subsystem (LSM such as SELinux or AppArmor) denied
+ *     the read operation via security_file_permission(). This can occur even
+ *     if the file was successfully opened, as LSM policies may enforce per-
+ *     operation checks. The specific policy that denied access may be logged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned by fanotify permission events (CONFIG_FANOTIFY_ACCESS_PERMISSIONS)
+ *     when a user-space fanotify listener denies the read operation via
+ *     fsnotify_file_area_perm(). This allows user-space HSM or antivirus
+ *     programs to block reads.
+ *
+ * error: ERESTARTSYS, Restart system call (internal)
+ *   desc: Internal error code indicating the syscall should be restarted. This
+ *     is typically translated to EINTR if SA_RESTART is not set on the signal
+ *     handler, or the syscall is transparently restarted if SA_RESTART is set.
+ *     User space should not see this error code directly.
+ *
+ * error: ENOBUFS, No buffer space available
+ *   desc: Returned when reading from pipe-based watch queues (CONFIG_WATCH_QUEUE)
+ *     when the buffer is too small to hold a complete notification, or when
+ *     reading packets from pipes with PIPE_BUF_FLAG_WHOLE set.
+ *
+ * lock: file->f_pos_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: conditional
+ *   released: true
+ *   desc: For regular files that require atomic position updates (FMODE_ATOMIC_POS),
+ *     the f_pos_lock mutex is acquired by fdget_pos() at syscall entry and released
+ *     by fdput_pos() at syscall exit. This serializes concurrent readv() calls that
+ *     share the same file description. Not acquired for stream files (FMODE_STREAM
+ *     such as pipes, sockets) or when the file is not shared between threads.
+ *
+ * lock: Filesystem-specific locks
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's read_iter or read method may acquire additional locks.
+ *     For regular files, this typically includes the inode's i_rwsem for certain
+ *     operations. For pipes, the pipe->mutex is acquired. For sockets, socket
+ *     lock is acquired. These are internal to the file operation and released
+ *     before return.
+ *
+ * lock: RCU read-side
+ *   type: KAPI_LOCK_RCU
+ *   acquired: conditional
+ *   released: true
+ *   desc: Used during file descriptor lookup via fdget_pos(). RCU read lock
+ *     protects access to the file descriptor table. Released by fdput_pos()
+ *     at syscall exit.
+ *
+ * signal: Any signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked waiting for data on interruptible operations
+ *   desc: The syscall may be interrupted by signals while waiting for data to
+ *     become available (pipes, sockets, terminals) or waiting for locks. If
+ *     interrupted before any data is read, returns -EINTR or -ERESTARTSYS.
+ *     If data has already been read, returns the number of bytes read.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILE_POSITION
+ *   target: file->f_pos
+ *   condition: For seekable files when read succeeds (returns > 0)
+ *   desc: The file offset (f_pos) is advanced by the number of bytes read.
+ *     For stream files (FMODE_STREAM such as pipes and sockets), the offset
+ *     is not used or modified. The offset update is protected by f_pos_lock
+ *     when the file is shared between threads/processes.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode access time (atime)
+ *   condition: When read succeeds and O_NOATIME is not set
+ *   desc: Updates the file's access time (atime) via touch_atime(). The update
+ *     may be suppressed by mount options (noatime, relatime), the O_NOATIME
+ *     flag, or if the filesystem does not support atime. Relatime only updates
+ *     atime if it is older than mtime or ctime, or more than a day old.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task I/O accounting
+ *   condition: Always (after read attempt)
+ *   desc: Updates the current task's I/O accounting statistics. The rchar field
+ *     (read characters) is incremented by bytes read via add_rchar(). The syscr
+ *     field (syscall read count) is incremented via inc_syscr(). These statistics
+ *     are visible in /proc/[pid]/io. Updated regardless of success or failure
+ *     (syscr always incremented, rchar only on successful reads).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   condition: When read returns >= 0
+ *   desc: Generates an FS_ACCESS fsnotify event via fsnotify_access() allowing
+ *     inotify, fanotify, and dnotify watchers to be notified of the read. This
+ *     occurs after data transfer completes successfully.
+ *   reversible: no
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control on read permission
+ *   without: Standard DAC checks are enforced
+ *   condition: Checked via security_file_permission() during rw_verify_area()
+ *
+ * capability: CAP_DAC_READ_SEARCH
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass read permission checks on regular files
+ *   without: Must have read permission on file
+ *   condition: Checked by LSM hooks during the read operation
+ *
+ * constraint: UIO_MAXIOV limit
+ *   desc: The vlen parameter must not exceed UIO_MAXIOV (1024). This limit is
+ *     defined by POSIX (IOV_MAX) and prevents excessive memory allocation for
+ *     the iovec array. Historical Linux kernels (2.0) had a limit of 16.
+ *   expr: vlen <= 1024
+ *
+ * constraint: MAX_RW_COUNT limit
+ *   desc: The total bytes to read (sum of all iov_len values) is clamped to
+ *     MAX_RW_COUNT (INT_MAX & PAGE_MASK, approximately 2GB minus one page) to
+ *     prevent integer overflow in internal calculations. This is transparent
+ *     to the caller; individual iov_len values are truncated as needed.
+ *   expr: actual_total = min(sum(iov_len), MAX_RW_COUNT)
+ *
+ * constraint: File must be open for reading
+ *   desc: The file descriptor must have been opened with O_RDONLY or O_RDWR.
+ *     Files opened with O_WRONLY or O_PATH cannot be read and return EBADF.
+ *     The file must have both FMODE_READ and FMODE_CAN_READ flags set.
+ *   expr: (file->f_mode & FMODE_READ) && (file->f_mode & FMODE_CAN_READ)
+ *
+ * examples: n = readv(fd, iov, 3);  // Read into 3 buffers
+ *   struct iovec iov[2] = {{header, sizeof(header)}, {payload, payload_len}};
+ *   n = readv(sockfd, iov, 2);  // Scatter read from socket
+ *   while ((n = readv(fd, iov, iovcnt)) > 0) { process(iov, n); }  // Read loop
+ *
+ * notes: readv() is particularly useful when data has a known structure with
+ *   a header and payload, or when reassembling fragmented data into a single
+ *   logical record. Common use cases include:
+ *
+ *   - Network protocols: Reading a fixed-size header into one buffer and
+ *     variable-length payload into another.
+ *
+ *   - Database systems: Reading a record header and data fields separately.
+ *
+ *   - Multimedia: Reading metadata and sample data into separate buffers.
+ *
+ *   The atomic nature of readv() ensures that for regular files, the entire
+ *   operation uses a single file position snapshot, preventing interleaving
+ *   with concurrent operations on the same file description.
+ *
+ *   For optimal performance with small iovec counts (<= 8), readv() uses a
+ *   stack-allocated buffer, avoiding heap allocation overhead. For larger
+ *   counts, consider whether the overhead is justified.
+ *
+ *   When reading from pipes or sockets, the scatter behavior allows efficient
+ *   protocol parsing without copying data. However, short reads are common;
+ *   the caller must handle partial fills across the iovec array.
+ *
+ *   Related syscalls: preadv() combines readv() with positioned read (like
+ *   pread()), preadv2() adds flags for per-operation control (RWF_HIPRI,
+ *   RWF_NOWAIT, etc.), and process_vm_readv() reads from another process.
+ *
+ * since-version: 2.0
+ */
 SYSCALL_DEFINE3(readv, unsigned long, fd, const struct iovec __user *, vec,
 		unsigned long, vlen)
 {
