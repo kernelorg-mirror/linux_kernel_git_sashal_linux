@@ -391,23 +391,196 @@ static void get_fs_root_and_pwd_rcu(struct fs_struct *fs, struct path *root,
 	} while (read_seqretry(&fs->seq, seq));
 }
 
-/*
- * NOTE! The user-level library version returns a
- * character pointer. The kernel system call just
- * returns the length of the buffer filled (which
- * includes the ending '\0' character), or a negative
- * error value. So libc would do something like
+/**
+ * sys_getcwd - Get the pathname of the current working directory
+ * @buf: User-space buffer to receive the null-terminated pathname
+ * @size: Size of the user-space buffer in bytes
  *
- *	char *getcwd(char * buf, size_t size)
- *	{
- *		int retval;
+ * long-desc: Returns the absolute pathname of the current working directory
+ *   for the calling process. The pathname is written to the user-provided
+ *   buffer including the null terminator. This is a fundamental filesystem
+ *   operation used by shells, file managers, and applications that need to
+ *   track their location in the filesystem hierarchy.
  *
- *		retval = sys_getcwd(buf, size);
- *		if (retval >= 0)
- *			return buf;
- *		errno = -retval;
- *		return NULL;
- *	}
+ *   The kernel syscall differs from the POSIX getcwd(3) library function.
+ *   While the library function returns a pointer to the buffer on success
+ *   and NULL on error (with errno set), the syscall returns the length of
+ *   the pathname (including the null terminator) on success, or a negative
+ *   error code on failure.
+ *
+ *   The syscall does NOT support NULL buffer with automatic allocation -
+ *   that is a glibc extension handled entirely in userspace. The kernel
+ *   always requires a valid user buffer.
+ *
+ *   If the current working directory is not reachable from the process's
+ *   root directory (for example, after chroot() without chdir()), the
+ *   returned pathname is prefixed with "(unreachable)". Since Linux 2.6.36,
+ *   this prefix is added; glibc 2.27+ correctly returns ENOENT for such
+ *   unreachable paths instead of returning the prefixed path.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: buf
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid writable user-space buffer of at least size
+ *     bytes. The buffer receives the null-terminated absolute pathname of the
+ *     current working directory. If buf is NULL or points to invalid memory,
+ *     the syscall returns EFAULT. The kernel does not support NULL buffer with
+ *     automatic allocation (unlike glibc's getcwd wrapper).
+ *
+ * param: size
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 2, 4294967295
+ *   constraint: Size of the user buffer in bytes. Must be large enough to hold
+ *     the complete pathname including the null terminator. The minimum valid
+ *     path is "/" (2 bytes with null), so size must be at least 2 for any
+ *     success. If size is smaller than the actual path length, ERANGE is
+ *     returned. Internally, pathnames are limited to PATH_MAX (4096 bytes).
+ *     Values of 0 or 1 always result in ERANGE since no valid path fits.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: positive length (includes null terminator)
+ *   desc: On success, returns the length of the pathname written to buf,
+ *     including the terminating null byte. This is always at least 2 (for "/").
+ *     The returned value can be used to determine exactly how much of the buffer
+ *     was used. On error, returns a negative error code. Note this differs from
+ *     the POSIX getcwd(3) which returns the buffer pointer on success.
+ *
+ * error: ERANGE, Buffer too small
+ *   desc: The size argument is less than the length of the absolute pathname
+ *     of the current working directory, including the null terminator. This
+ *     includes the case where size is 0 or 1, since even the shortest path "/"
+ *     requires 2 bytes. The caller should retry with a larger buffer, typically
+ *     PATH_MAX (4096) bytes to guarantee success for any valid path.
+ *
+ * error: ENOENT, Directory unlinked
+ *   desc: The current working directory has been unlinked (deleted). This occurs
+ *     when a process's working directory is removed while the process still has
+ *     it as cwd. The directory still exists on disk (the inode is pinned by the
+ *     process's reference) but has no name in the filesystem namespace. The
+ *     condition is detected via d_unlinked() which checks both that the dentry
+ *     is unhashed and is not the root.
+ *
+ * error: ENOMEM, Memory allocation failure
+ *   desc: The kernel could not allocate internal memory to construct the pathname.
+ *     Specifically, __getname() calls kmem_cache_alloc() with GFP_KERNEL to
+ *     allocate a PATH_MAX-sized buffer from the names_cachep slab. Under severe
+ *     memory pressure, this allocation may fail. This is rare in practice.
+ *
+ * error: EFAULT, Bad user address
+ *   desc: The buf pointer is NULL, points to invalid memory, or points to memory
+ *     that is not writable by the calling process. This is detected by
+ *     copy_to_user() which safely handles invalid user addresses. Unlike glibc's
+ *     getcwd wrapper, the kernel does not support NULL buffer for automatic
+ *     allocation.
+ *
+ * error: ENAMETOOLONG, Path too long
+ *   desc: The absolute pathname of the current working directory exceeds
+ *     PATH_MAX (4096) bytes. This is extremely rare in practice as most
+ *     filesystems enforce PATH_MAX during path creation. This could theoretically
+ *     occur with deeply nested bind mounts or unusual filesystem configurations.
+ *     The check is performed internally after constructing the path in an
+ *     internal kernel buffer.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired to safely traverse the dentry hierarchy and
+ *     mount tree without holding traditional locks. This protects against
+ *     concurrent mount/unmount operations and directory renames. The lock is
+ *     acquired at the start of the operation and released after path construction
+ *     or may be re-acquired during seqlock retry loops. RCU allows multiple
+ *     readers to proceed concurrently.
+ *
+ * lock: rename_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Global seqlock protecting dentry renames (defined in fs/dcache.c).
+ *     Used via read_seqbegin_or_lock() which first attempts a lockless read
+ *     (optimistic path) and falls back to exclusive locking if contention is
+ *     detected. This ensures the constructed pathname is consistent even if
+ *     d_move() renames directories during traversal. The seqlock retry mechanism
+ *     handles races by reconstructing the path if a rename occurred.
+ *
+ * lock: mount_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Global seqlock protecting the mount tree (defined in fs/namespace.c).
+ *     Used via read_seqbegin_or_lock() similar to rename_lock. This ensures
+ *     consistent mount point traversal if mounts change during path construction.
+ *     The syscall may retry path construction if mount_lock sequence indicates
+ *     concurrent mount activity.
+ *
+ * lock: fs->seq
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-process seqlock in struct fs_struct protecting the root and pwd
+ *     paths. Accessed via read_seqbegin()/read_seqretry() in
+ *     get_fs_root_and_pwd_rcu(). This ensures atomic snapshot of the process's
+ *     current working directory and root directory even if another thread calls
+ *     chdir() or chroot() concurrently.
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Kernel path buffer (names_cachep slab)
+ *   desc: Allocates a PATH_MAX-sized buffer from names_cachep slab via
+ *     __getname() for internal path construction. This memory is always freed
+ *     via __putname() before the syscall returns, regardless of success or
+ *     failure. The allocation uses GFP_KERNEL and may sleep.
+ *   reversible: yes
+ *
+ * constraint: Process context required
+ *   desc: Must be called from process context. Cannot be called from interrupt
+ *     context or softirq because the syscall may sleep during memory allocation
+ *     (__getname with GFP_KERNEL) and user memory access (copy_to_user may
+ *     trigger page faults).
+ *
+ * constraint: Path length limit
+ *   desc: The kernel limits pathname length to PATH_MAX (4096 bytes including
+ *     the null terminator). This is enforced during path construction. Paths
+ *     exceeding this limit cannot be returned even with an arbitrarily large
+ *     user buffer.
+ *   expr: path_length <= PATH_MAX
+ *
+ * examples: char buf[PATH_MAX]; long len = syscall(SYS_getcwd, buf, sizeof(buf));
+ *   // len contains length including null, or negative error code
+ *   // For most programs, use the glibc getcwd() wrapper instead
+ *
+ * notes: The kernel syscall behavior differs significantly from the POSIX C
+ *   library function getcwd(3). The library function returns a pointer to the
+ *   buffer on success and NULL on error (with errno set), while the syscall
+ *   returns the length on success or negative error on failure.
+ *
+ *   The glibc wrapper provides additional functionality not present in the
+ *   syscall: when buf is NULL, glibc allocates a buffer of sufficient size
+ *   (or size bytes if size is non-zero) using malloc(). This is a GNU extension
+ *   not part of POSIX.
+ *
+ *   Thread safety: This syscall is fully thread-safe. The seqlock-based
+ *   synchronization ensures that concurrent chdir(), chroot(), rename(), and
+ *   mount/unmount operations are handled correctly without corrupting the
+ *   returned pathname.
+ *
+ *   Historical note: A race condition between getcwd() and d_move() was fixed
+ *   in commit 61647823aa920 (2017). The race could cause getcwd() to return
+ *   ENOENT during a concurrent directory rename, even though the directory
+ *   was not actually deleted.
+ *
+ *   Performance: The syscall uses an optimistic lockless read path using RCU
+ *   and seqlocks. In the common case with no concurrent modifications, no
+ *   exclusive locks are taken. This makes getcwd() efficient even under high
+ *   filesystem activity.
+ *
+ * since-version: 2.1.92
  */
 SYSCALL_DEFINE2(getcwd, char __user *, buf, unsigned long, size)
 {
