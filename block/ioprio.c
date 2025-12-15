@@ -478,6 +478,219 @@ static int ioprio_best(unsigned short aprio, unsigned short bprio)
 	return min(aprio, bprio);
 }
 
+/**
+ * sys_ioprio_get - Get I/O scheduling class and priority
+ * @which: Type of target to query (process, pgrp, or user)
+ * @who: Identifier of target (PID, PGID, or UID), or 0 for current/self
+ *
+ * long-desc: Retrieves the I/O scheduling class and priority for one or more
+ *   processes. When multiple processes match (IOPRIO_WHO_PGRP or
+ *   IOPRIO_WHO_USER), returns the "best" (highest) priority found among
+ *   all matching processes. This syscall closely mimics getpriority(2)
+ *   semantics.
+ *
+ *   The @which parameter determines how @who is interpreted:
+ *   - IOPRIO_WHO_PROCESS (1): @who is a thread/process ID. If @who is 0,
+ *     the calling thread is targeted. Returns the raw ioprio value as set
+ *     by ioprio_set(). If no ioprio has been set, returns IOPRIO_DEFAULT
+ *     (IOPRIO_CLASS_NONE with level 0), allowing userspace to distinguish
+ *     between unset priority and explicitly set priority.
+ *   - IOPRIO_WHO_PGRP (2): @who is a process group ID. If @who is 0, the
+ *     calling process's process group is queried. Returns the best effective
+ *     priority among all threads in all processes in the process group.
+ *   - IOPRIO_WHO_USER (3): @who is a user ID (interpreted in the init user
+ *     namespace). All processes with that real UID and a visible PID in the
+ *     caller's PID namespace are queried. Note: @who of 0 means UID 0 (root),
+ *     NOT the caller's UID. Returns the best effective priority found.
+ *
+ *   The return value is a composite ioprio value where:
+ *   - Bits 13-15: I/O scheduling class (IOPRIO_CLASS_*)
+ *   - Bits 3-12: Optional I/O hints (IOPRIO_HINT_*)
+ *   - Bits 0-2: Priority level within class (0-7, lower is higher priority)
+ *
+ *   Use IOPRIO_PRIO_CLASS() to extract the class and IOPRIO_PRIO_LEVEL()
+ *   to extract the priority level from the return value.
+ *
+ *   Priority comparison for "best" priority:
+ *   - The ioprio_best() function returns the numerically smaller value
+ *   - Since higher classes have lower numeric values (RT=1, BE=2, IDLE=3),
+ *     RT class is preferred over BE, which is preferred over IDLE
+ *   - Within the same class, lower level numbers indicate higher priority
+ *
+ *   Difference between IOPRIO_WHO_PROCESS and other modes:
+ *   - IOPRIO_WHO_PROCESS uses get_task_raw_ioprio() which returns the raw
+ *     stored value (IOPRIO_DEFAULT if unset), preserving historical behavior
+ *     and allowing userspace to detect unset vs explicitly set priorities
+ *   - IOPRIO_WHO_PGRP and IOPRIO_WHO_USER use get_task_ioprio() which returns
+ *     the effective priority derived from the task's nice value if no explicit
+ *     ioprio has been set (matching what the I/O scheduler actually uses)
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be one of IOPRIO_WHO_PROCESS (1), IOPRIO_WHO_PGRP (2),
+ *     or IOPRIO_WHO_USER (3). Any other value returns EINVAL.
+ *
+ * param: who
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation depends on @which. For IOPRIO_WHO_PROCESS, this
+ *     is a PID (thread ID) where 0 means the calling thread. For IOPRIO_WHO_PGRP,
+ *     this is a process group ID where 0 means the caller's process group. For
+ *     IOPRIO_WHO_USER, this is a UID where 0 means UID 0 (root), not the caller's
+ *     UID. Negative values are treated as large positive values and will likely
+ *     result in ESRCH. Invalid or non-existent identifiers return ESRCH.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: Non-negative ioprio value (class in bits 13-15, level in bits 0-2)
+ *   desc: On success, returns the I/O priority of the target(s). For
+ *     IOPRIO_WHO_PROCESS, returns the raw value (IOPRIO_DEFAULT if unset).
+ *     For IOPRIO_WHO_PGRP and IOPRIO_WHO_USER, returns the best (highest)
+ *     effective priority among all matching processes. The return value
+ *     encodes both class and priority level. Use IOPRIO_PRIO_CLASS(ret)
+ *     and IOPRIO_PRIO_LEVEL(ret) to decode. On error, returns a negative
+ *     errno value.
+ *
+ * error: ESRCH, No matching process found
+ *   desc: No process matching the @which/@who criteria was found. For
+ *     IOPRIO_WHO_PROCESS, the specified PID does not exist or is not visible
+ *     in the caller's PID namespace (find_task_by_vpid returns NULL). For
+ *     IOPRIO_WHO_PGRP, the process group is empty or does not exist. For
+ *     IOPRIO_WHO_USER, no processes with the specified real UID exist that
+ *     are visible in the caller's PID namespace, or the user_struct for that
+ *     UID could not be found (find_user returns NULL).
+ *
+ * error: EINVAL, Invalid which value
+ *   desc: Returned when @which is not IOPRIO_WHO_PROCESS (1), IOPRIO_WHO_PGRP
+ *     (2), or IOPRIO_WHO_USER (3). Unlike ioprio_set, there is no validation
+ *     of the ioprio value itself since ioprio_get only reads priority.
+ *
+ * error: EACCES, LSM denied the operation
+ *   desc: The Linux Security Module (SELinux, Smack, etc.) denied reading the
+ *     I/O priority via security_task_getioprio() hook. SELinux requires
+ *     PROCESS__GETSCHED permission; Smack requires MAY_READ access. When
+ *     querying multiple processes (PGRP/USER), denied tasks are silently
+ *     skipped; only if ALL tasks are denied does ESRCH remain.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held around the entire process/pgrp/user lookup
+ *     and iteration to protect task_struct from being freed during access.
+ *     Acquired at syscall entry and released before return. Required for
+ *     find_task_by_vpid(), find_vpid(), task_pgrp(), and task_uid().
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The tasklist read lock is acquired for IOPRIO_WHO_PGRP to safely
+ *     iterate over all threads in the process group using do_each_pid_thread().
+ *     This prevents races with change_pid() that could move tasks between
+ *     hash lists during iteration (fix from commit e6a59aac8a871). Not
+ *     acquired for IOPRIO_WHO_USER which uses for_each_process_thread()
+ *     under RCU protection. Released after completing iteration.
+ *
+ * lock: task->alloc_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-task allocation lock (task_lock/task_unlock) is acquired
+ *     in get_task_ioprio() and get_task_raw_ioprio() when accessing the
+ *     task's io_context. This protects against concurrent modification or
+ *     freeing of io_context. Fix from commit 8ba8682107ee2.
+ *
+ * lock: uidhash_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The UID hash table lock is briefly acquired by find_user() when
+ *     looking up a user_struct for IOPRIO_WHO_USER with non-zero @who.
+ *     Acquired with IRQs disabled (spin_lock_irqsave). Not acquired when
+ *     @who is 0 since current_user() is used instead.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Syscall does not have interruptible waits
+ *   desc: This syscall does not have explicit signal handling. All lock
+ *     acquisitions are non-interruptible (spin_lock variants), and the
+ *     syscall completes quickly. No ERESTARTSYS or EINTR returns are
+ *     possible from this syscall.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: user_struct reference count
+ *   desc: For IOPRIO_WHO_USER with non-zero @who, find_user() increments
+ *     the reference count on the user_struct. This is decremented by
+ *     free_uid() before the syscall returns. When @who is 0, current_user()
+ *     is used which does not modify the reference count.
+ *   condition: IOPRIO_WHO_USER with non-zero @who
+ *   reversible: yes (automatically within syscall via free_uid)
+ *
+ * constraint: Process visibility (PID namespace)
+ *   desc: For IOPRIO_WHO_PROCESS and IOPRIO_WHO_PGRP, processes are looked
+ *     up using find_task_by_vpid() and find_vpid() which respect PID namespace
+ *     boundaries. Only processes visible in the caller's PID namespace can
+ *     be queried. For IOPRIO_WHO_USER, task_pid_vnr() must return non-zero
+ *     for a process to be included in the query.
+ *
+ * constraint: No capability required
+ *   desc: Unlike ioprio_set, no capabilities are required to query I/O
+ *     priority. Any process can query the ioprio of any other visible
+ *     process unless restricted by an LSM. This mirrors getpriority(2)
+ *     behavior.
+ *
+ * examples:
+ *   ioprio = ioprio_get(IOPRIO_WHO_PROCESS, 0);
+ *     // Get current thread's ioprio (raw value, IOPRIO_DEFAULT if unset)
+ *   ioprio = ioprio_get(IOPRIO_WHO_PROCESS, pid);
+ *     // Get specific thread's ioprio
+ *   ioprio = ioprio_get(IOPRIO_WHO_PGRP, 0);
+ *     // Get best ioprio in caller's process group (effective priorities)
+ *   ioprio = ioprio_get(IOPRIO_WHO_USER, getuid());
+ *     // Get best ioprio among all processes of current user
+ *   class = IOPRIO_PRIO_CLASS(ioprio);  // Extract class (0-7)
+ *   level = IOPRIO_PRIO_LEVEL(ioprio);  // Extract level (0-7)
+ *
+ * notes:
+ *   - Introduced in Linux 2.6.13 by Jens Axboe as part of the CFQ I/O
+ *     scheduler work.
+ *   - glibc does not provide a wrapper; use syscall(SYS_ioprio_get, ...).
+ *   - Despite IOPRIO_WHO_PROCESS's name, it queries individual threads, not
+ *     entire thread groups. To query priority for all threads in a process,
+ *     iterate through /proc/PID/task/ or use IOPRIO_WHO_PGRP if appropriate.
+ *   - Historical behavior preserved: IOPRIO_WHO_PROCESS returns raw ioprio
+ *     (IOPRIO_DEFAULT if never set) to allow userspace to distinguish unset
+ *     from explicitly set priorities. This was formalized in commit
+ *     4b838d9ee950b.
+ *   - For IOPRIO_WHO_PGRP and IOPRIO_WHO_USER, the effective priority is
+ *     returned. If a task has no explicit ioprio, the priority is derived
+ *     from the task's CPU nice value: io_nice = (cpu_nice + 20) / 5, with
+ *     class determined by the task's scheduling policy (RT tasks get
+ *     IOPRIO_CLASS_RT, SCHED_IDLE tasks get IOPRIO_CLASS_IDLE, others get
+ *     IOPRIO_CLASS_BE).
+ *   - Race condition fix: commit e6a59aac8a871 added tasklist_lock for PGRP
+ *     iteration to prevent races with change_pid(); commit 8ba8682107ee2
+ *     added task_lock for io_context access to prevent use-after-free.
+ *   - When LSM denies access to individual tasks during PGRP/USER queries,
+ *     those tasks are skipped (not an error). The return value reflects
+ *     only the tasks that were accessible.
+ *   - The "best" priority is determined by ioprio_best() which returns
+ *     min(a, b). Since lower ioprio values mean higher priority (RT class
+ *     is 1, BE is 2, IDLE is 3), this effectively returns the highest
+ *     priority found.
+ *
+ * since-version: 2.6.13
+ */
 SYSCALL_DEFINE2(ioprio_get, int, which, int, who)
 {
 	struct task_struct *g, *p;
