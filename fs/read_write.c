@@ -2138,6 +2138,427 @@ SYSCALL_DEFINE3(readv, unsigned long, fd, const struct iovec __user *, vec,
 	return do_readv(fd, vec, vlen, 0);
 }
 
+/**
+ * sys_writev - Write data from multiple buffers to a file (gather write)
+ * @fd: File descriptor to write to
+ * @vec: Pointer to array of iovec structures describing buffers
+ * @vlen: Number of iovec structures in the array
+ *
+ * long-desc: Performs gather output by writing data from multiple buffers
+ *   specified by the iovec array vec to the file descriptor fd. This syscall
+ *   writes vlen buffers from the buffers described by vec to the file
+ *   associated with fd, processing them in order from vec[0] to vec[vlen-1].
+ *   Each iovec structure specifies a base address and length for one buffer.
+ *
+ *   The writev() syscall works like write(2) except that multiple buffers are
+ *   written. The buffers are processed in array order: all of vec[0] is written
+ *   before vec[1], and so on. This allows efficient gather I/O where data
+ *   naturally resides in multiple non-contiguous memory regions (e.g., a
+ *   protocol header and payload in separate buffers).
+ *
+ *   The data transfer performed by writev() is atomic with respect to other
+ *   writes: the data written appears as a contiguous block that is not
+ *   intermingled with writes from other processes or threads. For seekable
+ *   files, the write begins at the current file offset, which is then
+ *   incremented by the number of bytes written. For non-seekable files
+ *   (pipes, sockets, FMODE_STREAM), the file offset is not used.
+ *
+ *   On Linux, writev() transfers at most MAX_RW_COUNT (approximately 2GB minus
+ *   one page) bytes per call, regardless of the total length specified in the
+ *   iovec array. Individual iov_len values are clamped to ensure the total
+ *   does not exceed this limit. This is transparent to the caller.
+ *
+ *   The number of bytes written may be less than the total requested if the
+ *   disk becomes full, the process hits its resource limits (RLIMIT_FSIZE),
+ *   the write was interrupted by a signal after some data was transferred,
+ *   or the underlying file type does not guarantee full writes (pipes,
+ *   sockets, terminals, non-blocking devices).
+ *
+ *   Unlike read operations, writes to regular files may modify multiple
+ *   file metadata attributes: modification time (mtime), change time (ctime),
+ *   and may clear the setuid/setgid bits if the file has them set.
+ *
+ *   POSIX requires that writev() fail with EINVAL if the sum of iov_len values
+ *   overflows ssize_t. Linux prevents this overflow by clamping to MAX_RW_COUNT.
+ *   POSIX also permits writev() to fail if iovcnt is <= 0 or > IOV_MAX; Linux
+ *   returns 0 for iovcnt == 0 and EINVAL for iovcnt > UIO_MAXIOV (1024).
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, ULONG_MAX
+ *   constraint: Must be a valid, open file descriptor with write permission.
+ *     The file must have been opened with O_WRONLY, O_RDWR, or O_APPEND.
+ *     File descriptors opened with O_RDONLY, O_PATH, or that have been closed
+ *     return EBADF. Standard file descriptors 0 (stdin), 1 (stdout), 2 (stderr)
+ *     are valid if open and writable. AT_FDCWD and other special values are
+ *     not valid. Despite being unsigned long, values > INT_MAX may fail fdget().
+ *
+ * param: vec
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid, readable user-space array of struct
+ *     iovec containing vlen elements. Each iovec structure contains:
+ *     - iov_base: pointer to a readable user-space buffer containing data
+ *     - iov_len: size of the buffer (must be non-negative when cast to ssize_t)
+ *     NULL is valid only when vlen is 0 (returns 0 immediately). Each iov_base
+ *     must pass access_ok() validation; invalid addresses return EFAULT.
+ *     On compat syscalls (32-bit process on 64-bit kernel), the iovec structure
+ *     uses compat_uptr_t and compat_size_t for its members.
+ *
+ * param: vlen
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UIO_MAXIOV
+ *   constraint: Number of iovec structures in vec array. Must be <= UIO_MAXIOV
+ *     (1024); values > 1024 return EINVAL. A value of 0 returns 0 immediately
+ *     without writing any data or accessing the file (but fd must still be
+ *     valid). For vlen <= UIO_FASTIOV (8), the iovec array is copied to a
+ *     stack buffer; larger arrays require heap allocation which may fail with
+ *     ENOMEM under memory pressure.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: >= 0
+ *   desc: On success, returns the number of bytes written (non-negative). Zero
+ *     indicates that either no data was available to write, the total iov_len
+ *     was 0, or vlen was 0. The return value may be less than the total
+ *     requested if the disk fills up, RLIMIT_FSIZE is reached, a non-blocking
+ *     operation would block, or a signal interrupts after partial write.
+ *     Partial writes are not errors; the caller should retry with adjusted
+ *     buffers. On error, returns a negative error code.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid file descriptor, or fd was not opened for writing.
+ *     This includes file descriptors opened with O_RDONLY, O_PATH, or file
+ *     descriptors that have been closed. Also returned if the file structure
+ *     does not have FMODE_WRITE set.
+ *
+ * error: EFAULT, Bad address
+ *   desc: vec points outside the accessible address space, or one of the
+ *     iov_base pointers in the iovec array points to invalid memory. The
+ *     validation occurs via access_ok() in import_iovec() before any write
+ *     operation. Can also occur if copy_from_user() fails when reading the
+ *     iovec array itself, or copy_from_user() fails during data transfer.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) vlen exceeds UIO_MAXIOV (1024).
+ *     (2) An iov_len value, when cast to ssize_t, is negative (indicating the
+ *     user passed an excessively large unsigned value). (3) The file does not
+ *     support writing (FMODE_CAN_WRITE not set). (4) The file was opened with
+ *     O_DIRECT and alignment requirements are not met. (5) For atomic writes
+ *     (RWF_ATOMIC via pwritev2), the length is not power of 2 or position is
+ *     not aligned. (6) RWF_NOWAIT specified but file doesn't support it.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed when vlen > UIO_FASTIOV (8). For small
+ *     iovec arrays (<= 8 elements), a stack-allocated buffer is used, avoiding
+ *     this error. Larger arrays require kmalloc_array() which can fail under
+ *     memory pressure. Can also occur during page cache allocation for
+ *     buffered writes.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: fd refers to a file (pipe, socket, device) that is marked non-blocking
+ *     (O_NONBLOCK) and the write would block because the output buffer is full
+ *     or the resource is temporarily unavailable. Equivalent to EWOULDBLOCK.
+ *     Also returned if RWF_NOWAIT is used and the write would block. The
+ *     application should retry later or use select/poll/epoll to wait.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The call was interrupted by a signal before any data was written. This
+ *     only occurs if no data has been transferred; if some data was written
+ *     before the signal, the call returns the number of bytes written. The
+ *     caller should typically check for this error and restart the write.
+ *
+ * error: EIO, Input/output error
+ *   desc: A low-level I/O error occurred. For regular files, this typically
+ *     indicates a hardware error on the storage device, a filesystem error,
+ *     or a network filesystem timeout. May also indicate previous asynchronous
+ *     write errors being reported synchronously.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The device containing the file has no room for the data. For regular
+ *     files, this indicates the filesystem is full. For tmpfs/ramfs, this
+ *     indicates memory exhaustion. Partial writes may have occurred before
+ *     hitting this condition; check the return value.
+ *
+ * error: EDQUOT, Disk quota exceeded
+ *   desc: The user's disk quota for the filesystem has been exhausted. This
+ *     can occur even if the filesystem has free space. Quota limits are
+ *     per-user or per-group depending on filesystem configuration.
+ *
+ * error: EFBIG, File too large
+ *   desc: An attempt was made to write data that would cause the file size to
+ *     exceed the implementation-defined maximum file size (s_maxbytes) or the
+ *     process's file size limit (RLIMIT_FSIZE). For files not opened with
+ *     O_LARGEFILE, the limit is 2GB (MAX_NON_LFS). When RLIMIT_FSIZE is hit,
+ *     SIGXFSZ is also sent to the process.
+ *
+ * error: EPIPE, Broken pipe
+ *   desc: fd refers to a pipe or socket whose reading end has been closed.
+ *     When this occurs, SIGPIPE is also sent to the calling process unless
+ *     the MSG_NOSIGNAL flag is used (for sockets) or SIGPIPE is blocked.
+ *     Commonly encountered when writing to a closed network connection.
+ *
+ * error: EOVERFLOW, Value too large for defined data type
+ *   desc: The file position plus total count would exceed LLONG_MAX. Also
+ *     returned when writing to certain special files where the position would
+ *     overflow. For files without FOP_UNSIGNED_OFFSET, negative positions are
+ *     not allowed after the operation would complete.
+ *
+ * error: EACCES, Permission denied
+ *   desc: The security subsystem (LSM such as SELinux or AppArmor) denied
+ *     the write operation via security_file_permission(). This can occur even
+ *     if the file was successfully opened, as LSM policies may enforce per-
+ *     operation checks. The specific policy that denied access may be logged.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Returned in several cases: (1) fanotify permission events when a
+ *     user-space listener denies the write via fsnotify_file_area_perm().
+ *     (2) Attempting to write to a file with the immutable attribute (chattr +i).
+ *     (3) RWF_NOAPPEND specified on an append-only file (chattr +a).
+ *
+ * error: EROFS, Read-only file system
+ *   desc: The filesystem containing the file is mounted read-only. This can
+ *     happen if the filesystem was remounted read-only after the file was
+ *     opened, or for inherently read-only filesystems.
+ *
+ * error: ETXTBSY, Text file busy
+ *   desc: An attempt was made to write to a file that is currently being used
+ *     as a swap file. This is a specialized check to prevent corruption of
+ *     active swap space.
+ *
+ * error: ERESTARTSYS, Restart system call (internal)
+ *   desc: Internal error code indicating the syscall should be restarted. This
+ *     is typically translated to EINTR if SA_RESTART is not set on the signal
+ *     handler, or the syscall is transparently restarted if SA_RESTART is set.
+ *     User space should not see this error code directly.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The file does not support the requested operation. This can occur
+ *     with RWF_* flags via pwritev2() when the file or filesystem doesn't
+ *     support the requested behavior (RWF_NOWAIT, RWF_ATOMIC, RWF_DONTCACHE).
+ *     Also returned by do_loop_readv_writev() if flags other than RWF_HIPRI
+ *     are used with the legacy write() path.
+ *
+ * lock: file->f_pos_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: conditional
+ *   released: true
+ *   desc: For regular files that require atomic position updates (FMODE_ATOMIC_POS),
+ *     the f_pos_lock mutex is acquired by fdget_pos() at syscall entry and released
+ *     by fdput_pos() at syscall exit. This serializes concurrent writev() calls that
+ *     share the same file description. Not acquired for stream files (FMODE_STREAM
+ *     such as pipes, sockets) or when the file is not shared between threads.
+ *
+ * lock: sb_writers (freeze protection)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: conditional
+ *   released: true
+ *   desc: For regular files, file_start_write() acquires the superblock's write
+ *     freeze protection (SB_FREEZE_WRITE level) via sb_start_write(). This prevents
+ *     the filesystem from being frozen while a write is in progress. Released by
+ *     file_end_write() after the write completes. Not acquired for non-regular
+ *     files (pipes, sockets, devices, directories).
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's write_iter method typically acquires the inode's
+ *     i_rwsem for exclusive access during writes. For generic_file_write_iter(),
+ *     this is acquired via inode_lock(). Provides serialization against other
+ *     writes and certain reads (e.g., direct I/O). Some filesystems may use
+ *     different locking strategies.
+ *
+ * lock: Filesystem-specific locks
+ *   type: KAPI_LOCK_CUSTOM
+ *   acquired: conditional
+ *   released: true
+ *   desc: The filesystem's write_iter or write method may acquire additional locks.
+ *     For pipes, the pipe->mutex is acquired. For sockets, the socket lock is
+ *     acquired. For ext4, the i_data_sem may be acquired for extent manipulation.
+ *     These are internal to the file operation and released before return.
+ *
+ * lock: RCU read-side
+ *   type: KAPI_LOCK_RCU
+ *   acquired: conditional
+ *   released: true
+ *   desc: Used during file descriptor lookup via fdget_pos(). RCU read lock
+ *     protects access to the file descriptor table. Released by fdput_pos()
+ *     at syscall exit.
+ *
+ * signal: SIGXFSZ
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: When write would exceed RLIMIT_FSIZE
+ *   desc: If the write would cause the file to exceed the process's file size
+ *     limit (RLIMIT_FSIZE), the kernel sends SIGXFSZ to the process before
+ *     returning EFBIG. The default action is to terminate the process. If the
+ *     signal is caught or ignored, the syscall returns EFBIG.
+ *   timing: KAPI_SIGNAL_TIME_BEFORE
+ *
+ * signal: SIGPIPE
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: When writing to a pipe or socket with no readers
+ *   desc: When writing to a pipe or socket whose reading end has been closed,
+ *     the kernel sends SIGPIPE to the process. The default action terminates
+ *     the process. If SIGPIPE is blocked, caught, or ignored, the syscall
+ *     returns EPIPE instead. For sockets, MSG_NOSIGNAL prevents SIGPIPE.
+ *   error: -EPIPE
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: Any signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: When blocked waiting for buffer space or locks
+ *   desc: The syscall may be interrupted by signals while waiting for buffer
+ *     space (pipes, sockets), waiting for locks, or during slow I/O. If
+ *     interrupted before any data is written, returns -EINTR or -ERESTARTSYS.
+ *     If data has already been written, returns the number of bytes written.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes
+ *
+ * side-effect: KAPI_EFFECT_FILE_POSITION
+ *   target: file->f_pos
+ *   condition: For seekable files when write succeeds (returns > 0)
+ *   desc: The file offset (f_pos) is advanced by the number of bytes written.
+ *     For stream files (FMODE_STREAM such as pipes and sockets), the offset
+ *     is not used or modified. For O_APPEND files, the position is first set
+ *     to the end of file before writing. The offset update is protected by
+ *     f_pos_lock when the file is shared between threads/processes.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode timestamps (mtime, ctime)
+ *   condition: When write succeeds and modifies file content
+ *   desc: Updates the file's modification time (mtime) and change time (ctime)
+ *     via file_update_time(). The update may be delayed by lazytime mount
+ *     option or filesystem-specific behaviors. For O_NOATIME files, only
+ *     mtime/ctime are updated, not atime.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: inode SUID/SGID bits
+ *   condition: When writing to a setuid/setgid file by non-root
+ *   desc: For security, writing to a file clears its setuid bit and (if the
+ *     writer is not in the file's group) the setgid bit via file_remove_privs().
+ *     This prevents creating setuid/setgid executables through modification.
+ *     The check uses dentry_needs_remove_privs() and notify_change().
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task I/O accounting
+ *   condition: Always (after write attempt)
+ *   desc: Updates the current task's I/O accounting statistics. The wchar field
+ *     (write characters) is incremented by bytes written via add_wchar(). The
+ *     syscw field (syscall write count) is incremented via inc_syscw(). These
+ *     statistics are visible in /proc/[pid]/io. Updated regardless of success
+ *     or failure (syscw always incremented, wchar only on successful writes).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   condition: When write returns > 0
+ *   desc: Generates an FS_MODIFY fsnotify event via fsnotify_modify() allowing
+ *     inotify, fanotify, and dnotify watchers to be notified of the write. This
+ *     occurs after data transfer completes successfully.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: file content and size
+ *   condition: When write succeeds
+ *   desc: The file's content is modified with the data from the iovec buffers.
+ *     If writing beyond the current end-of-file, the file size is extended.
+ *     For buffered I/O, data may be written to page cache first and flushed
+ *     later. For O_DIRECT or O_SYNC files, data is written synchronously.
+ *   reversible: no
+ *
+ * capability: CAP_DAC_OVERRIDE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass discretionary access control on write permission
+ *   without: Standard DAC checks are enforced
+ *   condition: Checked via security_file_permission() during rw_verify_area()
+ *
+ * capability: CAP_FOWNER
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Bypass permission checks for file modification operations
+ *   without: Must be file owner for certain operations
+ *   condition: Checked when clearing SUID/SGID bits via file_remove_privs()
+ *
+ * constraint: UIO_MAXIOV limit
+ *   desc: The vlen parameter must not exceed UIO_MAXIOV (1024). This limit is
+ *     defined by POSIX (IOV_MAX) and prevents excessive memory allocation for
+ *     the iovec array. Historical Linux kernels (2.0) had a limit of 16.
+ *   expr: vlen <= 1024
+ *
+ * constraint: MAX_RW_COUNT limit
+ *   desc: The total bytes to write (sum of all iov_len values) is clamped to
+ *     MAX_RW_COUNT (INT_MAX & PAGE_MASK, approximately 2GB minus one page) to
+ *     prevent integer overflow in internal calculations. This is transparent
+ *     to the caller; individual iov_len values are truncated as needed.
+ *   expr: actual_total = min(sum(iov_len), MAX_RW_COUNT)
+ *
+ * constraint: RLIMIT_FSIZE limit
+ *   desc: The write is limited by the process's soft RLIMIT_FSIZE resource
+ *     limit. If the current file position plus bytes to write exceeds this
+ *     limit, the write is truncated to the limit boundary and SIGXFSZ may be
+ *     sent. If the position already exceeds the limit, EFBIG is returned
+ *     immediately with SIGXFSZ sent.
+ *   expr: pos + count <= rlimit(RLIMIT_FSIZE) || rlimit(RLIMIT_FSIZE) == RLIM_INFINITY
+ *
+ * constraint: File must be open for writing
+ *   desc: The file descriptor must have been opened with O_WRONLY or O_RDWR.
+ *     Files opened with O_RDONLY or O_PATH cannot be written and return EBADF.
+ *     The file must have both FMODE_WRITE and FMODE_CAN_WRITE flags set.
+ *   expr: (file->f_mode & FMODE_WRITE) && (file->f_mode & FMODE_CAN_WRITE)
+ *
+ * examples: n = writev(fd, iov, 3);  // Write from 3 buffers
+ *   struct iovec iov[2] = {{header, hdr_len}, {payload, payload_len}};
+ *   n = writev(sockfd, iov, 2);  // Gather write to socket
+ *   while (remaining > 0 && (n = writev(fd, iov, iovcnt)) > 0) { adjust(iov, n); }
+ *
+ * notes: writev() is particularly useful when data has a known structure with
+ *   a header and payload, or when sending protocol messages without copying.
+ *   Common use cases include:
+ *
+ *   - Network protocols: Writing a fixed-size header from one buffer and
+ *     variable-length payload from another without copying into a single buffer.
+ *
+ *   - Database systems: Writing a record header and data fields separately.
+ *
+ *   - Logging systems: Writing timestamp, level, and message from separate buffers.
+ *
+ *   The atomic nature of writev() ensures that for regular files, the entire
+ *   operation uses a single file position snapshot, preventing interleaving
+ *   with concurrent operations on the same file description.
+ *
+ *   For optimal performance with small iovec counts (<= 8), writev() uses a
+ *   stack-allocated buffer (UIO_FASTIOV), avoiding heap allocation overhead.
+ *   For larger counts, consider whether the overhead is justified.
+ *
+ *   Unlike read operations, writes may fail mid-transfer due to disk full or
+ *   quota exhaustion. Always check the return value and be prepared to handle
+ *   partial writes by adjusting the iovec array and retrying.
+ *
+ *   For pipes and FIFOs, writes of PIPE_BUF (typically 4096) bytes or less are
+ *   guaranteed to be atomic. Larger writes may be interleaved with other writers.
+ *
+ *   Related syscalls: pwritev() combines writev() with positioned write (like
+ *   pwrite()), pwritev2() adds flags for per-operation control (RWF_DSYNC,
+ *   RWF_SYNC, RWF_APPEND, RWF_NOWAIT, RWF_ATOMIC), and process_vm_writev()
+ *   writes to another process's address space.
+ *
+ * since-version: 2.0
+ */
 SYSCALL_DEFINE3(writev, unsigned long, fd, const struct iovec __user *, vec,
 		unsigned long, vlen)
 {
