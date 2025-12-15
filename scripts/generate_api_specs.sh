@@ -46,6 +46,8 @@ cat <<EOF
 #include <linux/quota.h>
 #include <linux/uio.h>
 #include <linux/time.h>
+#include <uapi/linux/watch_queue.h>
+#include <uapi/linux/falloc.h>
 
 #ifdef CONFIG_KAPI_SPEC
 

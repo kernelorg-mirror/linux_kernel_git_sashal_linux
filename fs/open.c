@@ -363,6 +363,314 @@ int ksys_fallocate(int fd, int mode, loff_t offset, loff_t len)
 	return vfs_fallocate(fd_file(f), mode, offset, len);
 }
 
+/**
+ * sys_fallocate - Manipulate file space allocation
+ * @fd: File descriptor of the target file
+ * @mode: Operation mode flags (FALLOC_FL_* bitmask)
+ * @offset: Starting byte offset for the operation
+ * @len: Length in bytes of the range to operate on
+ *
+ * long-desc: Manipulates the allocated disk space for a file within the
+ *   specified range [offset, offset+len). The behavior depends on the mode
+ *   flags provided. This is a Linux-specific syscall; the portable alternative
+ *   is posix_fallocate(3), which provides a subset of functionality.
+ *
+ *   Mode 0 (FALLOC_FL_ALLOCATE_RANGE): Allocates disk space for the specified
+ *   range, ensuring subsequent writes won't fail due to lack of space. If the
+ *   range extends beyond EOF, the file size is increased. Uninitialized regions
+ *   within the range read as zeros. Allocation may exceed the requested range
+ *   due to filesystem block size rounding.
+ *
+ *   FALLOC_FL_KEEP_SIZE: Can be ORed with allocation modes. Prevents file size
+ *   changes even if offset+len exceeds i_size. Useful for preallocating space
+ *   for append workloads without changing visible file size.
+ *
+ *   FALLOC_FL_PUNCH_HOLE: Deallocates space in the range, creating a hole.
+ *   Partial blocks are zeroed; whole blocks are removed. MUST be combined with
+ *   FALLOC_FL_KEEP_SIZE. File size remains unchanged. Supported on ext4, XFS,
+ *   Btrfs, tmpfs, gfs2, and others.
+ *
+ *   FALLOC_FL_COLLAPSE_RANGE: Removes the byte range without leaving a hole.
+ *   Content after the range is shifted to offset, reducing file size by len
+ *   bytes. Both offset and len must be multiples of filesystem block size.
+ *   Cannot reach or pass EOF. Cannot be combined with other flags.
+ *
+ *   FALLOC_FL_ZERO_RANGE: Zeros the range efficiently using unwritten extents
+ *   or metadata operations when possible. Blocks are preallocated for hole
+ *   regions. Can be combined with FALLOC_FL_KEEP_SIZE.
+ *
+ *   FALLOC_FL_INSERT_RANGE: Inserts a hole at offset, shifting existing content
+ *   upward by len bytes, increasing file size. Both offset and len must be
+ *   multiples of filesystem block size. Offset must be less than EOF. Cannot
+ *   be combined with other flags.
+ *
+ *   FALLOC_FL_UNSHARE_RANGE: Unshares copy-on-write blocks, making them private.
+ *   Useful for ensuring subsequent writes don't fail due to CoW space issues.
+ *   Cannot be combined with punch, zero, collapse, or insert modes.
+ *
+ *   FALLOC_FL_WRITE_ZEROES: Zeros a range in a way optimized for subsequent
+ *   overwrites. May use hardware write-zeroes commands. Cannot be combined
+ *   with FALLOC_FL_KEEP_SIZE.
+ *
+ *   Filesystem support varies. Not all filesystems support all modes. Block
+ *   devices support basic allocation. Pipes, FIFOs, sockets, and directories
+ *   are not supported.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: fd
+ *   type: KAPI_TYPE_FD
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid file descriptor open for writing (O_WRONLY or
+ *     O_RDWR). Must refer to a regular file or block device. Pipes, FIFOs,
+ *     directories, sockets, and most special files are not supported.
+ *
+ * param: mode
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+ *               FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE |
+ *               FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE |
+ *               FALLOC_FL_WRITE_ZEROES
+ *   constraint: Mode flags are mutually exclusive (only one operation type),
+ *     except FALLOC_FL_KEEP_SIZE which can be combined with allocation,
+ *     unshare, and zero-range modes. FALLOC_FL_PUNCH_HOLE requires
+ *     FALLOC_FL_KEEP_SIZE to be set. FALLOC_FL_COLLAPSE_RANGE,
+ *     FALLOC_FL_INSERT_RANGE, and FALLOC_FL_WRITE_ZEROES cannot be combined
+ *     with FALLOC_FL_KEEP_SIZE. Mode 0 (no flags) performs space preallocation.
+ *
+ * param: offset
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, LLONG_MAX
+ *   constraint: Must be non-negative. For FALLOC_FL_COLLAPSE_RANGE and
+ *     FALLOC_FL_INSERT_RANGE, must be aligned to filesystem block size.
+ *     For FALLOC_FL_INSERT_RANGE, must be strictly less than current file
+ *     size. For FALLOC_FL_COLLAPSE_RANGE, offset+len must not reach or
+ *     exceed EOF. offset+len must not overflow loff_t or exceed s_maxbytes.
+ *
+ * param: len
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_NONZERO
+ *   constraint: Must be strictly positive (len > 0). For FALLOC_FL_COLLAPSE_RANGE
+ *     and FALLOC_FL_INSERT_RANGE, must be aligned to filesystem block size.
+ *     offset+len must not overflow or exceed maximum file size limits.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *     The operation is generally not atomic; a failure may leave the file
+ *     in a partially modified state depending on the filesystem.
+ *
+ * error: EBADF, Bad file descriptor
+ *   desc: fd is not a valid open file descriptor, or fd is not opened for
+ *     writing (missing O_WRONLY or O_RDWR access mode).
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned for multiple conditions: (1) offset is negative, (2) len
+ *     is zero or negative, (3) for FALLOC_FL_COLLAPSE_RANGE or
+ *     FALLOC_FL_INSERT_RANGE, offset or len is not a multiple of the
+ *     filesystem logical block size, (4) for FALLOC_FL_COLLAPSE_RANGE,
+ *     offset+len reaches or exceeds EOF, (5) for FALLOC_FL_INSERT_RANGE,
+ *     offset is at or beyond EOF, (6) mode contains incompatible flag
+ *     combinations.
+ *
+ * error: EOPNOTSUPP, Operation not supported
+ *   desc: The filesystem does not implement fallocate, or does not support
+ *     the requested mode. Also returned for unsupported flag combinations
+ *     that pass initial validation, or when the filesystem-specific handler
+ *     rejects the operation (e.g., collapse/insert on encrypted ext4 files).
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: The file has the immutable attribute set (chattr +i), or the file
+ *     is append-only (chattr +a) and the operation is not pure preallocation.
+ *     Also returned when file seals prevent the operation: F_SEAL_WRITE or
+ *     F_SEAL_FUTURE_WRITE blocks punch-hole, F_SEAL_GROW blocks operations
+ *     that would extend the file.
+ *
+ * error: ETXTBSY, Text file busy
+ *   desc: The file is an active swap file, or for FALLOC_FL_COLLAPSE_RANGE
+ *     or FALLOC_FL_INSERT_RANGE, the file is currently being executed.
+ *
+ * error: ESPIPE, Illegal seek
+ *   desc: fd refers to a pipe or FIFO, which do not support fallocate.
+ *
+ * error: EISDIR, Is a directory
+ *   desc: fd refers to a directory. Directories do not support fallocate.
+ *
+ * error: ENODEV, No such device
+ *   desc: fd refers to a file type that is not a regular file or block
+ *     device (e.g., socket, character device).
+ *
+ * error: EFBIG, File too large
+ *   desc: offset+len exceeds the maximum file size supported by the
+ *     filesystem (s_maxbytes), or would cause offset+len to overflow,
+ *     or (when extending file size) would exceed RLIMIT_FSIZE. When
+ *     RLIMIT_FSIZE is exceeded, SIGXFSZ is also sent to the process.
+ *
+ * error: ENOSPC, No space left on device
+ *   desc: The device containing the file has insufficient free space to
+ *     allocate the requested blocks. Also returned by tmpfs when the
+ *     requested range exceeds configured maximum blocks.
+ *
+ * error: EIO, I/O error
+ *   desc: An I/O error occurred during the filesystem operation, typically
+ *     when reading or writing metadata or data blocks.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Insufficient kernel memory to complete the operation. This may
+ *     occur during extent allocation, page cache operations, or internal
+ *     structure allocation.
+ *
+ * error: EINTR, Interrupted system call
+ *   desc: The operation was interrupted by a signal before completion.
+ *     Some filesystems check for fatal signals during long-running
+ *     allocation loops and may return early with partial completion.
+ *
+ * lock: sb_writers (SB_FREEZE_WRITE level)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired via file_start_write() to prevent filesystem freeze
+ *     during the operation. This is a per-cpu read-write semaphore that
+ *     blocks freeze_super() while held. Released via file_end_write()
+ *     after the filesystem's fallocate handler returns.
+ *
+ * lock: inode->i_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by filesystem-specific fallocate handlers (e.g., ext4,
+ *     XFS, Btrfs) to serialize access to inode metadata and prevent
+ *     concurrent modifications. Most filesystems acquire this lock
+ *     exclusively. Released before return.
+ *
+ * lock: mapping->invalidate_lock
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: conditional
+ *   released: true
+ *   desc: Acquired by some filesystem handlers (e.g., ext4 for punch-hole,
+ *     collapse, insert, zero-range) to prevent page cache invalidation
+ *     races. Prevents page faults from reinstantiating pages being removed.
+ *
+ * signal: SIGXFSZ
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When file size change would exceed RLIMIT_FSIZE
+ *   desc: Sent to the calling process when the operation would extend the
+ *     file size beyond the soft RLIMIT_FSIZE limit. The signal is sent
+ *     via send_sig() from inode_newsize_ok() and the syscall returns
+ *     -EFBIG. The default action for SIGXFSZ is to terminate the process.
+ *   timing: KAPI_SIGNAL_TIME_BEFORE
+ *
+ * signal: pending_signals
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: During long-running filesystem operations
+ *   desc: Some filesystems (e.g., tmpfs/shmem) check fatal_signal_pending()
+ *     during allocation loops. If a fatal signal is pending, the operation
+ *     aborts early, potentially leaving the file partially modified.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_MODIFY_STATE
+ *   target: File data blocks and metadata
+ *   desc: Allocates, deallocates, or modifies disk blocks associated with
+ *     the file depending on mode. For preallocation (mode 0), blocks are
+ *     reserved. For punch-hole, blocks are freed. For collapse/insert,
+ *     block mappings are reorganized. For zero-range, blocks may be
+ *     converted to unwritten extents or zeroed.
+ *   condition: Always on success
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File size (i_size)
+ *   desc: Unless FALLOC_FL_KEEP_SIZE is specified, extending allocations
+ *     increase i_size to offset+len. FALLOC_FL_COLLAPSE_RANGE decreases
+ *     i_size by len bytes. FALLOC_FL_INSERT_RANGE increases i_size by
+ *     len bytes. FALLOC_FL_PUNCH_HOLE never changes i_size (requires
+ *     KEEP_SIZE flag).
+ *   condition: When not using FALLOC_FL_KEEP_SIZE and range extends beyond EOF
+ *   reversible: yes (via truncate)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Inode timestamps (ctime, mtime)
+ *   desc: The inode's ctime and mtime are updated to the current time
+ *     via file_modified() called by filesystem handlers. This reflects
+ *     that the file's content or metadata has changed.
+ *   condition: On successful modification
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: File mode bits (setuid, setgid)
+ *   desc: The setuid and setgid bits may be cleared from the file mode
+ *     via file_remove_privs() called by file_modified(). This security
+ *     measure prevents privilege escalation after file modification.
+ *   condition: When file has setuid/setgid bits and is modified
+ *   reversible: yes (via chmod)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify events
+ *   desc: On successful completion, fsnotify_modify() is called to generate
+ *     inotify and fanotify FS_MODIFY events, notifying watchers of the
+ *     file content change. Events are generated even for KEEP_SIZE
+ *     operations that don't change visible file size.
+ *   condition: Operation succeeds (returns 0)
+ *   reversible: no
+ *
+ * constraint: File Seals
+ *   desc: For files with seals (e.g., memfd, shmem), certain seals block
+ *     specific operations. F_SEAL_WRITE and F_SEAL_FUTURE_WRITE prevent
+ *     punch-hole operations. F_SEAL_GROW prevents operations that would
+ *     extend the file size. F_SEAL_SHRINK prevents collapse operations
+ *     (implicit in setattr checks). Sealed files return -EPERM.
+ *
+ * constraint: Filesystem Block Alignment
+ *   desc: FALLOC_FL_COLLAPSE_RANGE and FALLOC_FL_INSERT_RANGE require both
+ *     offset and len to be aligned to the filesystem's logical block size.
+ *     The specific alignment requirement varies by filesystem. Misaligned
+ *     requests return -EINVAL.
+ *
+ * constraint: Resource Limits
+ *   desc: When extending file size, the new size is checked against
+ *     RLIMIT_FSIZE. If the limit would be exceeded, SIGXFSZ is sent and
+ *     -EFBIG is returned. The filesystem's s_maxbytes limit also applies.
+ *     Some filesystems (tmpfs) have additional block count limits.
+ *
+ * examples: fallocate(fd, 0, 0, 1048576);  // Preallocate 1MB from start
+ *   fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4096);  // Preallocate without size change
+ *   fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4096, 4096);  // Punch hole
+ *   fallocate(fd, FALLOC_FL_ZERO_RANGE, 0, 4096);  // Zero first 4KB
+ *   fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, 4096, 4096);  // Remove second 4KB block
+ *   fallocate(fd, FALLOC_FL_INSERT_RANGE, 4096, 4096);  // Insert 4KB hole
+ *
+ * notes: This is a Linux-specific syscall introduced in Linux 2.6.23. The
+ *   portable POSIX equivalent is posix_fallocate(3), which only supports
+ *   basic allocation (mode 0 behavior) and falls back to writing zeros
+ *   if the filesystem lacks native support.
+ *
+ *   On 32-bit architectures, the compat syscall splits the 64-bit offset
+ *   and len parameters into high/low 32-bit pairs.
+ *
+ *   Filesystem support for various modes: ext4 supports all modes except
+ *   UNSHARE (extent-based files only for some modes). XFS supports all
+ *   modes. Btrfs supports allocation, punch-hole, and zero-range. tmpfs
+ *   supports allocation and punch-hole. NFS v4.2+ supports allocation,
+ *   punch-hole, and zero-range. Block devices support basic allocation.
+ *
+ *   The operation is NOT guaranteed to be atomic. A crash or error during
+ *   the operation may leave the file in a partially modified state. For
+ *   data integrity, use fsync() after fallocate().
+ *
+ * since-version: 2.6.23
+ */
 SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
 {
 	return ksys_fallocate(fd, mode, offset, len);
