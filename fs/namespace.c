@@ -5171,30 +5171,313 @@ bool path_is_under(const struct path *path1, const struct path *path2)
 }
 EXPORT_SYMBOL(path_is_under);
 
-/*
- * pivot_root Semantics:
- * Moves the root file system of the current process to the directory put_old,
- * makes new_root as the new root file system of the current process, and sets
- * root/cwd of all processes which had them on the current root to new_root.
+/**
+ * sys_pivot_root - Change the root filesystem
+ * @new_root: Path to the new root filesystem mount point
+ * @put_old: Path where the old root will be moved to
  *
- * Restrictions:
- * The new_root and put_old must be directories, and  must not be on the
- * same file  system as the current process root. The put_old  must  be
- * underneath new_root,  i.e. adding a non-zero number of /.. to the string
- * pointed to by put_old must yield the same directory as new_root. No other
- * file system may be mounted on put_old. After all, new_root is a mountpoint.
+ * long-desc: Changes the root mount in the mount namespace of the calling
+ *   process. Moves the current root filesystem to the directory specified
+ *   by put_old and makes new_root the new root filesystem. This syscall
+ *   also updates the root and current working directory of all processes
+ *   and threads in the same mount namespace that had them on the old root
+ *   directory to point to the new root.
  *
- * Also, the current root cannot be on the 'rootfs' (initial ramfs) filesystem.
- * See Documentation/filesystems/ramfs-rootfs-initramfs.rst for alternatives
- * in this situation.
+ *   The typical use case is during system startup when the system mounts
+ *   a temporary root filesystem (e.g., an initrd or initramfs), then mounts
+ *   the real root filesystem, and eventually turns the latter into the
+ *   current root of all relevant processes. A modern use is to set up a
+ *   root filesystem during the creation of a container.
  *
- * Notes:
- *  - we don't move root/cwd if they are not at the root (reason: if something
- *    cared enough to change them, it's probably wrong to force them elsewhere)
- *  - it's okay to pick a root that isn't the root of a file system, e.g.
- *    /nfs/my_root where /nfs is the mount point. It must be a mountpoint,
- *    though, so you may need to say mount --bind /nfs/my_root /nfs/my_root
- *    first.
+ *   Both new_root and put_old must be directories and must be mount points.
+ *   new_root must be on a different mount than the current root. put_old
+ *   must be at or beneath new_root (i.e., reachable from new_root by
+ *   traversing the mount tree). The current root must also be a mount
+ *   point (not on the initial rootfs).
+ *
+ *   The parent mounts of new_root, put_old (if already mounted), and the
+ *   current root must not have MS_SHARED propagation type. This prevents
+ *   the operation from propagating in unexpected ways across mount
+ *   namespaces.
+ *
+ *   Important: pivot_root does NOT change the caller's current working
+ *   directory (unless it was on the old root). A chdir("/") call is
+ *   recommended after pivot_root to ensure the working directory is on
+ *   the new root.
+ *
+ *   The rootfs (initial ramfs) cannot be pivot_root()ed. For initramfs,
+ *   use switch_root(8) instead, which deletes everything from rootfs,
+ *   overmounts it with the new root, and execs the new init.
+ *
+ *   Note: new_root and put_old can be the same directory. A common idiom
+ *   is: chdir(new_root); pivot_root(".", "."); umount2(".", MNT_DETACH);
+ *   This stacks the old root mount on top of the new root at /, allowing
+ *   it to be lazily detached.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: new_root
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname pointing to a
+ *     directory that is the root of a mount point. The path is resolved
+ *     relative to the current working directory with symlinks followed
+ *     (LOOKUP_FOLLOW | LOOKUP_DIRECTORY). Maximum length is PATH_MAX
+ *     (4096) bytes including the null terminator. The mount point must
+ *     not be the rootfs, must have a parent mount (not absolute root),
+ *     and must not have MNT_LOCKED flag set. The mount must be reachable
+ *     from the current root (i.e., beneath it in the mount tree).
+ *
+ * param: put_old
+ *   type: KAPI_TYPE_PATH
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid null-terminated pathname pointing to a
+ *     directory that will become the mount point for the old root. The
+ *     path is resolved relative to the current working directory with
+ *     symlinks followed (LOOKUP_FOLLOW | LOOKUP_DIRECTORY). Maximum
+ *     length is PATH_MAX (4096) bytes. The directory must be at or
+ *     underneath new_root (reachable from new_root in the mount tree).
+ *     The mount containing put_old must not have MS_SHARED propagation.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on successful pivot. The new_root is now the root
+ *     of the mount namespace, and the old root has been moved to put_old.
+ *
+ * error: EPERM, Caller lacks required capability
+ *   desc: The caller does not have CAP_SYS_ADMIN capability in the user
+ *     namespace that owns the caller's mount namespace. This check is
+ *     performed by may_mount() via ns_capable(). Also returned by LSM
+ *     hooks (SELinux, AppArmor) if security policy denies the operation.
+ *
+ * error: EINVAL, Invalid mount configuration
+ *   desc: Returned for numerous conditions: (1) the propagation type of
+ *     the parent mount of new_root, put_old, or the current root is
+ *     MS_SHARED; (2) new_root or current root mount is not in the caller's
+ *     mount namespace (check_mnt() failure); (3) new_root has MNT_LOCKED
+ *     flag set; (4) current root is not a mount point; (5) current root
+ *     has no parent mount (is on rootfs/initial ramfs); (6) new_root is
+ *     not a mount point; (7) new_root has no parent mount (absolute root);
+ *     (8) put_old is not reachable from new_root; (9) new_root is not
+ *     beneath the current root; (10) path resolution failure during mount
+ *     locking (internal do_lock_mount errors).
+ *
+ * error: EBUSY, Loop or same filesystem
+ *   desc: Either new_root or put_old resolves to the same mount as the
+ *     current root. This would create a loop in the mount tree or
+ *     indicates an attempt to pivot within the same filesystem.
+ *
+ * error: ENOENT, Path does not exist or is unlinked
+ *   desc: A component of the new_root or put_old pathname does not exist.
+ *     Also returned if new_root's dentry has been unlinked (deleted but
+ *     still referenced). Also returned if the mount point cannot be
+ *     mounted on (cant_mount() check during locking).
+ *
+ * error: ENOTDIR, Not a directory
+ *   desc: Either new_root or put_old does not refer to a directory. The
+ *     LOOKUP_DIRECTORY flag is used during path resolution which enforces
+ *     this requirement.
+ *
+ * error: EACCES, Permission denied
+ *   desc: Search permission is denied on a component of the pathname
+ *     prefix during path resolution. Also returned by LSM hooks if the
+ *     security policy denies access to the paths.
+ *
+ * error: EFAULT, Invalid user pointer
+ *   desc: The new_root or put_old argument points outside the process's
+ *     accessible address space. Detected by strncpy_from_user() during
+ *     pathname copying.
+ *
+ * error: ENAMETOOLONG, Pathname too long
+ *   desc: The new_root or put_old pathname exceeds PATH_MAX (4096) bytes,
+ *     or a pathname component exceeds NAME_MAX (255) bytes.
+ *
+ * error: ELOOP, Too many symbolic links
+ *   desc: Too many symbolic links were encountered while resolving the
+ *     pathname (limit is typically 40 levels).
+ *
+ * error: ENOMEM, Insufficient kernel memory
+ *   desc: The kernel could not allocate memory needed for pathname
+ *     processing, mountpoint structures, or other internal data
+ *     structures. Allocations use GFP_KERNEL and may sleep.
+ *
+ * lock: namespace_sem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The namespace read-write semaphore is acquired for writing via
+ *     namespace_lock()/down_write() during mount tree operations. This
+ *     serializes all mount namespace modifications. Acquired by LOCK_MOUNT
+ *     macro during put_old mount point locking and held through the
+ *     pivot operation.
+ *
+ * lock: inode->i_rwsem (put_old directory)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: The inode lock on the put_old directory's inode is acquired via
+ *     inode_lock() in do_lock_mount() before namespace_lock(). This
+ *     prevents concurrent directory operations from interfering with
+ *     the mount point manipulation.
+ *
+ * lock: mount_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The mount hash seqlock is acquired for writing via lock_mount_hash()
+ *     during the actual mount tree surgery (umount_mnt, attach_mnt calls).
+ *     This is a lower-level lock than namespace_sem and protects mount
+ *     hash table and tree structure modifications.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global tasklist read-write lock is acquired for reading in
+ *     chroot_fs_refs() to iterate over all processes and update their
+ *     root and cwd references. This is released before the syscall returns.
+ *
+ * lock: fs_struct->seq
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   condition: For each process with root/cwd on old root
+ *   desc: Each task's fs_struct seqlock is acquired for writing in
+ *     chroot_fs_refs() to atomically update the root and pwd paths when
+ *     they reference the old root directory.
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: Mount tree topology
+ *   desc: The mount tree is reorganized: (1) new_root is detached from its
+ *     parent and attached to the root parent at the current root's mount
+ *     point, becoming the new root; (2) the old root is detached and
+ *     attached to the put_old mount point under the new root. This is an
+ *     atomic operation performed under mount_lock.
+ *   reversible: yes
+ *   condition: Can be reversed by another pivot_root in the opposite direction
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: Process root and cwd paths
+ *   desc: For all processes and threads in the same mount namespace whose
+ *     root directory or current working directory was on the old root
+ *     mount, those paths are updated to point to the corresponding
+ *     location under the new root via chroot_fs_refs(). Processes with
+ *     root/cwd not at the mount root are not affected.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount namespace event counter
+ *   desc: The mount namespace's event counter is incremented via
+ *     touch_mnt_namespace(), waking any processes blocked in poll() on
+ *     the namespace file descriptor (for mount notification).
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: MNT_LOCKED flag transfer
+ *   condition: Old root has MNT_LOCKED flag
+ *   desc: If the old root mount had MNT_LOCKED flag set (locked into a
+ *     less privileged namespace), the flag is transferred to the new
+ *     root mount and cleared from the old root. This maintains the
+ *     security invariant that the namespace root cannot be unmounted.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Mount expiry list
+ *   desc: The new root mount is removed from any mount expiry list
+ *     (list_del_init on mnt_expire). A moved mount should not expire
+ *     automatically as it's now serving as the root.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: fsnotify mount notifications
+ *   desc: Mount notifications are sent for both the old root and new
+ *     root mounts via mnt_notify_add() to inform watchers of the
+ *     topology change.
+ *   reversible: no
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Change root filesystem in the mount namespace
+ *   without: Returns -EPERM from may_mount() check
+ *   condition: Always checked via ns_capable() against the user namespace
+ *     that owns the caller's mount namespace
+ *
+ * constraint: Mount Namespace Membership
+ *   desc: Both the current root mount and new_root mount must belong to
+ *     the caller's current mount namespace. The check_mnt() function
+ *     verifies mnt->mnt_ns equals current->nsproxy->mnt_ns for both.
+ *     Mounts from other namespaces cannot be used.
+ *
+ * constraint: Propagation Type
+ *   desc: The parent mounts of new_root, put_old, and the current root
+ *     must not have MS_SHARED propagation type (IS_MNT_SHARED check).
+ *     Shared mounts would cause the pivot operation to propagate
+ *     unexpectedly to peer namespaces.
+ *
+ * constraint: Mount Locked Status
+ *   desc: The new_root mount must not have MNT_LOCKED flag set. Locked
+ *     mounts cannot be moved or used as pivot targets. The old root's
+ *     MNT_LOCKED flag (if any) is transferred to the new root.
+ *
+ * constraint: Rootfs Restriction
+ *   desc: The current root cannot be on the initial rootfs (ramfs created
+ *     during kernel initialization). This is detected by checking that
+ *     the root mount has a parent (!mnt_has_parent returns false for
+ *     rootfs). See Documentation/filesystems/ramfs-rootfs-initramfs.rst
+ *     for alternatives using switch_root(8).
+ *
+ * constraint: Reachability
+ *   desc: new_root must be reachable from (underneath) the current root
+ *     in the mount tree, and put_old must be reachable from new_root.
+ *     The is_path_reachable() function verifies these constraints by
+ *     walking up the mount_parent chain.
+ *
+ * examples: pivot_root("/mnt/newroot", "/mnt/newroot/oldroot");
+ *   // After mounting new root at /mnt/newroot, pivot and put old root at oldroot
+ *
+ *   chdir("/mnt/newroot"); pivot_root(".", ".");
+ *   // Pivot with same dir - old root stacked on new, then umount2(".", MNT_DETACH)
+ *
+ *   // Container setup: unshare mount namespace, then pivot
+ *   unshare(CLONE_NEWNS);
+ *   mount("/container/rootfs", "/container/rootfs", NULL, MS_BIND, NULL);
+ *   pivot_root("/container/rootfs", "/container/rootfs/old");
+ *   umount2("/old", MNT_DETACH);
+ *
+ * notes: glibc does not provide a wrapper for this syscall; it must be
+ *   called using syscall(SYS_pivot_root, new_root, put_old).
+ *
+ *   The syscall number is 155 on x86-64, 217 on i386, and 41 in the
+ *   generic syscall table.
+ *
+ *   Historical bugs fixed in this syscall:
+ *   - CVE-2014-7970 (commit 0d0826019e529): pivot_root could create a loop
+ *     in the mount tree when new_root was below the current root via chroot.
+ *     Fixed by verifying new_root is reachable from the current root.
+ *   - Deadlock fix (commit 27cb1572e3e6b): Moved check_mnt() under
+ *     namespace_sem to avoid holding vfsmount_lock during parent traversal.
+ *   - Circular reference fix (commit 0bb6fcc13ae4f): Returns -EINVAL if
+ *     either the current root or new_root is detached (no parent), which
+ *     would cause reference loops.
+ *
+ *   Unlike many syscalls, pivot_root does not check for pending signals
+ *   and cannot return -EINTR. However, it may block waiting for lock
+ *   acquisition (namespace_sem, inode lock).
+ *
+ *   The operation is atomic with respect to other mount operations in
+ *   the namespace due to namespace_sem and mount_lock serialization.
+ *   However, process root/cwd updates in chroot_fs_refs() happen after
+ *   the mount tree changes, creating a brief window where processes may
+ *   see inconsistent state.
+ *
+ *   For security contexts: LSMs (SELinux, AppArmor) hook into this via
+ *   security_sb_pivotroot() and may deny the operation based on policy.
+ *
+ * since-version: 2.3.41
  */
 SYSCALL_DEFINE2(pivot_root, const char __user *, new_root,
 		const char __user *, put_old)
