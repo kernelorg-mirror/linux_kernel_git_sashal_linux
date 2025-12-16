@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -27,6 +28,12 @@ enum Commands {
     Learn {
         /// Git revision range (e.g., "v6.0..v6.1"). If not specified, learns from entire history.
         range: Option<String>,
+    },
+    /// Generate embeddings for stored resolutions (for RAG similarity search)
+    Vectorize {
+        /// Batch size for embedding generation (default: 64)
+        #[arg(short, long, default_value = "64")]
+        batch_size: usize,
     },
 }
 
@@ -588,11 +595,118 @@ fn learn(range: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Compute cosine similarity between two vectors
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
+/// Initialize the BGE-small embedding model
+fn init_embedding_model() -> Result<TextEmbedding> {
+    TextEmbedding::try_new(
+        InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(true),
+    ).context("Failed to initialize embedding model")
+}
+
+fn vectorize(batch_size: usize) -> Result<()> {
+    let store_path = Path::new(STORE_PATH);
+
+    if !store_path.exists() {
+        bail!("No resolutions found. Run 'llminus learn' first.");
+    }
+
+    let mut store = ResolutionStore::load(store_path)?;
+
+    // Count how many need embeddings
+    let need_embedding: Vec<usize> = store
+        .resolutions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.embedding.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    if need_embedding.is_empty() {
+        println!("All {} resolutions already have embeddings.", store.resolutions.len());
+        return Ok(());
+    }
+
+    println!("Found {} resolutions needing embeddings", need_embedding.len());
+    println!("Initializing embedding model (BGE-small-en, ~33MB download on first run)...");
+
+    // Initialize the embedding model
+    let mut model = init_embedding_model()?;
+
+    println!("Model loaded. Generating embeddings...\n");
+
+    // Process in batches
+    let total_batches = (need_embedding.len() + batch_size - 1) / batch_size;
+
+    for (batch_num, chunk) in need_embedding.chunks(batch_size).enumerate() {
+        // Collect texts for this batch
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|&i| store.resolutions[i].to_embedding_text())
+            .collect();
+
+        // Generate embeddings
+        let embeddings = model
+            .embed(texts, None)
+            .context("Failed to generate embeddings")?;
+
+        // Assign embeddings back to resolutions
+        for (j, &idx) in chunk.iter().enumerate() {
+            store.resolutions[idx].embedding = Some(embeddings[j].clone());
+        }
+
+        // Progress report
+        let done = (batch_num + 1) * batch_size.min(chunk.len());
+        let pct = (done as f64 / need_embedding.len() as f64 * 100.0).min(100.0);
+        println!(
+            "  Batch {}/{}: {:.1}% ({}/{})",
+            batch_num + 1,
+            total_batches,
+            pct,
+            done.min(need_embedding.len()),
+            need_embedding.len()
+        );
+
+        // Save after each batch (incremental progress)
+        store.save(store_path)?;
+    }
+
+    // Final stats
+    let json_size = std::fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
+    let with_embeddings = store.resolutions.iter().filter(|r| r.embedding.is_some()).count();
+
+    println!("\nResults:");
+    println!("  Total resolutions: {}", store.resolutions.len());
+    println!("  With embeddings: {}", with_embeddings);
+    println!("  Embedding dimensions: 384");
+    println!("  Output size: {:.2} MB", json_size as f64 / 1024.0 / 1024.0);
+    println!("\nEmbeddings saved to: {}", store_path.display());
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Learn { range } => learn(range.as_deref()),
+        Commands::Vectorize { batch_size } => vectorize(batch_size),
     }
 }
 
@@ -613,6 +727,7 @@ mod tests {
         let cli = Cli::try_parse_from(["llminus", "learn"]).unwrap();
         match cli.command {
             Commands::Learn { range } => assert!(range.is_none()),
+            _ => panic!("Expected Learn command"),
         }
     }
 
@@ -621,7 +736,49 @@ mod tests {
         let cli = Cli::try_parse_from(["llminus", "learn", "v6.0..v6.1"]).unwrap();
         match cli.command {
             Commands::Learn { range } => assert_eq!(range, Some("v6.0..v6.1".to_string())),
+            _ => panic!("Expected Learn command"),
         }
+    }
+
+    #[test]
+    fn test_vectorize_command_parses() {
+        let cli = Cli::try_parse_from(["llminus", "vectorize"]).unwrap();
+        match cli.command {
+            Commands::Vectorize { batch_size } => assert_eq!(batch_size, 64),
+            _ => panic!("Expected Vectorize command"),
+        }
+    }
+
+    #[test]
+    fn test_vectorize_command_with_batch_size() {
+        let cli = Cli::try_parse_from(["llminus", "vectorize", "-b", "128"]).unwrap();
+        match cli.command {
+            Commands::Vectorize { batch_size } => assert_eq!(batch_size, 128),
+            _ => panic!("Expected Vectorize command"),
+        }
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        // Identical vectors should have similarity 1.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.0001);
+
+        // Orthogonal vectors should have similarity 0.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 0.0).abs() < 0.0001);
+
+        // Opposite vectors should have similarity -1.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![-1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - (-1.0)).abs() < 0.0001);
+
+        // Different length vectors return 0
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
     }
 
     #[test]
