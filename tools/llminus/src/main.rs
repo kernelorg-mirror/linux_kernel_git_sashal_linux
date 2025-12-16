@@ -35,6 +35,12 @@ enum Commands {
         #[arg(short, long, default_value = "64")]
         batch_size: usize,
     },
+    /// Find similar historical conflict resolutions for current conflicts
+    Find {
+        /// Number of similar resolutions to show (default: 1)
+        #[arg(default_value = "1")]
+        n: usize,
+    },
 }
 
 /// A single diff hunk representing a change region
@@ -701,12 +707,244 @@ fn vectorize(batch_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// A file with active conflict markers
+#[derive(Debug)]
+struct ConflictFile {
+    path: String,
+    ours_content: String,
+    theirs_content: String,
+    base_content: Option<String>,
+}
+
+impl ConflictFile {
+    /// Generate embedding text for this conflict
+    fn to_embedding_text(&self) -> String {
+        let mut text = format!("File: {}\n\n", self.path);
+
+        text.push_str("=== OURS ===\n");
+        text.push_str(&self.ours_content);
+        text.push_str("\n\n");
+
+        text.push_str("=== THEIRS ===\n");
+        text.push_str(&self.theirs_content);
+        text.push('\n');
+
+        if let Some(ref base) = self.base_content {
+            text.push_str("\n=== BASE ===\n");
+            text.push_str(base);
+            text.push('\n');
+        }
+
+        text
+    }
+}
+
+/// Get list of files with unmerged conflicts
+fn get_conflicted_files() -> Result<Vec<String>> {
+    // git diff --name-only --diff-filter=U shows unmerged files
+    let output = git(&["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(output.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// State machine for parsing conflict markers
+enum ConflictParseState {
+    Outside,
+    InOurs,
+    InBase,
+    InTheirs,
+}
+
+/// Append a line to a string, adding newline separator if non-empty
+fn append_line(s: &mut String, line: &str) {
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s.push_str(line);
+}
+
+/// Parse conflict markers from a file and extract ours/theirs/base content
+fn parse_conflict_file(path: &str) -> Result<Vec<ConflictFile>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path))?;
+
+    let mut conflicts = Vec::new();
+    let mut state = ConflictParseState::Outside;
+    let mut current_ours = String::new();
+    let mut current_theirs = String::new();
+    let mut current_base: Option<String> = None;
+
+    for line in content.lines() {
+        if line.starts_with("<<<<<<<") {
+            state = ConflictParseState::InOurs;
+            current_ours.clear();
+            current_theirs.clear();
+            current_base = None;
+        } else if line.starts_with("|||||||") {
+            // diff3 style - base content follows
+            state = ConflictParseState::InBase;
+            current_base = Some(String::new());
+        } else if line.starts_with("=======") {
+            state = ConflictParseState::InTheirs;
+        } else if line.starts_with(">>>>>>>") {
+            // End of conflict block - save it
+            conflicts.push(ConflictFile {
+                path: path.to_string(),
+                ours_content: std::mem::take(&mut current_ours),
+                theirs_content: std::mem::take(&mut current_theirs),
+                base_content: current_base.take(),
+            });
+            state = ConflictParseState::Outside;
+        } else {
+            match state {
+                ConflictParseState::InOurs => append_line(&mut current_ours, line),
+                ConflictParseState::InBase => {
+                    if let Some(ref mut base) = current_base {
+                        append_line(base, line);
+                    }
+                }
+                ConflictParseState::InTheirs => append_line(&mut current_theirs, line),
+                ConflictParseState::Outside => {}
+            }
+        }
+    }
+
+    Ok(conflicts)
+}
+
+/// Result of a similarity search
+struct SimilarResolution {
+    resolution: MergeResolution,
+    similarity: f32,
+}
+
+/// Find similar resolutions (shared logic for find and resolve)
+fn find_similar_resolutions(n: usize) -> Result<(Vec<ConflictFile>, Vec<SimilarResolution>)> {
+    check_repo()?;
+
+    let store_path = Path::new(STORE_PATH);
+    if !store_path.exists() {
+        bail!("No resolutions database found. Run 'llminus learn' first.");
+    }
+
+    // Find current conflicts
+    let conflict_paths = get_conflicted_files()?;
+    if conflict_paths.is_empty() {
+        bail!("No conflicts detected. Run this command when you have active merge conflicts.");
+    }
+
+    // Parse all conflict regions
+    let mut all_conflicts = Vec::new();
+    for path in &conflict_paths {
+        if let Ok(conflicts) = parse_conflict_file(path) {
+            all_conflicts.extend(conflicts);
+        }
+    }
+
+    if all_conflicts.is_empty() {
+        bail!("Could not parse any conflict markers from the conflicted files.");
+    }
+
+    // Load the resolution store
+    let store = ResolutionStore::load(store_path)?;
+    let with_embeddings: Vec<_> = store.resolutions.iter()
+        .filter(|r| r.embedding.is_some())
+        .collect();
+
+    if with_embeddings.is_empty() {
+        bail!("No embeddings in database. Run 'llminus vectorize' first.");
+    }
+
+    // Initialize embedding model
+    let mut model = init_embedding_model()?;
+
+    // Generate embedding for current conflicts
+    let conflict_text: String = all_conflicts.iter()
+        .map(|c| c.to_embedding_text())
+        .collect::<Vec<_>>()
+        .join("\n---\n\n");
+
+    let query_embeddings = model
+        .embed(vec![conflict_text], None)
+        .context("Failed to generate embedding for current conflict")?;
+    let query_embedding = &query_embeddings[0];
+
+    // Compute similarities and take top N (clone resolutions to own them)
+    let mut similarities: Vec<_> = with_embeddings.iter()
+        .map(|r| {
+            let sim = cosine_similarity(query_embedding, r.embedding.as_ref().unwrap());
+            (r, sim)
+        })
+        .collect();
+
+    similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top_n: Vec<SimilarResolution> = similarities.into_iter()
+        .take(n)
+        .map(|(r, sim)| SimilarResolution {
+            resolution: (*r).clone(),
+            similarity: sim,
+        })
+        .collect();
+
+    Ok((all_conflicts, top_n))
+}
+
+fn find(n: usize) -> Result<()> {
+    // Use find_similar_resolutions for core search logic
+    let (_conflicts, top_n) = find_similar_resolutions(n)?;
+
+    // Display results
+    println!("\n{}", "=".repeat(80));
+    println!("Top {} similar historical conflict resolution(s):", top_n.len());
+    println!("{}", "=".repeat(80));
+
+    for (i, result) in top_n.iter().enumerate() {
+        let r = &result.resolution;
+        println!("\n{}. [similarity: {:.4}]", i + 1, result.similarity);
+        println!("   Commit: {}", r.commit_hash);
+        println!("   Summary: {}", r.commit_summary);
+        println!("   Author: {}", r.author);
+        println!("   Date: {}", r.commit_date);
+        println!("   Files ({}):", r.files.len());
+        for file in &r.files {
+            println!("     - {} ({})", file.file_path, file.subsystem);
+        }
+
+        // Show the resolution diffs for each file
+        println!("\n   Resolution details:");
+        for file in &r.files {
+            println!("   --- {} ---", file.file_path);
+            if !file.resolution_diff.is_empty() {
+                for hunk in &file.resolution_diff {
+                    // Indent and print the diff
+                    for line in hunk.content.lines() {
+                        println!("   {}", line);
+                    }
+                }
+            } else {
+                println!("   (no diff hunks recorded)");
+            }
+        }
+        println!();
+    }
+
+    // Provide git show command for easy access
+    if let Some(top) = top_n.first() {
+        println!("{}", "-".repeat(80));
+        println!("To see the full commit:");
+        println!("  git show {}", top.resolution.commit_hash);
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Learn { range } => learn(range.as_deref()),
         Commands::Vectorize { batch_size } => vectorize(batch_size),
+        Commands::Find { n } => find(n),
     }
 }
 
@@ -755,6 +993,24 @@ mod tests {
         match cli.command {
             Commands::Vectorize { batch_size } => assert_eq!(batch_size, 128),
             _ => panic!("Expected Vectorize command"),
+        }
+    }
+
+    #[test]
+    fn test_find_command_parses() {
+        let cli = Cli::try_parse_from(["llminus", "find"]).unwrap();
+        match cli.command {
+            Commands::Find { n } => assert_eq!(n, 1),
+            _ => panic!("Expected Find command"),
+        }
+    }
+
+    #[test]
+    fn test_find_command_with_n() {
+        let cli = Cli::try_parse_from(["llminus", "find", "5"]).unwrap();
+        match cli.command {
+            Commands::Find { n } => assert_eq!(n, 5),
+            _ => panic!("Expected Find command"),
         }
     }
 
@@ -951,5 +1207,76 @@ index 123..456 789
 
         let merges = get_merge_commits(None).unwrap();
         assert_eq!(merges.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_conflict_markers() {
+        let dir = TempDir::new().unwrap();
+        let conflict_file = dir.path().join("conflict.c");
+        let content = r#"int main() {
+<<<<<<< HEAD
+    printf("ours");
+=======
+    printf("theirs");
+>>>>>>> feature
+    return 0;
+}
+"#;
+        fs::write(&conflict_file, content).unwrap();
+
+        let conflicts = parse_conflict_file(conflict_file.to_str().unwrap()).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].ours_content.contains("ours"));
+        assert!(conflicts[0].theirs_content.contains("theirs"));
+        assert!(conflicts[0].base_content.is_none());
+    }
+
+    #[test]
+    fn test_parse_conflict_markers_diff3() {
+        let dir = TempDir::new().unwrap();
+        let conflict_file = dir.path().join("conflict.c");
+        // diff3 style with base content
+        let content = r#"int main() {
+<<<<<<< HEAD
+    printf("ours");
+||||||| base
+    printf("base");
+=======
+    printf("theirs");
+>>>>>>> feature
+    return 0;
+}
+"#;
+        fs::write(&conflict_file, content).unwrap();
+
+        let conflicts = parse_conflict_file(conflict_file.to_str().unwrap()).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].ours_content.contains("ours"));
+        assert!(conflicts[0].theirs_content.contains("theirs"));
+        assert!(conflicts[0].base_content.as_ref().unwrap().contains("base"));
+    }
+
+    #[test]
+    fn test_parse_multiple_conflicts() {
+        let dir = TempDir::new().unwrap();
+        let conflict_file = dir.path().join("conflict.c");
+        let content = r#"<<<<<<< HEAD
+first ours
+=======
+first theirs
+>>>>>>> feature
+middle
+<<<<<<< HEAD
+second ours
+=======
+second theirs
+>>>>>>> feature
+"#;
+        fs::write(&conflict_file, content).unwrap();
+
+        let conflicts = parse_conflict_file(conflict_file.to_str().unwrap()).unwrap();
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts[0].ours_content.contains("first ours"));
+        assert!(conflicts[1].ours_content.contains("second ours"));
     }
 }
