@@ -21,9 +21,203 @@
  */
 
 /**
- * sys_set_robust_list() - Set the robust-futex list head of a task
- * @head:	pointer to the list-head
- * @len:	length of the list-head, as userspace expects
+ * sys_set_robust_list - Register the robust futex list head for the calling thread
+ * @head: User-space pointer to the robust list head structure
+ * @len: Size of the robust_list_head structure (must equal sizeof(*head))
+ *
+ * long-desc: Registers a per-thread robust futex list with the kernel. This
+ *   mechanism enables automatic cleanup of futex-based locks when a thread
+ *   terminates abnormally (e.g., killed by a signal, segmentation fault, or
+ *   explicit exit without unlocking). Without this mechanism, other threads
+ *   waiting on locks held by the deceased thread would block forever.
+ *
+ *   The robust futex list is a user-space linked list that threads use to
+ *   track which futex locks they currently hold. The kernel does not modify
+ *   this list during normal operation - it only reads and processes the list
+ *   when the thread exits.
+ *
+ *   The robust_list_head structure contains three fields:
+ *   1. list.next: Pointer to the first robust_list entry (or back to itself
+ *      if empty). The low bit indicates PI futex when set.
+ *   2. futex_offset: Byte offset from each list entry to its futex word
+ *   3. list_op_pending: Transient pointer to lock being acquired/released
+ *
+ *   When a thread exits (via do_exit()), the kernel walks the robust list
+ *   and for each entry where the futex word's TID matches the dying thread:
+ *   1. Sets the FUTEX_OWNER_DIED bit (0x40000000) in the futex word
+ *   2. If FUTEX_WAITERS bit (0x80000000) is set, wakes one waiting thread
+ *   3. Also processes list_op_pending to catch in-flight lock acquisitions
+ *
+ *   The kernel limits processing to ROBUST_LIST_LIMIT (2048) entries to
+ *   prevent infinite loops on circular or maliciously crafted lists. This
+ *   limit protects against denial-of-service attacks.
+ *
+ *   User-space protocol for lock acquisition:
+ *   1. Set list_op_pending to the lock entry address
+ *   2. Acquire the futex lock (set futex word to TID)
+ *   3. Add the entry to the linked list
+ *   4. Clear list_op_pending
+ *
+ *   User-space protocol for lock release:
+ *   1. Set list_op_pending to the lock entry address
+ *   2. Remove the entry from the linked list
+ *   3. Release the futex lock (clear futex word)
+ *   4. Clear list_op_pending
+ *
+ *   This syscall only stores the pointer; the actual list processing
+ *   happens at thread exit time in exit_robust_list(). The pointer is not
+ *   validated during this syscall - invalid pointers will cause the list
+ *   walk to abort silently at exit time.
+ *
+ *   A compat version exists for 32-bit processes on 64-bit kernels, storing
+ *   the pointer in current->compat_robust_list instead.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: head
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: User-space pointer to a struct robust_list_head, or NULL
+ *     to disable robust futex handling for this thread. The pointer is
+ *     stored without validation. If NULL, the robust list mechanism is
+ *     effectively disabled (exit_robust_list returns early). The structure
+ *     must remain valid and accessible in user memory until thread exit.
+ *     Invalid pointers cause silent failures during exit processing.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must exactly equal sizeof(struct robust_list_head). On
+ *     64-bit systems this is typically 24 bytes (3 x 8-byte words). On
+ *     32-bit systems this is 12 bytes (3 x 4-byte words). This size check
+ *     provides versioning - if the structure size changes in future kernel
+ *     versions, old binaries will fail gracefully with EINVAL rather than
+ *     causing memory corruption.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the robust list head pointer
+ *     has been stored in the calling thread's task_struct. The previously
+ *     registered head (if any) is silently replaced.
+ *
+ * error: EINVAL, Invalid structure size
+ *   desc: The len parameter does not match sizeof(struct robust_list_head).
+ *     This indicates a version mismatch between user-space and the kernel,
+ *     or an incorrect size value passed by the application. The robust list
+ *     head is not modified when this error occurs.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->robust_list
+ *   desc: Stores the head pointer in the calling thread's task_struct. The
+ *     previous value is overwritten without any cleanup or notification.
+ *     This pointer is read during thread exit to process the robust list.
+ *   reversible: yes
+ *   condition: When len == sizeof(struct robust_list_head)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: User memory futex words (deferred)
+ *   desc: At thread exit time (not during this syscall), the kernel walks
+ *     the robust list and modifies futex words for locks held by the dying
+ *     thread. For each held lock, FUTEX_OWNER_DIED (0x40000000) is set in
+ *     the 32-bit futex word via atomic cmpxchg. This is a deferred side
+ *     effect occurring in exit_robust_list() during do_exit().
+ *   reversible: no
+ *   condition: Thread exits with non-empty robust list
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Futex waiters (deferred)
+ *   desc: At thread exit time, for each robust futex that had the
+ *     FUTEX_WAITERS bit set, the kernel performs futex_wake() to wake one
+ *     waiting thread. The woken thread sees FUTEX_OWNER_DIED set and can
+ *     take appropriate action (typically acquire the lock and recover).
+ *   reversible: no
+ *   condition: Thread exits holding futexes with waiters
+ *
+ * state-trans: current->robust_list
+ *   from: previous value (NULL or valid pointer)
+ *   to: head parameter value
+ *   condition: When len == sizeof(struct robust_list_head)
+ *   desc: The robust_list field is unconditionally set to the new value.
+ *     Setting NULL effectively disables robust futex handling for the
+ *     thread. There is no reference counting or cleanup of old values.
+ *
+ * constraint: Structure size versioning
+ *   desc: The len parameter provides ABI versioning. If the kernel's
+ *     robust_list_head structure changes size in future versions, older
+ *     binaries compiled against the previous size will fail with EINVAL.
+ *     This prevents memory corruption from mismatched structures.
+ *   expr: len == sizeof(struct robust_list_head)
+ *
+ * constraint: List entry limit
+ *   desc: The kernel processes at most ROBUST_LIST_LIMIT (2048) entries
+ *     from the robust list at exit time. This limit protects against
+ *     infinite loops caused by circular lists (malicious or accidental)
+ *     and denial-of-service attacks. Excess entries are silently ignored.
+ *
+ * constraint: Memory validity at exit
+ *   desc: The head pointer and all list entries must point to valid,
+ *     readable user memory at thread exit time. If any pointer is invalid,
+ *     the kernel silently aborts list processing at that point. The
+ *     futex_offset must also produce valid addresses when added to list
+ *     entry addresses.
+ *
+ * constraint: Futex word alignment
+ *   desc: The futex word (32-bit integer at list_entry + futex_offset)
+ *     must be naturally aligned (4-byte aligned). Unaligned accesses cause
+ *     handle_futex_death() to return early, skipping that entry.
+ *
+ * examples: struct robust_list_head head;
+ *   head.list.next = &head.list;  // Empty list points to self
+ *   head.futex_offset = offsetof(struct my_lock, futex) -
+ *                       offsetof(struct my_lock, list);
+ *   head.list_op_pending = NULL;
+ *   syscall(SYS_set_robust_list, &head, sizeof(head));  // Register
+ *   syscall(SYS_set_robust_list, NULL, sizeof(head));  // Disable
+ *
+ * notes: This syscall is not intended for direct application use. Instead,
+ *   applications should use glibc's robust mutex implementation via
+ *   pthread_mutexattr_setrobust(). glibc provides no wrapper function for
+ *   this syscall; direct invocation requires syscall(2).
+ *
+ *   A thread can have only one robust futex list at a time. Each call to
+ *   set_robust_list() replaces any previously registered list head.
+ *
+ *   The robust list mechanism was introduced to solve a long-standing
+ *   problem with futex-based locks: if a thread holding a lock terminates
+ *   unexpectedly (SIGKILL, segfault, etc.), other threads waiting for that
+ *   lock would hang indefinitely. Prior to robust futexes, a system reboot
+ *   was often required to recover from such situations (famously affecting
+ *   package managers like yum).
+ *
+ *   During execve(), the robust_list pointer is NOT cleared by default.
+ *   A security fix (commit 6b54082c3ed4d) added exec_update_lock protection
+ *   to get_robust_list() to prevent leaking the pointer across privilege
+ *   boundaries during exec races.
+ *
+ *   The kernel silently ignores errors during exit-time list processing:
+ *   - Invalid user pointers cause immediate abort of list walking
+ *   - Unaligned futex words are skipped
+ *   - Futex words not owned by the dying thread are skipped
+ *   - cmpxchg failures are retried; persistent failures cause abort
+ *
+ *   PI (Priority Inheritance) futexes are indicated by setting bit 0 in
+ *   the list entry's next pointer. The kernel handles PI futexes specially
+ *   during exit, coordinating with the PI state cleanup in exit_pi_state_list().
+ *
+ *   Corner cases:
+ *   - NULL head: Valid, disables robust futex handling
+ *   - Zero len: Returns -EINVAL
+ *   - Wrong len: Returns -EINVAL (ABI protection)
+ *   - Invalid head pointer: Stored anyway; fails silently at exit
+ *   - Empty list (head->list.next == &head->list): No locks processed
+ *   - Circular list: Kernel stops after 2048 iterations
+ *   - Thread exits before adding lock to list: list_op_pending catches it
+ *
+ * since-version: 2.6.17
  */
 SYSCALL_DEFINE2(set_robust_list, struct robust_list_head __user *, head,
 		size_t, len)
