@@ -3400,6 +3400,402 @@ bad_unshare_out:
 	return err;
 }
 
+/**
+ * sys_unshare - Disassociate parts of the process execution context
+ * @unshare_flags: Bitmask of CLONE_* flags specifying which parts to unshare
+ *
+ * long-desc: Allows a process to disassociate parts of its execution
+ *   context that are currently being shared with other processes. This
+ *   syscall permits fine-grained control over namespace and resource
+ *   isolation without creating a new process.
+ *
+ *   Unlike fork() or clone(), unshare() modifies the calling process's
+ *   context directly. The copy_* functions used by clone() cannot be used
+ *   here directly because they modify an inactive task_struct being
+ *   constructed, whereas unshare() modifies the current, active task_struct.
+ *
+ *   The syscall supports unsharing of the following execution context parts:
+ *
+ *   - CLONE_FILES: Unshare the file descriptor table. After unsharing, the
+ *     calling process gets its own private copy of the file descriptor table.
+ *     Changes to file descriptors (open, close, dup) no longer affect other
+ *     processes that previously shared this table.
+ *
+ *   - CLONE_FS: Unshare filesystem attributes including root directory,
+ *     current working directory, and umask. After unsharing, changes to
+ *     chroot(), chdir(), or umask() do not affect other processes.
+ *
+ *   - CLONE_SYSVSEM: Unshare System V semaphore undo values. This detaches
+ *     the process from its semaphore adjustment list, equivalent to the
+ *     cleanup performed by exit(). Required when unsharing IPC namespace
+ *     since semaphores in the old namespace become unreachable.
+ *
+ *   - CLONE_NEWNS: Create a new mount namespace. The calling process gets
+ *     a private copy of the mount table. Mounts and unmounts in this
+ *     namespace do not affect other processes. Implicitly adds CLONE_FS.
+ *
+ *   - CLONE_NEWUTS: Create a new UTS namespace. The process gets private
+ *     copies of hostname and NIS domain name, changeable via sethostname()
+ *     and setdomainname() without affecting other processes.
+ *
+ *   - CLONE_NEWIPC: Create a new IPC namespace with private System V IPC
+ *     objects (message queues, semaphore sets, shared memory segments) and
+ *     POSIX message queues. Implicitly performs CLONE_SYSVSEM semantics.
+ *
+ *   - CLONE_NEWNET: Create a new network namespace with private network
+ *     devices, IP addresses, routing tables, firewall rules, and other
+ *     network-related resources. Network namespaces are fundamental to
+ *     container networking.
+ *
+ *   - CLONE_NEWPID: Create a new PID namespace for children. The calling
+ *     process does not move to the new namespace; only subsequently forked
+ *     children will be in the new PID namespace. The first child becomes
+ *     PID 1 in the new namespace.
+ *
+ *   - CLONE_NEWUSER: Create a new user namespace. This is the only namespace
+ *     that can be created without CAP_SYS_ADMIN. The creator gains full
+ *     capabilities in the new namespace, enabling unprivileged container
+ *     creation. Implicitly adds CLONE_THREAD and CLONE_FS.
+ *
+ *   - CLONE_NEWCGROUP: Create a new cgroup namespace. The process sees its
+ *     current cgroup as the root of the cgroup hierarchy.
+ *
+ *   - CLONE_NEWTIME: Create a new time namespace. CLOCK_MONOTONIC and
+ *     CLOCK_BOOTTIME can have different offsets in the new namespace,
+ *     useful for checkpoint/restore scenarios.
+ *
+ *   Some flags have implicit dependencies that are automatically added:
+ *   - CLONE_NEWUSER adds CLONE_THREAD | CLONE_FS
+ *   - CLONE_VM adds CLONE_SIGHAND
+ *   - CLONE_SIGHAND adds CLONE_THREAD
+ *   - CLONE_NEWNS adds CLONE_FS
+ *
+ *   The CLONE_THREAD, CLONE_SIGHAND, and CLONE_VM flags cannot actually
+ *   unshare their respective resources; they are only accepted to verify
+ *   the process is in a state compatible with other unshare operations.
+ *   If any of these flags are set (explicitly or implicitly), the process
+ *   must be single-threaded.
+ *
+ *   Creating a user namespace along with other namespace types in a single
+ *   unshare() call is specially handled: the user namespace is created first,
+ *   granting full capabilities, then other namespaces are created using
+ *   those capabilities. This allows unprivileged users to create otherwise
+ *   privileged namespaces.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: unshare_flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: CLONE_THREAD | CLONE_FS | CLONE_NEWNS | CLONE_SIGHAND |
+ *     CLONE_VM | CLONE_FILES | CLONE_SYSVSEM | CLONE_NEWUTS | CLONE_NEWIPC |
+ *     CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWCGROUP |
+ *     CLONE_NEWTIME
+ *   constraint: Must be a combination of valid CLONE_* flags. Zero is
+ *     valid (no-op). Flags not in the valid set cause EINVAL. CLONE_THREAD,
+ *     CLONE_SIGHAND, and CLONE_VM require the process to be single-threaded.
+ *     Namespace flags (except CLONE_NEWUSER) require CAP_SYS_ADMIN.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns zero on success. On failure, returns a negative error code
+ *     and the process execution context remains unchanged.
+ *
+ * error: EINVAL, Invalid flags specified
+ *   desc: Returned when unshare_flags contains any bit not in the valid set
+ *     (CLONE_THREAD, CLONE_FS, CLONE_NEWNS, CLONE_SIGHAND, CLONE_VM,
+ *     CLONE_FILES, CLONE_SYSVSEM, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWNET,
+ *     CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWCGROUP, CLONE_NEWTIME).
+ *
+ * error: EINVAL, Thread group not empty
+ *   desc: Returned when CLONE_THREAD, CLONE_SIGHAND, or CLONE_VM is in the
+ *     effective flags (explicitly or via implicit additions) and the calling
+ *     thread's thread group is not empty (i.e., there are other threads).
+ *     Checked via thread_group_empty(current).
+ *
+ * error: EINVAL, Signal handlers shared
+ *   desc: Returned when CLONE_SIGHAND or CLONE_VM is in the effective flags
+ *     and the signal handler structure is shared with other processes
+ *     (sighand->count > 1). This can occur even in a single-threaded process
+ *     if signal handlers were shared via clone(CLONE_SIGHAND).
+ *
+ * error: EINVAL, VM shared
+ *   desc: Returned when CLONE_VM is in the effective flags and the process
+ *     is not truly single-threaded (!current_is_single_threaded()). This
+ *     check is more thorough than thread_group_empty() as it considers
+ *     processes sharing the same mm via CLONE_VM.
+ *
+ * error: EINVAL, PID namespace ancestry mismatch
+ *   desc: Returned when CLONE_NEWPID is specified and the task's active PID
+ *     namespace is not in the same user namespace hierarchy. Specifically,
+ *     !in_userns(parent_pid_ns->user_ns, user_ns) must be false.
+ *
+ * error: ENOMEM, Memory allocation failed
+ *   desc: Returned when any memory allocation fails during namespace or
+ *     resource structure creation. This includes allocation of fs_struct,
+ *     files_struct, file descriptor tables, namespace structures, or
+ *     any associated kernel objects. Partial allocations are cleaned up.
+ *
+ * error: ENOSPC, Namespace limit exceeded
+ *   desc: Returned when creating a namespace would exceed a nesting depth
+ *     limit or per-user namespace count limit. User namespaces are limited
+ *     to 32 levels of nesting. Each namespace type has per-user accounting
+ *     via ucounts which may hit configured limits.
+ *
+ * error: EPERM, Insufficient privileges
+ *   desc: Returned when the process lacks CAP_SYS_ADMIN in the target user
+ *     namespace for namespace creation operations (all namespace types
+ *     except CLONE_NEWUSER). Also returned when creating a user namespace
+ *     from a chrooted environment (current_chrooted()) or when the
+ *     effective uid/gid is not mapped in the parent user namespace.
+ *
+ * error: EPERM, Locked mount tree
+ *   desc: Returned when CLONE_NEWNS is specified and the mount tree
+ *     contains a mount that is both unbindable and locked (MNT_LOCKED).
+ *     This prevents copying such mounts in copy_tree().
+ *
+ * error: EPERM, LSM denied user namespace
+ *   desc: Returned when a Linux Security Module (LSM) denies the creation
+ *     of a new user namespace via the security_create_user_ns() hook.
+ *     SELinux, AppArmor, or other LSMs may impose additional restrictions.
+ *
+ * error: EAGAIN, User credential allocation failed
+ *   desc: Returned when set_cred_ucounts() fails to allocate ucounts for
+ *     the new user namespace credentials. This typically indicates resource
+ *     pressure on the ucounts allocation system.
+ *
+ * error: EMFILE, File descriptor table too large
+ *   desc: Returned when CLONE_FILES is specified and duplicating the file
+ *     descriptor table would require allocating a table larger than
+ *     allowed by sysctl_nr_open or would exceed INT_MAX / sizeof(struct
+ *     file *) bytes.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: Returned when CLONE_NEWNET is specified and the process receives
+ *     a fatal signal while waiting for pernet_ops_rwsem in copy_net_ns().
+ *     Uses down_read_killable() which can be interrupted.
+ *
+ * lock: task_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired via task_lock(current) to safely update the process's
+ *     fs_struct and files_struct pointers. The lock is held briefly during
+ *     the swap of old and new structures.
+ *
+ * lock: fs->seq (seqlock)
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The filesystem structure's seqlock is held exclusively via
+ *     read_seqlock_excl()/read_sequnlock_excl() when updating the current
+ *     process's fs_struct pointer. Also used when copying fs_struct.
+ *
+ * lock: pernet_ops_rwsem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Held as a read lock during network namespace creation to ensure
+ *     pernet operations are called consistently. Acquired via
+ *     down_read_killable() which can return EINTR on fatal signal.
+ *
+ * lock: namespace_sem (various)
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: Mount namespace operations acquire namespace_sem for exclusive
+ *     access to the mount tree during copy_tree() and related operations.
+ *
+ * lock: userns_state_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Held briefly in create_user_ns() when copying parent namespace
+ *     flags to the new namespace.
+ *
+ * signal: Any fatal signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: During network namespace creation (CLONE_NEWNET)
+ *   desc: When creating a network namespace, the syscall may block on
+ *     pernet_ops_rwsem via down_read_killable(). A fatal signal during
+ *     this wait causes the syscall to return -EINTR. Other namespace
+ *     creation operations do not have interruptible waits.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->fs (filesystem structure)
+ *   desc: When CLONE_FS or CLONE_NEWNS is specified (and fs->users > 1),
+ *     the process gets a new private fs_struct containing copies of root,
+ *     pwd, and umask. The old fs_struct's reference count is decremented.
+ *   reversible: no
+ *   condition: CLONE_FS flag set and fs_struct was shared
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->files (file descriptor table)
+ *   desc: When CLONE_FILES is specified (and files->count > 1), the
+ *     process gets a new private files_struct with duplicated file
+ *     descriptors. The old files_struct's reference count is decremented.
+ *   reversible: no
+ *   condition: CLONE_FILES flag set and files_struct was shared
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->nsproxy (namespace proxy)
+ *   desc: When any namespace flag is specified, the process may get a
+ *     new nsproxy structure with references to new namespaces. Handled
+ *     via switch_task_namespaces().
+ *   reversible: no
+ *   condition: Any CLONE_NEW* flag specified
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->cred (credentials)
+ *   desc: When CLONE_NEWUSER is specified, new credentials with the new
+ *     user namespace are installed via commit_creds(). The process becomes
+ *     root (uid 0) with full capabilities within the new user namespace.
+ *   reversible: no
+ *   condition: CLONE_NEWUSER flag set
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: SysV semaphore undo list
+ *   desc: When CLONE_NEWIPC or CLONE_SYSVSEM is specified, exit_sem() is
+ *     called which performs semaphore undo operations, equivalent to the
+ *     cleanup done at process exit. This may modify semaphore values.
+ *   reversible: no
+ *   condition: CLONE_NEWIPC or CLONE_SYSVSEM flag set
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: SysV shared memory attachments
+ *   desc: When CLONE_NEWIPC is specified, exit_shm() is called which
+ *     orphans or detaches shared memory segments from the old IPC
+ *     namespace. shm_init_task() initializes the new task's shm state.
+ *   reversible: no
+ *   condition: CLONE_NEWIPC flag set
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: New namespace structures
+ *   desc: New namespace structures are allocated and initialized for each
+ *     requested namespace type. These become part of the process's nsproxy
+ *     and persist until the last reference is dropped.
+ *   reversible: no
+ *   condition: Any CLONE_NEW* flag specified
+ *
+ * state-trans: process namespace membership
+ *   from: shared or inherited namespaces
+ *   to: private or new namespaces
+ *   condition: Corresponding CLONE_* flag specified
+ *   desc: The process transitions from being a member of shared/inherited
+ *     namespaces to having its own private namespace instances. This is
+ *     the fundamental state change effected by unshare().
+ *
+ * state-trans: process credentials
+ *   from: original user namespace membership
+ *   to: root in new user namespace
+ *   condition: CLONE_NEWUSER specified
+ *   desc: When creating a new user namespace, the process's credentials
+ *     are replaced. The process becomes uid 0 / gid 0 with full
+ *     capabilities in the new namespace, though these don't grant
+ *     privileges outside the namespace.
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Creation of mount, UTS, IPC, PID, network, cgroup, and time
+ *     namespaces. Checked in the target user namespace via ns_capable().
+ *   without: Returns -EPERM for these namespace types. However, creating
+ *     a user namespace first (which requires no capabilities) grants
+ *     CAP_SYS_ADMIN in the new namespace, allowing other namespaces to
+ *     be created in the same call.
+ *   condition: Any CLONE_NEW* flag except CLONE_NEWUSER
+ *
+ * constraint: Single-threaded requirement
+ *   desc: CLONE_VM, CLONE_SIGHAND, and CLONE_THREAD (which may be added
+ *     implicitly) require the process to be single-threaded. Multiple
+ *     checks enforce this: thread_group_empty(), sighand->count == 1,
+ *     and current_is_single_threaded(). Multi-threaded processes cannot
+ *     unshare user namespaces, VM, or signal handlers.
+ *
+ * constraint: User namespace nesting limit
+ *   desc: User namespaces can only be nested 32 levels deep. Creating a
+ *     user namespace whose parent is already at level 32 returns -ENOSPC.
+ *     This prevents resource exhaustion attacks.
+ *
+ * constraint: Chroot restriction for user namespaces
+ *   desc: A process in a chroot environment cannot create user namespaces.
+ *     This is a security measure to prevent privilege escalation by
+ *     combining chroot escapes with user namespace capabilities.
+ *     Returns -EPERM if current_chrooted() is true.
+ *
+ * constraint: UID/GID mapping requirement
+ *   desc: When creating a user namespace, the effective UID and GID must
+ *     be mapped in the parent user namespace. If kuid_has_mapping() or
+ *     kgid_has_mapping() returns false for the creator's euid/egid,
+ *     -EPERM is returned.
+ *
+ * constraint: Per-user namespace limits
+ *   desc: The number of namespaces of each type that can be owned by a
+ *     single user is limited via ucounts. Limits are configurable via
+ *     /proc/sys/user/max_*_namespaces. Exceeding these limits returns
+ *     -ENOSPC.
+ *
+ * constraint: PID namespace hierarchy
+ *   desc: CLONE_NEWPID can only create PID namespaces that are descendants
+ *     of the calling process's active PID namespace. Additionally, the
+ *     PID namespace nesting has a maximum depth (MAX_PID_NS_LEVEL, typically
+ *     32). The active PID namespace must be in the same user namespace
+ *     hierarchy as the target.
+ *
+ * constraint: Mount namespace copy restrictions
+ *   desc: When copying the mount tree for CLONE_NEWNS, unbindable mounts
+ *     that are also locked (MNT_LOCKED) cannot be copied and cause -EPERM.
+ *     This prevents unprivileged users from circumventing locked mounts.
+ *
+ * examples: unshare(CLONE_NEWNS);  // Private mount namespace
+ *   unshare(CLONE_NEWUSER | CLONE_NEWNET);  // Unprivileged network ns
+ *   unshare(CLONE_FILES);  // Private file descriptor table
+ *   unshare(CLONE_NEWUTS);  // Private hostname (needs CAP_SYS_ADMIN)
+ *   unshare(CLONE_NEWIPC | CLONE_SYSVSEM);  // New IPC ns, clear semaphores
+ *   unshare(0);  // No-op, always succeeds
+ *
+ * notes: unshare() was introduced in Linux 2.6.16 as part of the namespace
+ *   infrastructure. Additional namespace types were added in subsequent
+ *   versions: user namespaces became unprivileged in 3.8, time namespaces
+ *   were added in 5.6.
+ *
+ *   The glibc wrapper (available since glibc 2.14) uses the same interface
+ *   as the syscall. The unshare(1) utility from util-linux provides a
+ *   command-line interface to this syscall.
+ *
+ *   When creating a user namespace in combination with other namespace
+ *   types, the kernel processes CLONE_NEWUSER first. This grants full
+ *   capabilities in the new user namespace, which are then used to create
+ *   the other namespaces. This is the basis for unprivileged containers.
+ *
+ *   CLONE_THREAD, CLONE_SIGHAND, and CLONE_VM do not actually unshare
+ *   anything - they only exist to verify compatibility. The actual
+ *   unsharing of these resources was deemed too complex and dangerous
+ *   to implement.
+ *
+ *   Unlike clone(), unshare() modifies the calling process rather than
+ *   creating a child. This means failure leaves the process unchanged,
+ *   but success is irreversible - there is no way to re-share resources.
+ *
+ *   The CLONE_NEWPID flag only affects children - the calling process
+ *   remains in its original PID namespace but becomes PID 1's parent
+ *   in the new namespace.
+ *
+ *   Network namespace creation (CLONE_NEWNET) is the only operation that
+ *   can be interrupted by signals. Other namespace operations use non-
+ *   interruptible allocations and locks.
+ *
+ *   The perf_event_namespaces() function is called after successful
+ *   unshare to notify perf subsystem of namespace changes.
+ *
+ * since-version: 2.6.16
+ */
 SYSCALL_DEFINE1(unshare, unsigned long, unshare_flags)
 {
 	return ksys_unshare(unshare_flags);
