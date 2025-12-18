@@ -3289,8 +3289,203 @@ SYSCALL_DEFINE1(setfsuid, uid_t, uid)
 	return __sys_setfsuid(uid);
 }
 
-/*
- * Samma på svenska..
+/**
+ * sys_setfsgid - Set the filesystem group ID of the calling process
+ * @gid: The new filesystem group ID
+ *
+ * long-desc: Sets the filesystem group ID (fsgid) of the calling process. The
+ *   filesystem GID is used for permission checking when accessing filesystem
+ *   objects, and is separate from the real, effective, and saved group IDs.
+ *
+ *   Permission rules for changing fsgid:
+ *   - Without CAP_SETGID, the fsgid may only be changed to a value equal to
+ *     the current real GID, effective GID, saved set-group-ID, or current
+ *     filesystem GID
+ *   - With CAP_SETGID capability, the fsgid may be set to any GID that has
+ *     a valid mapping in the caller's user namespace
+ *   - If these conditions are not met, the call silently fails
+ *
+ *   CRITICAL DESIGN FLAW: Unlike most syscalls, setfsgid() ALWAYS returns
+ *   the previous filesystem group ID, regardless of whether the call succeeded
+ *   or failed. This makes it impossible to directly determine if the call
+ *   succeeded. To check for success, the caller must make a subsequent call
+ *   to setfsgid(-1) (which always fails since -1 is an invalid GID) and
+ *   verify that it returns the expected new fsgid value.
+ *
+ *   User namespace support: The @gid value is interpreted in the context of
+ *   the caller's user namespace. It is converted to a kernel-internal kgid_t
+ *   using make_kgid(). If @gid has no mapping in the caller's user namespace,
+ *   the call silently fails (returns the old fsgid without making changes).
+ *
+ *   DEPRECATION NOTE: This syscall is considered obsolete and should be
+ *   avoided in new applications. The original motivation (avoiding signal
+ *   delivery to processes with the same egid) was eliminated in Linux 2.0
+ *   when the signal delivery rules changed. Modern applications should use
+ *   setresgid(2) or setregid(2) instead, or rely on the automatic fsgid
+ *   tracking of egid changes.
+ *
+ *   This syscall is only available when CONFIG_MULTIUSER is enabled.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: gid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid GID that the caller has permission to set.
+ *     For unprivileged callers (without CAP_SETGID), must equal the current
+ *     real GID, effective GID, saved set-group-ID, or current filesystem GID.
+ *     For privileged callers (with CAP_SETGID), may be any GID that has a
+ *     mapping in the caller's user namespace. The value (gid_t)-1 is NOT
+ *     valid and will cause the call to silently fail (it fails gid_valid()).
+ *
+ * return:
+ *   type: KAPI_TYPE_UINT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: Previous filesystem GID
+ *   desc: ALWAYS returns the previous filesystem group ID of the calling
+ *     process, regardless of whether the call succeeded or failed. This is
+ *     a known design flaw documented in the man page. The returned value is
+ *     the fsgid translated to the caller's user namespace via from_kgid_munged().
+ *     If the fsgid has no mapping in the caller's namespace, the overflow GID
+ *     (typically 65534) is returned instead.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process credential filesystem GID (fsgid)
+ *   desc: Updates the calling process's filesystem group ID if all permission
+ *     checks pass. The credentials are atomically replaced via RCU in
+ *     commit_creds(). Only the fsgid field is modified; real GID, effective
+ *     GID, and saved set-group-ID remain unchanged.
+ *   condition: Permission check passes (gid matches gid/egid/sgid/fsgid or
+ *     caller has CAP_SETGID) AND gid is valid in caller's namespace AND
+ *     LSM hook approves AND new fsgid differs from old fsgid
+ *   reversible: yes, by calling setfsgid() with the previous fsgid value
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process dumpability flag
+ *   desc: If the filesystem GID changes, the process's dumpability may be
+ *     affected. In commit_creds(), if fsgid differs from the old value,
+ *     set_dumpable() is called with the suid_dumpable sysctl value,
+ *     potentially making the process non-dumpable. Also, pdeath_signal is
+ *     cleared to 0 to prevent security issues from signal delivery after
+ *     credential changes.
+ *   condition: Filesystem GID changes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Keyring state (via key_fsgid_changed)
+ *   desc: If the filesystem GID changes, key_fsgid_changed() is called to
+ *     update the ownership of the thread keyring to match the new fsgid.
+ *     The thread keyring's gid field is set to the new fsgid. This ensures
+ *     proper key access control after credential changes.
+ *   condition: Filesystem GID changes (CONFIG_KEYS enabled)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_NETWORK
+ *   target: Process connector notification (PROC_EVENT_GID)
+ *   desc: If the filesystem GID changes, a PROC_EVENT_GID notification is
+ *     sent via the process connector (proc_id_connector). This allows
+ *     userspace processes monitoring the connector socket to be notified
+ *     of credential changes.
+ *   condition: Filesystem GID changes (CONFIG_PROC_EVENTS enabled)
+ *   reversible: no
+ *
+ * state-trans: credentials
+ *   from: original credential state with old fsgid
+ *   to: new credential state with updated fsgid
+ *   condition: All permission checks pass
+ *   desc: The process credentials atomically transition from the old state
+ *     to the new state via commit_creds(). The old credentials are released
+ *     via put_cred_many(). RCU is used to ensure safe concurrent access to
+ *     credentials by other kernel code (via rcu_assign_pointer).
+ *
+ * capability: CAP_SETGID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Setting the filesystem GID to any valid GID in the caller's
+ *     user namespace, regardless of the current real GID, effective GID,
+ *     saved set-group-ID, or current filesystem GID.
+ *   without: Can only set fsgid to a value that equals the current real GID,
+ *     effective GID, saved set-group-ID, or current filesystem GID. Attempts
+ *     to set to other values silently fail.
+ *   condition: Checked via ns_capable_setid(old->user_ns, CAP_SETGID) which
+ *     verifies the capability in the credentials' user namespace and sets
+ *     PF_SUPERPRIV flag on the task if capability is used.
+ *
+ * constraint: User namespace GID mapping
+ *   desc: The @gid parameter must have a valid mapping in the caller's user
+ *     namespace. The conversion via make_kgid() must produce a valid kgid_t
+ *     (not INVALID_GID). In the initial user namespace, all 32-bit GID values
+ *     are valid except (gid_t)-1. In other user namespaces, only GIDs that
+ *     have been explicitly mapped via /proc/[pid]/gid_map are valid. If the
+ *     GID is not valid, the call silently fails.
+ *   expr: gid_valid(make_kgid(current_user_ns(), gid))
+ *
+ * constraint: LSM policy (SafeSetID)
+ *   desc: If the SafeSetID LSM is enabled, the GID transition must be
+ *     explicitly allowed in the SafeSetID policy. SafeSetID calls the
+ *     security_task_fix_setgid() hook and can deny the operation. Unlike
+ *     other setid syscalls, if SafeSetID denies a setfsgid() call, the
+ *     process is NOT killed (SafeSetID only kills on setgid/setregid/setresgid
+ *     denials, not setfsgid). The call simply silently fails.
+ *
+ * constraint: CONFIG_MULTIUSER kernel configuration
+ *   desc: This syscall is only available when the kernel is built with
+ *     CONFIG_MULTIUSER=y. This option is enabled by default and is required
+ *     for multi-user systems. Embedded systems may disable it to save space,
+ *     in which case this syscall is not available.
+ *
+ * lock: thread_keyring->sem
+ *   type: KAPI_LOCK_SEMAPHORE
+ *   acquired: true
+ *   released: true
+ *   desc: If fsgid changes and CONFIG_KEYS is enabled and the thread has a
+ *     thread keyring, the keyring semaphore is write-locked in key_fsgid_changed()
+ *     to update the keyring's gid field. Lock is acquired with down_write() and
+ *     released with up_write() before returning.
+ *
+ * examples: gid_t old_fsgid = setfsgid(1000);  // Try to set fsgid to 1000
+ *   if (setfsgid(-1) != 1000) { handle_error(); }  // Verify success
+ *   setfsgid(getgid());  // Set fsgid to real GID
+ *   setfsgid(0);  // Set fsgid to root (requires CAP_SETGID or gid/egid/sgid==0)
+ *
+ * notes: SILENT FAILURE WARNING: This syscall silently fails in several cases:
+ *   the gid is not valid in the callers user namespace (gid_valid() fails),
+ *   memory allocation fails in prepare_creds(), permission check fails (gid
+ *   does not match and no CAP_SETGID), or LSM hook denies the operation
+ *   (security_task_fix_setgid() returns non-zero). In ALL these cases, the
+ *   syscall returns the old fsgid without any error indication. Always verify
+ *   success by checking with setfsgid(-1).
+ *
+ *   The syscall number is 123 on x86-64, 139 (16-bit setfsgid16) and 216
+ *   (32-bit setfsgid32) on i386, and 152 in the generic syscall table.
+ *
+ *   On 32-bit platforms with 16-bit GID support (CONFIG_UID16), a separate
+ *   setfsgid16 syscall exists that uses old_gid_t (16-bit). GIDs are converted
+ *   via low2highgid() before calling __sys_setfsgid().
+ *
+ *   Historical context: setfsgid() was introduced in Linux 1.2 as a companion
+ *   to setfsuid(), to address the NFS server use case where file access needed
+ *   to occur with different credentials without changing the effective group ID.
+ *   Like setfsuid(), this syscall is now considered obsolete since Linux 2.0
+ *   changed signal delivery rules. The man page marks this as [[deprecated]].
+ *
+ *   The fsgid is automatically reset to match the effective GID whenever
+ *   the egid changes via setgid(), setregid(), setresgid(), or execve() of
+ *   a setgid program. Only explicit setfsgid() calls can make fsgid differ
+ *   from egid.
+ *
+ *   Threading: At the kernel level, the fsgid is per-thread (stored in
+ *   per-task credentials). POSIX does not specify fsgid behavior, and glibc
+ *   does not synchronize setfsgid() across threads (unlike setgid() etc.).
+ *   Each thread can have a different fsgid.
+ *
+ *   Unlike setfsuid(), changing fsgid does NOT have any direct effect on
+ *   filesystem-related capabilities. The CAP_FS_SET capability adjustments
+ *   that occur with setfsuid() (dropping/raising capabilities when fsuid
+ *   transitions to/from root) do not have a GID equivalent since filesystem
+ *   capabilities are based on UID, not GID.
+ *
+ * since-version: 1.2
  */
 long __sys_setfsgid(gid_t gid)
 {
