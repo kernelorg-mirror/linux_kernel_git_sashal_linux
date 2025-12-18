@@ -5747,11 +5747,237 @@ SYSCALL_DEFINE3(sigprocmask, int, how, old_sigset_t __user *, nset,
 
 #ifndef CONFIG_ODD_RT_SIGACTION
 /**
- *  sys_rt_sigaction - alter an action taken by a process
- *  @sig: signal to be sent
- *  @act: new sigaction
- *  @oact: used to save the previous sigaction
- *  @sigsetsize: size of sigset_t type
+ * sys_rt_sigaction - examine and change a signal action
+ * @sig: Signal number to examine or modify (1 to SIGRTMAX)
+ * @act: New signal action to install, or NULL to only query
+ * @oact: Buffer to receive previous signal action, or NULL if not needed
+ * @sigsetsize: Size of the sigset_t type (must equal sizeof(sigset_t))
+ *
+ * long-desc: Examines and/or changes the action taken by a process on receipt
+ *   of a specific signal. This is the real-time signal variant of sigaction(2),
+ *   introduced in Linux 2.2 to support enlarged 64-bit signal sets.
+ *
+ *   The signal action is specified by a struct sigaction containing:
+ *   - sa_handler: Signal handler function (SIG_DFL, SIG_IGN, or function pointer)
+ *   - sa_sigaction: Alternate handler receiving 3 args (when SA_SIGINFO is set)
+ *   - sa_mask: Signals to block during handler execution (sigset_t)
+ *   - sa_flags: Behavior modifiers (SA_* flags)
+ *   - sa_restorer: Signal trampoline address (internal use, architecture-specific)
+ *
+ *   If @act is non-NULL, the new action is installed for signal @sig. The previous
+ *   action is returned in @oact if non-NULL. If @act is NULL and @oact is non-NULL,
+ *   the current action is queried without modification.
+ *
+ *   The sa_mask field specifies which signals are blocked during execution of
+ *   the signal handler. The signal being handled is always blocked unless
+ *   SA_NODEFER is specified. SIGKILL and SIGSTOP are automatically removed from
+ *   sa_mask as they cannot be blocked.
+ *
+ *   When setting a signal to SIG_IGN or to SIG_DFL for signals with a default
+ *   action of ignore (SIGCHLD, SIGCONT, SIGURG, SIGWINCH), any pending instances
+ *   of that signal are discarded from both the thread's pending queue and the
+ *   shared pending queue, as required by POSIX.
+ *
+ *   If the signal handler was previously SIG_IGN and is being changed to catch
+ *   the signal, POSIX timers that were ignored are re-armed.
+ *
+ *   Signals marked with SA_IMMUTABLE (an internal kernel flag) cannot be modified.
+ *   This flag is set by the kernel for forced signals from seccomp or similar
+ *   security mechanisms to prevent races between signal delivery and sigaction.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: sig
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, SIGRTMAX
+ *   constraint: Signal number between 1 and SIGRTMAX (typically 64). SIGKILL (9)
+ *     and SIGSTOP (19) cannot be caught, blocked, or ignored - attempting to
+ *     install a handler for them returns EINVAL. Signal 0 is not valid for this
+ *     syscall (unlike kill). Real-time signals range from SIGRTMIN (32) to
+ *     SIGRTMAX (64).
+ *
+ * param: act
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Pointer to struct sigaction describing the new signal action.
+ *     If NULL, the signal action is not changed (query-only mode). The struct
+ *     contains: sa_handler/sa_sigaction (handler function or SIG_DFL/SIG_IGN),
+ *     sa_mask (sigset_t of signals to block during handling), sa_flags (SA_*
+ *     behavior flags), and optionally sa_restorer (signal trampoline). The
+ *     sa_flags field is filtered to only include UAPI_SA_FLAGS; unknown flags
+ *     are silently cleared (since Linux 5.11 via SA_UNSUPPORTED detection).
+ *
+ * param: oact
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Pointer to struct sigaction buffer to receive the previous
+ *     signal action. If NULL, the previous action is not returned. This can
+ *     be the same pointer as @act for atomic swap operations. The returned
+ *     sa_flags field is filtered to only include UAPI_SA_FLAGS, clearing any
+ *     internal kernel flags (e.g., SA_IMMUTABLE is never visible to userspace).
+ *
+ * param: sigsetsize
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must exactly equal sizeof(sigset_t) on the calling architecture
+ *     (8 bytes on most 64-bit architectures, 8 bytes on 32-bit with 64 signals).
+ *     This parameter allows future expansion to larger signal sets while
+ *     maintaining backward compatibility. Returns EINVAL if size mismatch.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. If @act was non-NULL, the new signal action
+ *     is now installed. If @oact was non-NULL, it contains the previous action.
+ *     Both operations are performed atomically under siglock.
+ *
+ * error: EINVAL, Invalid signal number or uncatchable signal
+ *   desc: The signal number @sig is invalid (less than 1 or greater than
+ *     SIGRTMAX), or an attempt was made to change the action for SIGKILL or
+ *     SIGSTOP, which cannot be caught, blocked, or ignored. POSIX requires
+ *     that these signals remain uncatchable.
+ *
+ * error: EINVAL, Signal set size mismatch
+ *   desc: The @sigsetsize parameter does not equal sizeof(sigset_t). This
+ *     indicates an ABI mismatch between the calling program and the kernel.
+ *     The C library normally handles this automatically.
+ *
+ * error: EINVAL, Signal action is immutable
+ *   desc: The signal action has the SA_IMMUTABLE flag set internally, indicating
+ *     it was set by the kernel for a forced signal (e.g., from seccomp) and
+ *     cannot be changed by userspace. This prevents security-critical signals
+ *     from being caught or ignored by the target process.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @act pointer points to memory that is not readable by the
+ *     calling process, or @oact points to memory that is not writable.
+ *     For @act, the entire struct sigaction must be readable. For @oact,
+ *     the buffer must be writable. Returned via copy_from_user/copy_to_user.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-process signal handler spinlock (sighand->siglock) is acquired
+ *     with interrupts disabled via spin_lock_irq() in do_sigaction(). Held during
+ *     the entire signal action modification: checking SA_IMMUTABLE, reading the
+ *     old action, applying flag filtering, updating the action, and flushing
+ *     pending signals if the handler becomes SIG_IGN or default-ignore. Released
+ *     with spin_unlock_irq() before return. All threads sharing sighand share
+ *     this lock.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process signal handling state (task->sighand->action[sig-1])
+ *   desc: Modifies the signal action for signal @sig in the calling process.
+ *     The change affects all threads sharing the sighand structure. The new
+ *     handler, mask, and flags take effect immediately for subsequent signal
+ *     delivery. Child processes inherit the signal actions at fork time.
+ *   condition: @act is non-NULL
+ *   reversible: yes (by calling rt_sigaction again)
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND | KAPI_EFFECT_PROCESS_STATE
+ *   target: Pending signal queues (signal->shared_pending and thread pending)
+ *   desc: When the signal action is set to SIG_IGN or to SIG_DFL for a signal
+ *     whose default action is ignore (SIGCHLD, SIGCONT, SIGURG, SIGWINCH),
+ *     all pending instances of that signal are removed from both the shared
+ *     pending queue and all per-thread pending queues via flush_sigqueue_mask().
+ *     This implements POSIX 3.3.1.3 requirements.
+ *   condition: @act non-NULL and handler set to SIG_IGN or default-ignore
+ *   reversible: no (discarded signals cannot be recovered)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: POSIX timers (signal->ignored_posix_timers)
+ *   desc: When changing a signal handler from SIG_IGN to a catching handler
+ *     or SIG_DFL (for non-ignore signals), any POSIX timers that had their
+ *     signals ignored are re-armed via posixtimer_sig_unignore(). This ensures
+ *     timer signals are not permanently lost when temporarily ignored.
+ *   condition: @act non-NULL and previous handler was SIG_IGN
+ *   reversible: yes (timers can be disarmed)
+ *
+ * state-trans: signal_action
+ *   from: Any valid action (handler, SIG_DFL, SIG_IGN)
+ *   to: New action specified in @act
+ *   condition: @act is non-NULL, signal is catchable, not SA_IMMUTABLE
+ *   desc: The signal disposition changes atomically from the old action to
+ *     the new action. The transition is visible to all threads sharing the
+ *     signal handler table. Signal delivery racing with sigaction may see
+ *     either the old or new handler depending on timing.
+ *
+ * constraint: Thread-group shared signal handlers
+ *   desc: Signal actions are shared among all threads in a thread group
+ *     (threads created with CLONE_SIGHAND). Changing a signal action in one
+ *     thread immediately affects all threads in the group. Each thread may
+ *     have its own signal mask (blocked signals), but handlers are shared.
+ *
+ * constraint: SA_MASK filtering
+ *   desc: SIGKILL and SIGSTOP are automatically removed from the sa_mask field
+ *     via sigdelsetmask() before the action is installed. These signals cannot
+ *     be blocked even during signal handler execution.
+ *
+ * constraint: SA_FLAGS filtering
+ *   desc: The kernel only recognizes flags defined in UAPI_SA_FLAGS: SA_NOCLDSTOP,
+ *     SA_NOCLDWAIT, SA_SIGINFO, SA_ONSTACK, SA_RESTART, SA_NODEFER, SA_RESETHAND,
+ *     SA_EXPOSE_TAGBITS, and architecture-specific SA_RESTORER. Unknown flags are
+ *     silently cleared. The SA_UNSUPPORTED flag (0x400) can be used to detect flag
+ *     support: set it in sa_flags, call sigaction, and check if it remains set in
+ *     oact.sa_flags (it won't, indicating the kernel clears unknown flags).
+ *
+ * constraint: exec() behavior
+ *   desc: On exec(), signals with handlers are reset to SIG_DFL. Signals that are
+ *     ignored (SIG_IGN) remain ignored across exec(). The sa_mask and sa_flags
+ *     are reset for signals reverting to SIG_DFL.
+ *
+ * constraint: fork() behavior
+ *   desc: Child processes created via fork() inherit the parent's complete signal
+ *     disposition table, including all signal handlers, masks, and flags. Pending
+ *     signals are NOT inherited by the child.
+ *
+ * examples:
+ *   rt_sigaction(SIGINT, &new_act, &old_act, sizeof(sigset_t));  // Replace handler
+ *   rt_sigaction(SIGTERM, &new_act, NULL, sizeof(sigset_t));     // Install, no old
+ *   rt_sigaction(SIGHUP, NULL, &old_act, sizeof(sigset_t));      // Query only
+ *   rt_sigaction(SIGKILL, &new_act, NULL, sizeof(sigset_t));     // Returns -EINVAL
+ *
+ * notes:
+ *   - This syscall is normally called via the glibc sigaction() wrapper, which
+ *     handles the sigsetsize parameter automatically and uses the correct signal
+ *     trampoline (sa_restorer) for the architecture.
+ *   - The SA_SIGINFO flag determines the handler prototype: without it, the handler
+ *     receives only the signal number; with it, the handler receives (int signo,
+ *     siginfo_t *info, void *ucontext) providing detailed signal information.
+ *   - On x86_64, glibc sets SA_RESTORER and provides sa_restorer pointing to
+ *     __restore_rt which calls rt_sigreturn to return from the signal handler.
+ *   - SA_RESTART causes interrupted syscalls to be restarted after the signal
+ *     handler returns. Without it, syscalls return -EINTR. Some syscalls (like
+ *     read/write on slow devices) are always restartable regardless of SA_RESTART.
+ *   - SA_RESETHAND causes the signal disposition to reset to SIG_DFL when the
+ *     handler is invoked, providing one-shot signal handling.
+ *   - SA_NODEFER prevents the signal from being added to the blocked mask during
+ *     handler execution, allowing recursive signal handling.
+ *   - SA_ONSTACK causes the handler to execute on an alternate signal stack
+ *     configured via sigaltstack(). Essential for handling SIGSEGV from stack
+ *     overflow.
+ *   - SA_NOCLDSTOP and SA_NOCLDWAIT are only meaningful for SIGCHLD: NOCLDSTOP
+ *     suppresses SIGCHLD when children stop/continue; NOCLDWAIT causes children
+ *     to not become zombies (auto-reaped).
+ *   - The compat variant (compat_sys_rt_sigaction) handles 32-bit userspace on
+ *     64-bit kernels, translating pointer sizes and sigset_t layout.
+ *   - Kernel threads cannot use this syscall; they use kernel_sigaction() which
+ *     directly manipulates sighand->action without the userspace interface.
+ *   - A race condition fix in SA_IMMUTABLE (kernel 5.16) prevents userspace from
+ *     changing signal disposition between when seccomp decides to send a fatal
+ *     signal and when the signal is delivered. This closes a security hole.
+ *   - Linux 2.6.13 and earlier had a bug where SA_NODEFER incorrectly masked
+ *     signals specified in sa_mask instead of just not adding the signal itself;
+ *     this was fixed in 2.6.14.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE4(rt_sigaction, int, sig,
 		const struct sigaction __user *, act,
