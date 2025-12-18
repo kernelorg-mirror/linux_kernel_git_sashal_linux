@@ -1537,11 +1537,171 @@ SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
 }
 
 /**
- * sys_sched_getscheduler - get the policy (scheduling class) of a thread
- * @pid: the pid in question.
+ * sys_sched_getscheduler - Get the scheduling policy of a thread
+ * @pid: Thread ID to query, or 0 for the calling thread
  *
- * Return: On success, the policy of the thread. Otherwise, a negative error
- * code.
+ * long-desc: Retrieves the current scheduling policy of the specified thread.
+ *   This syscall provides a lightweight mechanism to query a thread's
+ *   scheduling class without retrieving all scheduling parameters.
+ *
+ *   The @pid parameter identifies the target thread. If @pid is 0, the calling
+ *   thread policy is returned. The thread is looked up via
+ *   find_task_by_vpid(), which respects PID namespace boundaries - only threads
+ *   visible in the caller's PID namespace can be queried.
+ *
+ *   On success, the syscall returns the scheduling policy as a non-negative
+ *   integer. The base policy value will be one of:
+ *   - SCHED_NORMAL (0): Standard time-sharing policy (CFS scheduler)
+ *   - SCHED_FIFO (1): First-in-first-out realtime policy
+ *   - SCHED_RR (2): Round-robin realtime policy
+ *   - SCHED_BATCH (3): Batch processing policy
+ *   - SCHED_IDLE (5): Very low priority background tasks
+ *   - SCHED_DEADLINE (6): Earliest deadline first realtime policy
+ *   - SCHED_EXT (7): Extensible BPF scheduler (if CONFIG_SCHED_CLASS_EXT)
+ *
+ *   If the thread has the SCHED_RESET_ON_FORK flag set, the return value will
+ *   have bit 0x40000000 set in addition to the base policy. This flag indicates
+ *   that child processes created via fork() will have their scheduling policy
+ *   reset to SCHED_NORMAL with priority 0.
+ *
+ *   The implementation acquires an RCU read lock to safely look up the thread
+ *   and read its policy. Since the policy and sched_reset_on_fork flag are
+ *   simple integers, no additional locking is needed - the values read are
+ *   guaranteed to be consistent (though they may change immediately after the
+ *   syscall returns if another thread modifies the target's policy).
+ *
+ *   Permission checks are performed by the security_task_getscheduler() LSM
+ *   hook. By default, any thread can query any other thread's scheduling
+ *   policy. However, LSMs like SELinux may restrict this based on security
+ *   policy - SELinux requires the PROCESS__GETSCHED permission on the target
+ *   task.
+ *
+ *   This syscall is the complement to sched_setscheduler(). Together with
+ *   sched_getparam(), it allows querying the complete scheduling state of a
+ *   thread (though sched_getattr() provides all information in a single call).
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, PID_MAX_LIMIT
+ *   constraint: Must be a valid thread ID in the caller's PID namespace, or 0
+ *     to query the calling thread. Negative values return EINVAL. A PID of 0 is
+ *     treated specially and always refers to the calling thread via 'current'.
+ *     Non-existent or invisible thread IDs return ESRCH.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: scheduling policy value (0-7, possibly OR'd with SCHED_RESET_ON_FORK)
+ *   desc: On success, returns the scheduling policy of the target thread as a
+ *     non-negative integer. The low bits (0-2) contain the policy value
+ *     (SCHED_NORMAL=0, SCHED_FIFO=1, SCHED_RR=2, SCHED_BATCH=3, SCHED_IDLE=5,
+ *     SCHED_DEADLINE=6, SCHED_EXT=7). Bit 30 (SCHED_RESET_ON_FORK=0x40000000)
+ *     indicates children will reset to SCHED_NORMAL on fork. On failure,
+ *     returns a negative error code.
+ *
+ * error: EINVAL, Invalid pid argument
+ *   desc: The @pid argument is negative. Valid PIDs are non-negative integers.
+ *     This check is performed before any process lookup occurs. Note that pid 0
+ *     is valid and refers to the calling thread.
+ *
+ * error: ESRCH, No thread found with specified PID
+ *   desc: No thread with the specified @pid exists in the caller's PID
+ *     namespace. The lookup uses find_task_by_vpid() which respects PID
+ *     namespace isolation - threads in parent or sibling PID namespaces are
+ *     not visible. This error also occurs if the thread existed but exited
+ *     before the lookup completed.
+ *
+ * error: EACCES, LSM denied the operation
+ *   desc: A Linux Security Module (SELinux, etc.) denied permission to query
+ *     the target thread's scheduling policy via the security_task_getscheduler()
+ *     hook. SELinux requires the PROCESS__GETSCHED permission on the target
+ *     task's security context. This error is returned by avc_has_perm() when
+ *     the permission check fails. Note: The man page incorrectly documents this
+ *     as EPERM; the actual kernel implementation returns EACCES from LSM hooks.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired via guard(rcu)() to protect the
+ *     find_process_by_pid() lookup and subsequent read of the task's policy
+ *     and sched_reset_on_fork fields. This prevents the task_struct from being
+ *     freed while being accessed. The lock is automatically released when the
+ *     function returns (whether success or error).
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: No blocking operations performed
+ *   desc: This syscall does not block and completes quickly. The RCU read-side
+ *     critical section is non-blocking. There are no interruptible sleep points,
+ *     so signals cannot interrupt this syscall. It never returns EINTR or
+ *     ERESTARTSYS.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: none
+ *   desc: This is a read-only syscall. It does not modify any kernel state,
+ *     does not allocate resources, and has no persistent side effects. The
+ *     target task's state is not modified in any way.
+ *   reversible: n/a
+ *
+ * capability: none
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: No capabilities are directly checked by this syscall.
+ *   without: By default, all processes can query any thread's scheduling policy.
+ *   condition: LSMs may impose restrictions based on security policy, not
+ *     Linux capabilities. SELinux uses the PROCESS__GETSCHED permission.
+ *
+ * constraint: PID namespace visibility
+ *   desc: The target thread must be visible in the caller's PID namespace.
+ *     find_task_by_vpid() performs the lookup in task_active_pid_ns(current),
+ *     so processes can only query threads they can "see". Threads in parent
+ *     PID namespaces or other containers are not accessible.
+ *
+ * constraint: LSM policy restrictions
+ *   desc: Linux Security Modules may restrict access to scheduling information.
+ *     SELinux requires PROCESS__GETSCHED permission. The caller must have
+ *     appropriate SELinux policy allowing it to read scheduling information
+ *     from the target process's security context.
+ *
+ * examples:
+ *   int policy = sched_getscheduler(0);
+ *   int policy = sched_getscheduler(pid);
+ *   if (policy & SCHED_RESET_ON_FORK) handle_reset_flag();
+ *   int base_policy = policy & ~SCHED_RESET_ON_FORK;
+ *
+ * notes:
+ *   - POSIX.1-2001/2008 conformant. Returns the policy as a non-negative
+ *     integer on success, or -1 with errno set on failure.
+ *   - The scheduling policy is a per-thread attribute in Linux. The pid
+ *     parameter can accept either a process ID from getpid() or a thread ID
+ *     from gettid(). When a process ID is used, the main thread policy is
+ *     returned.
+ *   - The returned value is a snapshot that may become stale immediately if
+ *     another thread calls sched_setscheduler() on the target. No locks are
+ *     held after the syscall returns to prevent this.
+ *   - Unlike sched_getparam() which returns priority via an output parameter,
+ *     this syscall uses the return value for the policy. This allows for a
+ *     simpler interface when only the policy is needed.
+ *   - The SCHED_RESET_ON_FORK flag in the return value was added in Linux
+ *     2.6.32. Prior kernels did not report this flag.
+ *   - For pthread applications, use pthread_getschedparam(3) which provides
+ *     both policy and priority in a single call.
+ *   - To get complete scheduling attributes including SCHED_DEADLINE parameters
+ *     and nice values, use sched_getattr() instead.
+ *   - This syscall is very lightweight - it only acquires RCU read lock and
+ *     reads two integer fields. It is suitable for frequent polling if needed.
+ *   - The man page documents EPERM as a possible error, but the actual kernel
+ *     implementation returns EACCES from LSM hooks. Applications should handle
+ *     both error codes for maximum portability.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
 {
