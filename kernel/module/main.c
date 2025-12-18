@@ -773,6 +773,262 @@ EXPORT_SYMBOL(module_refcount);
 /* This exists whether we can unload or not */
 static void free_module(struct module *mod);
 
+/**
+ * sys_delete_module - Unload a kernel module
+ * @name_user: User-space pointer to NUL-terminated module name string
+ * @flags: Flags controlling unload behavior (O_NONBLOCK, O_TRUNC)
+ *
+ * long-desc: Unloads a kernel module from the running kernel. The module's
+ *   exit function (if present) is executed to perform cleanup, then the
+ *   module's memory is freed and it is removed from the kernel's module list.
+ *
+ *   The unloading process follows these steps:
+ *   1. Capability check (CAP_SYS_MODULE required)
+ *   2. Copy module name from user space and validate
+ *   3. Audit logging of the module removal attempt
+ *   4. Acquire module_mutex (interruptible)
+ *   5. Find the module by name in the loaded modules list
+ *   6. Verify no other modules depend on this module (source_list empty)
+ *   7. Verify module is in MODULE_STATE_LIVE (not initializing or dying)
+ *   8. Verify module has exit function or force unload is requested
+ *   9. Attempt to release module reference count
+ *   10. Mark module as MODULE_STATE_GOING
+ *   11. Release module_mutex before calling exit function
+ *   12. Execute module's exit function (if present)
+ *   13. Send MODULE_STATE_GOING notification to interested subsystems
+ *   14. Clean up livepatch, ftrace, and async operations
+ *   15. Free all module resources and memory
+ *   16. Wake up any waiters on module_wq
+ *
+ *   The flags parameter controls behavior when the module is still in use:
+ *   - No flags: Returns -EWOULDBLOCK if refcount is nonzero
+ *   - O_NONBLOCK: Same as no flags (returns immediately if busy)
+ *   - O_TRUNC: Force unload regardless of refcount (requires
+ *     CONFIG_MODULE_FORCE_UNLOAD). This is dangerous and taints the kernel
+ *     with TAINT_FORCED_RMMOD, indicating potential instability.
+ *   - O_NONBLOCK | O_TRUNC: Force immediate unload (same as O_TRUNC alone)
+ *
+ *   Note: The man page documents a "blocking wait" mode when neither flag is
+ *   specified, but the current implementation returns -EWOULDBLOCK immediately
+ *   if the reference count is nonzero. The blocking wait behavior was removed.
+ *
+ *   Module unloading is disabled when:
+ *   - /proc/sys/kernel/modules_disabled is set to 1 (irreversible)
+ *   - The kernel was booted with "nomodule" parameter
+ *   - CONFIG_MODULE_UNLOAD is not set (syscall not compiled in)
+ *
+ *   This syscall is typically invoked by rmmod(8) and modprobe -r. Direct
+ *   use requires syscall(2) as glibc does not provide a wrapper.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: name_user
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONZERO
+ *   constraint: User-space pointer to a NUL-terminated string containing
+ *     the module name to unload. The name must be between 1 and
+ *     MODULE_NAME_LEN-1 (55) characters. Names longer than MODULE_NAME_LEN-1
+ *     cannot match any loaded module since modules cannot be loaded with
+ *     such long names, so -ENOENT is returned. Empty names also return
+ *     -ENOENT. The name should match the module's internal name, which may
+ *     differ from its filename (e.g., underscores vs hyphens are normalized).
+ *     NULL or invalid pointers return -EFAULT.
+ *
+ * param: flags
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_MASK
+ *   valid-mask: O_NONBLOCK | O_TRUNC
+ *   constraint: Bitmask of flags controlling unload behavior. Only O_NONBLOCK
+ *     (04000) and O_TRUNC (01000) are recognized. O_NONBLOCK causes immediate
+ *     return if the module is busy. O_TRUNC forces unload regardless of
+ *     reference count (requires CONFIG_MODULE_FORCE_UNLOAD; silently ignored
+ *     otherwise). Unknown flags are silently ignored. Value 0 is valid and
+ *     equivalent to O_NONBLOCK in current implementation.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the module has been unloaded, its
+ *     exit function (if any) has completed, and all resources freed. The
+ *     module no longer appears in /proc/modules or /sys/module/.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller lacks CAP_SYS_MODULE capability, or module
+ *     loading/unloading has been globally disabled via
+ *     /proc/sys/kernel/modules_disabled or the "nomodule" boot parameter.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The name_user pointer is invalid or points to unmapped memory.
+ *     Returned when strncpy_from_user() fails to access user memory.
+ *
+ * error: ENOENT, Module not found
+ *   desc: No module with the specified name is currently loaded. Also
+ *     returned if the provided name is empty (zero length) or exceeds
+ *     MODULE_NAME_LEN-1 characters (since such modules cannot exist).
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: A signal was delivered while waiting to acquire the module_mutex.
+ *     The module was not unloaded; the operation can be retried.
+ *
+ * error: EWOULDBLOCK, Module is in use
+ *   desc: The module cannot be unloaded because either: (1) other loaded
+ *     modules depend on it (have imported its symbols), or (2) the module's
+ *     reference count is nonzero (something is actively using it) and
+ *     O_TRUNC was not specified or CONFIG_MODULE_FORCE_UNLOAD is disabled.
+ *     Use "lsmod" or check /proc/modules to see module dependencies and
+ *     reference counts.
+ *
+ * error: EBUSY, Module not in unloadable state
+ *   desc: The module cannot be unloaded because: (1) it is not in
+ *     MODULE_STATE_LIVE state (still initializing or already being removed),
+ *     or (2) the module has an init function but no exit function, meaning
+ *     it was not designed to be unloadable, and O_TRUNC was not specified
+ *     or CONFIG_MODULE_FORCE_UNLOAD is disabled.
+ *
+ * lock: module_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Global module mutex protecting the module list and module state
+ *     transitions. Acquired interruptibly at the start (may return -EINTR).
+ *     Released before calling the module's exit function to avoid holding
+ *     the lock during potentially long cleanup operations. Not re-acquired
+ *     after exit function completes.
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting to acquire module_mutex
+ *   desc: The syscall uses mutex_lock_interruptible() which can be
+ *     interrupted by any signal. If a signal arrives while waiting for
+ *     the mutex, the syscall returns -EINTR without modifying any state.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_FREE_MEMORY
+ *   target: Module code, data, and per-CPU memory
+ *   desc: Frees all memory allocated for the module including executable
+ *     code sections, read-only data, read-write data, per-CPU data, and
+ *     parameter storage. Memory is returned to kernel allocators.
+ *   reversible: no
+ *   condition: On successful unload
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Global module list (/proc/modules)
+ *   desc: Removes the module from the kernel's linked list of loaded modules.
+ *     The module will no longer appear in /proc/modules, lsmod output, or
+ *     find_module() lookups. The module's exported symbols are no longer
+ *     available for resolution by other modules.
+ *   reversible: no
+ *   condition: On successful unload
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: /sys/module/<name>/ sysfs entries
+ *   desc: Removes the sysfs directory and all files associated with the
+ *     module, including parameter files, holders directory, and module
+ *     attribute files.
+ *   reversible: no
+ *   condition: On successful unload
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Kernel taint flags
+ *   desc: If O_TRUNC flag is used and CONFIG_MODULE_FORCE_UNLOAD is enabled,
+ *     sets TAINT_FORCED_RMMOD (bit 3) in kernel taint flags via add_taint().
+ *     This permanently marks the kernel as potentially unstable. The taint
+ *     persists until reboot and affects bug reports and support.
+ *   reversible: no
+ *   condition: When force unload (O_TRUNC) is used
+ *
+ * side-effect: KAPI_EFFECT_IRREVERSIBLE
+ *   target: Module exit function execution
+ *   desc: Executes the module's __exit function (if present), which performs
+ *     module-specific cleanup such as unregistering drivers, freeing
+ *     allocated resources, and removing device nodes. The side effects
+ *     of the exit function depend on the specific module being unloaded.
+ *   condition: If module has an exit function
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: last_unloaded_module kernel variable
+ *   desc: Stores the name and taint flags of the unloaded module in a
+ *     kernel variable for diagnostic purposes. This is displayed in
+ *     OOPS/panic messages to help identify recently unloaded modules
+ *     that may have caused instability.
+ *   reversible: no
+ *   condition: On successful unload
+ *
+ * state-trans: module
+ *   from: MODULE_STATE_LIVE
+ *   to: MODULE_STATE_GOING
+ *   condition: After successfully releasing reference count
+ *   desc: The module transitions from LIVE (fully operational) to GOING
+ *     (being removed) state. In GOING state, no new references can be
+ *     acquired. The module is then fully freed and removed from lists.
+ *
+ * capability: CAP_SYS_MODULE
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Unloading kernel modules
+ *   without: Returns -EPERM immediately before any other processing
+ *   condition: Checked first, along with modules_disabled flag
+ *
+ * constraint: Module Unloading Disabled
+ *   desc: If /proc/sys/kernel/modules_disabled has been set to 1 (one-shot
+ *     irreversible operation), or the kernel was booted with "nomodule"
+ *     parameter, all module operations including unloading are disabled
+ *     and return -EPERM.
+ *
+ * constraint: CONFIG_MODULE_UNLOAD Required
+ *   desc: This syscall is only available when CONFIG_MODULE_UNLOAD is
+ *     enabled in the kernel configuration. Without it, the syscall entry
+ *     point may not exist or may return an error.
+ *
+ * constraint: CONFIG_MODULE_FORCE_UNLOAD for O_TRUNC
+ *   desc: The O_TRUNC flag only has effect when CONFIG_MODULE_FORCE_UNLOAD
+ *     is enabled. Otherwise, it is silently ignored and the module cannot
+ *     be forcibly unloaded.
+ *
+ * examples: syscall(SYS_delete_module, "mymodule", 0);  // Normal unload
+ *   syscall(SYS_delete_module, "stuck", O_NONBLOCK);  // Non-blocking
+ *   syscall(SYS_delete_module, "force", O_TRUNC);  // Force unload (dangerous)
+ *
+ * notes: This syscall is typically used indirectly via rmmod(8) or
+ *   modprobe -r. Direct use requires syscall(2) as glibc does not provide
+ *   a wrapper function.
+ *
+ *   The O_TRUNC forced unload is extremely dangerous and should only be
+ *   used as a last resort. It can cause kernel crashes, data corruption,
+ *   or security vulnerabilities if the module has active users. The kernel
+ *   is tainted to warn that stability is no longer guaranteed.
+ *
+ *   Unlike the man page description, the current implementation does NOT
+ *   support blocking wait mode. When the module has a nonzero reference
+ *   count and O_TRUNC is not used, -EWOULDBLOCK is returned immediately
+ *   rather than waiting for the reference count to drop.
+ *
+ *   Module names are normalized: hyphens in filenames become underscores
+ *   in module names. When unloading, use the normalized name as shown in
+ *   /proc/modules or lsmod output.
+ *
+ *   After successful unload, the module_wq wait queue is signaled to wake
+ *   up any processes waiting for module state changes (e.g., processes
+ *   trying to load the same module).
+ *
+ *   Corner cases:
+ *   - Empty name: Returns -ENOENT (cannot match any module)
+ *   - Name too long (>= MODULE_NAME_LEN): Returns -ENOENT
+ *   - NULL pointer: Returns -EFAULT
+ *   - Module in COMING state: Returns -EBUSY
+ *   - Module in GOING state: Returns -EBUSY
+ *   - Module with dependencies: Returns -EWOULDBLOCK
+ *   - Module with no exit function: Returns -EBUSY (unless O_TRUNC)
+ *   - Unknown flags: Silently ignored
+ *   - Concurrent unload attempts: Serialized by module_mutex
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 		unsigned int, flags)
 {
