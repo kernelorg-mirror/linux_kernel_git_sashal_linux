@@ -576,11 +576,165 @@ out:
 	return error;
 }
 
-/*
- * Ugh. To avoid negative return values, "getpriority()" will
- * not return the normal nice-value, but a negated value that
- * has been offset by 20 (ie it returns 40..1 instead of -20..19)
- * to stay compatible.
+/**
+ * sys_getpriority - Get the scheduling priority (nice value) for processes
+ * @which: Target type selector (PRIO_PROCESS, PRIO_PGRP, or PRIO_USER)
+ * @who: Target identifier interpreted according to @which
+ *
+ * long-desc: Retrieves the scheduling nice value for one or more processes.
+ *   When multiple processes match the criteria (PRIO_PGRP or PRIO_USER),
+ *   returns the highest priority (lowest nice value) among all matching
+ *   processes.
+ *
+ *   IMPORTANT: To avoid returning negative values that could be confused with
+ *   error codes, the kernel returns an offset value in the range 1-40 instead
+ *   of the actual nice value (-20 to 19). The formula is:
+ *   returned_value = 20 - nice_value, so nice -20 returns 40, nice 19 returns 1.
+ *   User-space wrappers (glibc) convert this back to the actual nice value.
+ *
+ *   The @which parameter determines how @who is interpreted:
+ *   - PRIO_PROCESS (0): @who is a process ID. If @who is 0, the calling
+ *     process is targeted. Uses find_task_by_vpid() which respects PID
+ *     namespace boundaries.
+ *   - PRIO_PGRP (1): @who is a process group ID. If @who is 0, the calling
+ *     process's process group is targeted. All threads in the process group
+ *     are examined via do_each_pid_thread(). Returns the highest priority
+ *     (lowest nice value) found among all threads.
+ *   - PRIO_USER (2): @who is a user ID. If @who is 0, the calling process's
+ *     real UID is targeted. All processes owned by the specified user are
+ *     examined. Only processes visible in the caller's PID namespace are
+ *     considered (checked via task_pid_vnr() != 0). Returns the highest
+ *     priority (lowest nice value) found.
+ *
+ *   For PRIO_USER, the @who value is converted to a kuid via make_kuid()
+ *   using the caller's user namespace. If @who is 0 or matches the caller's
+ *   UID, the current user_struct is used directly. Otherwise, find_user()
+ *   is called to locate the user_struct for the target UID.
+ *
+ *   Unlike setpriority(), no permission checks are required to read process
+ *   priorities. Any process can query the nice value of any other visible
+ *   process.
+ *
+ *   POSIX specifies that when multiple processes match, getpriority() should
+ *   return the lowest nice value (highest priority). Since the kernel returns
+ *   offset values (40..1 maps to nice -20..19), it actually returns the
+ *   highest offset value among matching processes.
+ *
+ *   Per-thread vs per-process: Under Linux/NPTL, nice values are per-thread
+ *   attributes, which differs from POSIX semantics that treat nice as
+ *   per-process. Different threads in the same process may have different
+ *   nice values. This syscall examines individual threads.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   valid-mask: PRIO_PROCESS | PRIO_PGRP | PRIO_USER
+ *   constraint: Must be exactly one of PRIO_PROCESS (0), PRIO_PGRP (1), or
+ *     PRIO_USER (2). Any other value results in EINVAL.
+ *
+ * param: who
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation depends on @which. For PRIO_PROCESS, must be a
+ *     valid PID in the caller's PID namespace or 0 (current process). For
+ *     PRIO_PGRP, must be a valid process group ID or 0 (current pgrp). For
+ *     PRIO_USER, must be a valid UID or 0 (current real UID). When @which is
+ *     PRIO_USER, @who is converted to a kuid via make_kuid() using the caller's
+ *     user namespace.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: 1 to 40
+ *   desc: Returns an offset nice value in the range 1-40 on success. This maps
+ *     to actual nice values 19 to -20 via the formula: nice = 20 - returned.
+ *     When multiple processes match, returns the value corresponding to the
+ *     highest priority (lowest nice value) among all matching processes.
+ *     User-space wrappers convert this to the actual nice value. Since -1 is
+ *     never returned on success, callers can distinguish success from error.
+ *
+ * error: EINVAL, Invalid which parameter
+ *   desc: The @which parameter is not one of PRIO_PROCESS (0), PRIO_PGRP (1),
+ *     or PRIO_USER (2). Checked at syscall entry before any process lookup.
+ *
+ * error: ESRCH, No matching process found
+ *   desc: No process matched the @which/@who criteria. For PRIO_PROCESS, no
+ *     process with the specified PID exists in the caller's PID namespace.
+ *     For PRIO_PGRP, no process group with the specified PGID exists or the
+ *     group has no threads. For PRIO_USER, no processes owned by the specified
+ *     UID exist that are visible in the caller's PID namespace, or find_user()
+ *     failed to locate the user_struct for the specified UID (meaning no
+ *     processes exist for that user).
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held for the duration of process iteration and
+ *     lookup. Protects task structures from being freed during iteration.
+ *     Required for find_task_by_vpid(), find_vpid(), task credential access,
+ *     and for_each_process_thread() iteration.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global tasklist read lock is acquired only for PRIO_PGRP case
+ *     during do_each_pid_thread() iteration to ensure thread group stability.
+ *     Not acquired for PRIO_PROCESS or PRIO_USER cases. Acquired as read_lock
+ *     inside the rcu_read_lock section.
+ *
+ * lock: uidhash_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: For PRIO_USER case only, acquired by find_user() to look up the
+ *     user_struct for the target UID. Acquired with IRQs disabled
+ *     (spin_lock_irqsave). Also acquired by free_uid() when releasing the
+ *     reference. Only acquired when @who != 0 and differs from caller's UID.
+ *
+ * constraint: PID namespace isolation
+ *   desc: Processes are only visible if they exist in the caller's PID
+ *     namespace hierarchy. For PRIO_PROCESS and PRIO_PGRP, uses
+ *     find_task_by_vpid()/find_vpid(). For PRIO_USER, only processes with
+ *     task_pid_vnr(p) != 0 are considered (visible in caller's PID namespace).
+ *
+ * examples: getpriority(PRIO_PROCESS, 0);  // Get own nice value (returns 1-40)
+ *   getpriority(PRIO_PROCESS, 1234);  // Get nice value of PID 1234
+ *   getpriority(PRIO_PGRP, 0);  // Get highest priority in own process group
+ *   getpriority(PRIO_USER, 1000);  // Get highest priority among UID 1000 procs
+ *
+ * notes: This syscall originated in 4.2BSD and is specified by POSIX.1-2008.
+ *   The unusual return value encoding (1-40 instead of -20..19) is for
+ *   historical compatibility to distinguish success from error returns.
+ *
+ *   The syscall number is 140 on x86-64, 96 on i386, and 141 in the generic
+ *   syscall table.
+ *
+ *   Historical fix (commit 8639b46139b0): Prior to Linux 4.5, PRIO_USER mode
+ *   could examine processes outside the caller's PID namespace. This was fixed
+ *   by adding the task_pid_vnr(p) != 0 check.
+ *
+ *   Historical fix (commit 701188374b6f): In 2.6.33-rc7, RCU protection was
+ *   added for sys_setpriority() but was missing for sys_getpriority(). This
+ *   was fixed to properly protect find_task_by_vpid() access.
+ *
+ *   The setpriority() syscall is the counterpart for modifying nice values.
+ *   Together they provide the BSD-style priority management interface.
+ *
+ *   Alpha architecture note: OSF/1 compatibility layer (osf_getpriority)
+ *   converts the return value back to the actual nice value (-20..19) and
+ *   uses force_successful_syscall_return() to handle the negative values.
+ *
+ *   The for_each_process_thread() iteration in PRIO_USER case iterates over
+ *   all processes and threads in the system, which can be expensive on systems
+ *   with many processes.
+ *
+ * since-version: 1.0
  */
 SYSCALL_DEFINE2(getpriority, int, which, int, who)
 {
