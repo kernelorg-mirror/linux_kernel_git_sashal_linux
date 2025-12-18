@@ -2473,6 +2473,103 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
 	return __sys_setresuid(ruid, euid, suid);
 }
 
+/**
+ * sys_getresuid - Get the real, effective, and saved user IDs
+ * @ruidp: Pointer to store the real user ID
+ * @euidp: Pointer to store the effective user ID
+ * @suidp: Pointer to store the saved set-user-ID
+ *
+ * long-desc: Retrieves the real user ID, effective user ID, and saved
+ *   set-user-ID of the calling process, storing them in the locations
+ *   pointed to by @ruidp, @euidp, and @suidp respectively. The UIDs are
+ *   translated from the kernel's internal representation to the caller's
+ *   user namespace. This syscall is the counterpart to setresuid(2).
+ *
+ *   The real UID identifies the user who owns the process and is used for
+ *   resource accounting. The effective UID determines the process's access
+ *   permissions and is used for most permission checks. The saved set-user-ID
+ *   allows a set-user-ID program to temporarily drop privileges and later
+ *   regain them.
+ *
+ *   If a UID has no mapping in the caller's user namespace (which can happen
+ *   when a process enters a user namespace where its UIDs are not mapped),
+ *   the overflow UID (typically 65534, configured via /proc/sys/kernel/overflowuid)
+ *   is returned instead. This "munging" ensures the syscall never fails due
+ *   to unmapped UIDs.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: ruidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a uid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * param: euidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a uid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * param: suidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a uid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The real, effective, and saved UIDs are written
+ *     to the locations pointed to by @ruidp, @euidp, and @suidp respectively.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: One of @ruidp, @euidp, or @suidp points to an address outside the
+ *     process's accessible address space, or the memory is not writable. The
+ *     pointers are validated sequentially (ruidp first, then euidp, then suidp),
+ *     so if EFAULT is returned, some values may have been written while others
+ *     were not. Specifically, if @euidp fails, @ruidp has already been written;
+ *     if @suidp fails, both @ruidp and @euidp have been written.
+ *
+ * examples: uid_t ruid, euid, suid;
+ *   getresuid(&ruid, &euid, &suid);  // Retrieve all three UIDs
+ *   if (euid != ruid) { ... }  // Running with elevated privileges
+ *   if (suid == 0) { ... }  // Can regain root privileges via setresuid
+ *
+ * notes: This syscall requires no special capabilities; any process can read
+ *   its own user IDs.
+ *
+ *   The syscall originated in Linux 2.1.44 and is also available on HP-UX
+ *   and FreeBSD (since 4.2). It is NOT part of any POSIX standard.
+ *
+ *   The syscall number is 118 on x86-64, 165 (16-bit getresuid16) and 209
+ *   (32-bit getresuid32) on i386, and 148 in the generic syscall table.
+ *
+ *   On 32-bit platforms with 16-bit UID support (CONFIG_UID16), a separate
+ *   getresuid16 syscall exists. UIDs larger than 65535 are truncated to the
+ *   overflow UID (65534) by the high2lowuid() macro.
+ *
+ *   This syscall does not acquire any locks. The credentials are accessed via
+ *   current_cred() which uses RCU-protected access to the current task
+ *   credentials. Since a task can only modify its own credentials (via
+ *   set*uid syscalls), this access is inherently safe without additional
+ *   synchronization.
+ *
+ *   Unlike setresuid(2), this syscall has no interaction with LSM modules,
+ *   capability checks, or user namespace restrictions (beyond UID mapping).
+ *
+ *   Threading: At the kernel level, UIDs are per-thread. However, POSIX
+ *   requires all threads to share credentials. The glibc wrapper for
+ *   setresuid(2) uses signal-based synchronization to ensure all threads
+ *   see consistent credentials. Since getresuid only reads, no such
+ *   synchronization is needed for this syscall.
+ *
+ * since-version: 2.1.44
+ */
 SYSCALL_DEFINE3(getresuid, uid_t __user *, ruidp, uid_t __user *, euidp, uid_t __user *, suidp)
 {
 	const struct cred *cred = current_cred();
