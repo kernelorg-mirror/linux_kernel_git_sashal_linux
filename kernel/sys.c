@@ -1733,16 +1733,267 @@ SYSCALL_DEFINE2(setreuid, uid_t, ruid, uid_t, euid)
 	return __sys_setreuid(ruid, euid);
 }
 
-/*
- * setuid() is implemented like SysV with SAVED_IDS
+/**
+ * sys_setuid - Set the user ID of the calling process
+ * @uid: New user ID to set
  *
- * Note that SAVED_ID's is deficient in that a setuid root program
- * like sendmail, for example, cannot set its uid to be a normal
- * user and then switch back, because if you're root, setuid() sets
- * the saved uid too.  If you don't like this, blame the bright people
- * in the POSIX committee and/or USG.  Note that the BSD-style setreuid()
- * will allow a root program to temporarily drop privileges and be able to
- * regain them by swapping the real and effective uid.
+ * long-desc: Sets the effective user ID of the calling process, and
+ *   depending on the caller's privileges, may also set the real UID,
+ *   saved set-user-ID, and filesystem UID.
+ *
+ *   This syscall implements SysV/POSIX semantics with SAVED_IDS. The behavior
+ *   differs significantly based on whether the caller has CAP_SETUID:
+ *
+ *   With CAP_SETUID capability:
+ *   - The real UID (uid) is set to @uid
+ *   - The saved set-user-ID (suid) is set to @uid
+ *   - The effective UID (euid) is set to @uid
+ *   - The filesystem UID (fsuid) is set to @uid
+ *   - If the new UID differs from the old real UID, the user_struct is
+ *     updated via set_user() to point to the new UID's accounting structure
+ *
+ *   Without CAP_SETUID capability:
+ *   - The @uid must equal either the current real UID or the saved set-user-ID
+ *   - Only the effective UID (euid) is set to @uid
+ *   - The filesystem UID (fsuid) is set to @uid
+ *   - The real UID and saved set-user-ID remain unchanged
+ *
+ *   CRITICAL SECURITY NOTE: Unlike setreuid(2), a privileged process that
+ *   calls setuid() to a non-root UID CANNOT regain root privileges afterward.
+ *   This is because setuid() sets ALL user IDs (uid, euid, suid) to the
+ *   specified value when called with CAP_SETUID. This behavior follows POSIX
+ *   SAVED_IDS semantics and is by design. Programs needing to temporarily
+ *   drop privileges should use seteuid(2) or setreuid(2) instead.
+ *
+ *   User namespace support: The @uid value is interpreted in the context of
+ *   the caller's user namespace. It is converted to a kernel-internal kuid_t
+ *   value using make_kuid(). If @uid has no mapping in the caller's user
+ *   namespace, it is considered invalid and EINVAL is returned.
+ *
+ *   Capability side effects: When UIDs change, the commoncap LSM adjusts
+ *   process capabilities via cap_emulate_setxuid():
+ *   - If transitioning from any UID == 0 to all UIDs != 0, and
+ *     SECURE_KEEP_CAPS is not set, permitted and effective capabilities
+ *     are cleared, along with ambient capabilities
+ *   - If transitioning from euid == 0 to euid != 0, effective caps are cleared
+ *   - If transitioning from euid != 0 to euid == 0, effective caps are set
+ *     to permitted caps
+ *   These adjustments can be suppressed by setting SECURE_NO_SETUID_FIXUP
+ *   in the securebits via prctl(PR_SET_SECUREBITS).
+ *
+ *   This syscall is only available when CONFIG_MULTIUSER is enabled. On
+ *   single-user systems (CONFIG_MULTIUSER=n), this syscall is not defined.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: uid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid UID that the caller has permission to set.
+ *     For unprivileged callers (without CAP_SETUID), must equal the current
+ *     real UID or saved set-user-ID. For privileged callers (with CAP_SETUID),
+ *     may be any UID that has a mapping in the caller's user namespace.
+ *     Unlike setreuid/setresuid, the value (uid_t)-1 is NOT special and is
+ *     treated as a literal UID value (which will fail uid_valid() check).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The user IDs have been updated as described
+ *     above based on the caller's capabilities. The process's capabilities
+ *     may also have been adjusted based on the UID transitions.
+ *
+ * error: EINVAL, User ID not valid in user namespace
+ *   desc: The @uid does not have a valid mapping in the caller's user
+ *     namespace. This occurs when make_kuid() returns INVALID_UID (internal
+ *     value of (uid_t)-1), which is checked by uid_valid(). This typically
+ *     happens when running in a user namespace that doesn't have the target
+ *     UID mapped, or when the UID value is out of the mapped range. Note
+ *     that in the initial user namespace, all 32-bit UID values are valid
+ *     except (uid_t)-1.
+ *
+ * error: ENOMEM, Cannot allocate credentials structure
+ *   desc: The kernel failed to allocate memory for the new credentials
+ *     structure via prepare_creds(). This function uses kmem_cache_alloc()
+ *     with GFP_KERNEL, which can fail under severe memory pressure. The
+ *     syscall returns early without modifying any credentials. Also returned
+ *     if security_prepare_creds() fails during credential preparation.
+ *
+ * error: EPERM, Permission denied for UID change
+ *   desc: Returned when the caller does not have CAP_SETUID capability and
+ *     the requested @uid does not equal either the current real UID or the
+ *     current saved set-user-ID. The caller may only set their effective UID
+ *     to their real UID or saved set-user-ID without CAP_SETUID. This
+ *     implements the unprivileged setuid behavior defined by POSIX.
+ *
+ * error: EAGAIN, Cannot allocate user structure
+ *   desc: Returned when the kernel fails to allocate a new user_struct in
+ *     set_user() via alloc_uid(). This occurs when the caller has CAP_SETUID
+ *     and the new UID differs from the old real UID, requiring allocation of
+ *     a new per-user accounting structure. The alloc_uid() function uses
+ *     kmem_cache_zalloc() with GFP_KERNEL. Also can fail if user_epoll_alloc()
+ *     fails during user structure initialization. Note that unlike older
+ *     kernel versions, RLIMIT_NPROC is not enforced at setuid time.
+ *
+ * error: EAGAIN, Cannot allocate ucounts structure
+ *   desc: Returned when set_cred_ucounts() fails to allocate a new ucounts
+ *     structure via alloc_ucounts(). This happens when the new UID differs
+ *     from the current UID and the kernel cannot allocate memory for tracking
+ *     per-user resource counts. Uses kzalloc() with GFP_KERNEL.
+ *
+ * error: EACCES, LSM policy denied the operation
+ *   desc: A Linux Security Module (such as SafeSetID) denied the user ID
+ *     transition via the security_task_fix_setuid() hook. SafeSetID enforces
+ *     allowlist-based policies and returns -EACCES when a UID transition is
+ *     not explicitly permitted in the policy. When SafeSetID denies the
+ *     operation, it also sends SIGKILL to the process to prevent security
+ *     vulnerabilities from missing allowlist entries. This error only occurs
+ *     when SafeSetID or a similar restrictive LSM is enabled and configured.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process credential user IDs (uid, euid, suid, fsuid)
+ *   desc: Updates the calling process's user ID credentials. With CAP_SETUID,
+ *     all four user IDs (uid, suid, euid, fsuid) are set to @uid. Without
+ *     CAP_SETUID, only euid and fsuid are updated. The credentials are
+ *     atomically replaced via RCU in commit_creds().
+ *   reversible: Depends on prior state. If setuid was called with CAP_SETUID,
+ *     the saved set-user-ID is overwritten, making it impossible to regain
+ *     the previous privileges via setuid alone.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process user structure (user_struct)
+ *   desc: If the real UID changes (only when caller has CAP_SETUID),
+ *     set_user() allocates or finds the user_struct for the new UID, updates
+ *     new->user, and releases the reference to the old user_struct via
+ *     free_uid(). This affects per-user resource accounting.
+ *   condition: Real UID changes to a different value (requires CAP_SETUID)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process capabilities (cap_permitted, cap_effective, cap_ambient)
+ *   desc: The commoncap LSM adjusts capabilities based on UID transitions via
+ *     cap_emulate_setxuid(). When dropping from root (any of uid/euid/suid==0)
+ *     to non-root (all of uid/euid/suid!=0), capabilities are cleared unless
+ *     SECURE_KEEP_CAPS is set. Ambient capabilities are always cleared in this
+ *     case. These adjustments implement the traditional Unix behavior where
+ *     dropping root loses capabilities.
+ *   condition: UID transitions involving root (UID 0) in the user namespace
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process dumpability flag
+ *   desc: If the effective UID or filesystem UID changes, the process's
+ *     dumpability may be affected. In commit_creds(), if euid or fsuid
+ *     differs from the old values (or capabilities are reduced),
+ *     set_dumpable() is called with the suid_dumpable sysctl value,
+ *     potentially making the process non-dumpable for security reasons.
+ *     Also, pdeath_signal is cleared to 0.
+ *   condition: Effective UID or filesystem UID changes, or caps reduced
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Keyring state (via key_fsuid_changed)
+ *   desc: If the filesystem UID changes, key_fsuid_changed() is called to
+ *     update any keyring state that depends on the process's filesystem UID.
+ *     This ensures proper key access control after credential changes.
+ *   condition: Filesystem UID changes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process flags (PF_NPROC_EXCEEDED)
+ *   desc: The flag_nproc_exceeded() function checks if the new credentials
+ *     would exceed RLIMIT_NPROC for the new user. If so, PF_NPROC_EXCEEDED
+ *     is set on the current task, deferring the RLIMIT_NPROC enforcement to
+ *     execve() time. This ensures that setuid() calls succeed even when over
+ *     limit, but subsequent execve() calls will fail with EAGAIN. The flag
+ *     is cleared if the limit is not exceeded. This behavior exists because
+ *     many programs don't check set*uid() return codes.
+ *   condition: New ucounts differ from current and RLIMIT_NPROC exceeded
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_NETWORK
+ *   target: Process connector notification (PROC_EVENT_UID)
+ *   desc: If any of the user ID fields (uid, euid, suid, fsuid) change,
+ *     a PROC_EVENT_UID notification is sent via the process connector
+ *     (proc_id_connector). This allows userspace processes monitoring the
+ *     connector socket to be notified of credential changes.
+ *   condition: Any user ID field changes (CONFIG_PROC_EVENTS enabled)
+ *   reversible: no
+ *
+ * state-trans: credentials
+ *   from: original credential state
+ *   to: new credential state with updated user IDs
+ *   condition: Permission checks pass
+ *   desc: The process credentials atomically transition from the old state
+ *     to the new state via commit_creds(). The old credentials are released
+ *     via put_cred_many(). RCU is used to ensure safe concurrent access to
+ *     credentials by other kernel code (via rcu_assign_pointer).
+ *
+ * capability: CAP_SETUID
+ *   type: KAPI_CAP_BYPASS_CHECK | KAPI_CAP_MODIFY_BEHAVIOR
+ *   allows: Setting all four user IDs (uid, suid, euid, fsuid) to any valid
+ *     UID in the caller's user namespace. Changing the real UID triggers
+ *     allocation of a new user_struct for resource accounting.
+ *   without: Can only set euid and fsuid to the current real UID or saved
+ *     set-user-ID. The real UID and saved set-user-ID remain unchanged.
+ *     This is the unprivileged POSIX-compliant behavior.
+ *   condition: Checked via ns_capable_setid(old->user_ns, CAP_SETUID) which
+ *     verifies the capability in the credentials' user namespace and sets
+ *     PF_SUPERPRIV flag on the task if capability is used.
+ *
+ * constraint: User namespace UID mapping
+ *   desc: The @uid parameter must have a valid mapping in the caller's user
+ *     namespace. The conversion via make_kuid() must produce a valid kuid_t
+ *     (not INVALID_UID). In the initial user namespace, all 32-bit UID values
+ *     are valid except (uid_t)-1. In other user namespaces, only UIDs that
+ *     have been explicitly mapped via /proc/[pid]/uid_map are valid.
+ *   expr: uid_valid(make_kuid(current_user_ns(), uid))
+ *
+ * constraint: CONFIG_MULTIUSER kernel configuration
+ *   desc: This syscall is only available when the kernel is built with
+ *     CONFIG_MULTIUSER=y. This option is enabled by default and is required
+ *     for multi-user systems. Embedded systems may disable it to save space,
+ *     in which case all users are treated as root and this syscall is not
+ *     available.
+ *
+ * examples: setuid(0);  // Become root (requires CAP_SETUID or already root)
+ *   setuid(1000);  // Drop to user 1000 (if CAP_SETUID: permanent, else: must match uid or suid)
+ *   setuid(getuid());  // Set euid to real uid (always succeeds if valid)
+ *   setuid(getsuid());  // Set euid to saved uid (unprivileged allowed)
+ *
+ * notes: This syscall implements SysV/POSIX semantics, NOT BSD semantics.
+ *   The critical difference is that root processes calling setuid() to a
+ *   non-zero UID permanently drop all privileges because the saved
+ *   set-user-ID is also changed. BSD-style setreuid() preserves the ability
+ *   to regain root privileges by leaving suid unchanged.
+ *
+ *   The syscall number is 105 on x86-64, 23 (16-bit setuid16) and 213
+ *   (32-bit setuid32) on i386. The glibc wrapper transparently handles
+ *   the kernel version difference.
+ *
+ *   For programs needing temporary privilege dropping with restoration
+ *   capability, use seteuid(2) instead. For full control over all three
+ *   user IDs, use setresuid(2).
+ *
+ *   The man page emphasizes: "it is a grave security error to omit checking
+ *   for a failure return from setuid()." Even root can fail this call under
+ *   various conditions (memory pressure, LSM denial, namespace issues).
+ *
+ *   Threading: At the kernel level, UIDs are per-thread. However, POSIX
+ *   requires all threads to share credentials. NPTL uses signal-based
+ *   techniques (specifically, sending RT signals to all threads) to
+ *   synchronize credential changes across threads.
+ *
+ *   RLIMIT_NPROC is NOT enforced at setuid() time. Instead, PF_NPROC_EXCEEDED
+ *   is set and enforcement is deferred to execve(). This was changed because
+ *   many programs don't check set*uid() return codes, and immediate failure
+ *   could leave processes running with elevated privileges. The commit
+ *   c16bdeb5a39ff removed the CAP_SYS_RESOURCE/CAP_SYS_ADMIN bypass for this
+ *   check to fix RLIMIT_NPROC enforcement issues.
+ *
+ * since-version: 1.0
  */
 long __sys_setuid(uid_t uid)
 {
