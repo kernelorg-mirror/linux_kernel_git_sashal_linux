@@ -2654,6 +2654,253 @@ error:
 	return retval;
 }
 
+/**
+ * sys_setresgid - Set the real, effective, and saved group IDs
+ * @rgid: New real group ID (-1 to leave unchanged)
+ * @egid: New effective group ID (-1 to leave unchanged)
+ * @sgid: New saved set-group-ID (-1 to leave unchanged)
+ *
+ * long-desc: Sets the real group ID, effective group ID, and saved
+ *   set-group-ID of the calling process. Each parameter can be set
+ *   independently, and passing -1 for any parameter leaves that ID
+ *   unchanged. The filesystem group ID (fsgid) is always set to match
+ *   the new effective group ID.
+ *
+ *   Privilege requirements:
+ *   Unprivileged processes (without CAP_SETGID) can only set each group
+ *   ID to a value that is already held as the current real group ID,
+ *   effective group ID, or saved set-group-ID. This restriction applies
+ *   to each parameter independently.
+ *
+ *   Privileged processes (with CAP_SETGID in their user namespace) can
+ *   set any or all of the three group IDs to any valid GID value in
+ *   the caller's user namespace. This provides complete control over
+ *   the process's group identity.
+ *
+ *   No-op optimization:
+ *   If all requested values either are -1 or already match the current
+ *   corresponding values (with the additional check that egid matches
+ *   both current egid and fsgid), the syscall returns 0 immediately
+ *   without allocating new credentials. This makes checking current
+ *   values or explicitly setting them to their current values efficient.
+ *
+ *   User namespace support:
+ *   The @rgid, @egid, and @sgid values are interpreted in the context
+ *   of the caller's user namespace. Each non-(-1) value is converted to
+ *   a kernel-internal kgid_t value using make_kgid(). If any GID has no
+ *   mapping in the caller's user namespace, the syscall fails with EINVAL.
+ *
+ *   Filesystem GID behavior:
+ *   Unlike setresuid(2) which has explicit fsuid handling, setresgid(2)
+ *   always sets fsgid to match the new effective GID. To set fsgid
+ *   independently, use setfsgid(2).
+ *
+ *   POSIX compliance:
+ *   This syscall is NOT part of any POSIX standard, though POSIX.1-2001
+ *   describes a similar interface. It originated in HP-UX and is also
+ *   available in FreeBSD (since 4.2). Linux has supported it since 2.1.44.
+ *
+ *   Threading considerations:
+ *   At the kernel level, credentials are per-thread. However, POSIX
+ *   mandates that all threads in a process share credentials. The glibc
+ *   wrapper uses signal-based synchronization (via NPTL) to propagate
+ *   credential changes to all threads. Direct syscall invocations bypass
+ *   this synchronization and only affect the calling thread.
+ *
+ *   This syscall is only available when CONFIG_MULTIUSER is enabled.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: rgid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Either -1 (leave unchanged) or a valid GID that has a
+ *     mapping in the caller's user namespace. For unprivileged callers,
+ *     must also equal the current real, effective, or saved set-group-ID.
+ *
+ * param: egid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Either -1 (leave unchanged) or a valid GID that has a
+ *     mapping in the caller's user namespace. For unprivileged callers,
+ *     must also equal the current real, effective, or saved set-group-ID.
+ *
+ * param: sgid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Either -1 (leave unchanged) or a valid GID that has a
+ *     mapping in the caller's user namespace. For unprivileged callers,
+ *     must also equal the current real, effective, or saved set-group-ID.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The real, effective, and/or saved group
+ *     IDs have been updated as requested, and the filesystem GID has
+ *     been set to match the new effective GID.
+ *
+ * error: EINVAL, Group ID not valid in user namespace
+ *   desc: One of @rgid, @egid, or @sgid (when not -1) does not have a
+ *     valid mapping in the caller's user namespace. This occurs when
+ *     make_kgid() returns INVALID_GID, which is detected by gid_valid().
+ *     Common causes include: (1) running in a user namespace without
+ *     the target GID mapped in /proc/[pid]/gid_map, (2) specifying
+ *     (gid_t)-1 which equals INVALID_GID for the validation check
+ *     (distinct from using -1 to mean "unchanged"), or (3) the GID
+ *     value being outside the mapped range. In the initial user namespace,
+ *     all 32-bit GID values are valid except (gid_t)-1.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The calling process does not have CAP_SETGID capability, AND
+ *     one or more of the requested values is "new" (not equal to any of
+ *     the current real, effective, or saved set-group-IDs). Specifically,
+ *     for each non-(-1) parameter, the kernel checks if the value matches
+ *     any of old->gid, old->egid, or old->sgid. If ANY parameter specifies
+ *     a value not matching one of these, CAP_SETGID is required. The
+ *     capability is checked via ns_capable_setid(old->user_ns, CAP_SETGID).
+ *
+ * error: ENOMEM, Cannot allocate credentials structure
+ *   desc: The kernel failed to allocate memory for the new credentials
+ *     structure via prepare_creds(). This function uses kmem_cache_alloc()
+ *     with GFP_KERNEL. This error is rare under normal system operation.
+ *     The syscall returns without modifying any credentials.
+ *
+ * error: EACCES, LSM policy denied the operation
+ *   desc: A Linux Security Module denied the group ID transition via the
+ *     security_task_fix_setgid() hook with the LSM_SETID_RES flag. The
+ *     SafeSetID LSM enforces allowlist-based policies for GID transitions
+ *     and returns -EACCES when a transition is not explicitly permitted.
+ *     When SafeSetID denies the operation, it also sends SIGKILL to the
+ *     process to prevent security vulnerabilities from processes that
+ *     don't check return values.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process credential group IDs (gid, egid, sgid, fsgid)
+ *   desc: Updates the calling process's group ID credentials according to
+ *     the parameters. For each parameter that is not -1, the corresponding
+ *     group ID is set to that value. The filesystem GID is always set to
+ *     match the new effective GID value. The changes are atomically applied
+ *     via commit_creds() using RCU.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process dumpability flag
+ *   desc: If the effective GID or filesystem GID changes from their original
+ *     values, set_dumpable() is called in commit_creds() with the current
+ *     suid_dumpable sysctl value. This may make the process non-dumpable
+ *     (preventing core dumps and ptrace attachment) for security reasons.
+ *   condition: Effective GID or filesystem GID changes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process death signal (pdeath_signal)
+ *   desc: If the effective GID changes to differ from the original effective
+ *     GID, the task's pdeath_signal field is cleared to 0 in commit_creds().
+ *     This prevents a process from receiving a death signal from its parent
+ *     after changing credentials, which could be a security issue.
+ *   condition: Effective GID changes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Keyring state (via key_fsgid_changed)
+ *   desc: If the filesystem GID changes, key_fsgid_changed() is called to
+ *     update any keyring state that depends on the process's filesystem GID.
+ *     This ensures proper key access control after credential changes.
+ *   condition: Filesystem GID changes (implied when egid changes since fsgid = egid)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_NETWORK
+ *   target: Process connector notification (PROC_EVENT_GID)
+ *   desc: If any of the group ID fields (gid, egid, sgid, fsgid) change,
+ *     a PROC_EVENT_GID notification is sent via the process connector
+ *     (proc_id_connector). This allows userspace processes monitoring the
+ *     connector socket to be notified of credential changes.
+ *   condition: Any group ID field changes (CONFIG_PROC_EVENTS enabled)
+ *   reversible: no
+ *
+ * state-trans: credentials
+ *   from: original credential state
+ *   to: new credential state with updated group IDs
+ *   condition: Permission checks pass and at least one GID changes
+ *   desc: The process credentials atomically transition from the old state
+ *     to the new state via commit_creds(). The old credentials are released
+ *     via put_cred_many(). RCU is used (via rcu_assign_pointer) to ensure
+ *     safe concurrent access to credentials by other kernel code.
+ *
+ * capability: CAP_SETGID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Setting any or all of the three group IDs (real, effective, saved)
+ *     to any valid GID in the caller's user namespace. This provides complete
+ *     control over the process's group identity.
+ *   without: Can only set each GID to a value already held as the current
+ *     real GID, effective GID, or saved set-group-ID. Any attempt to set a
+ *     GID to a "new" value (one not matching any of the three current GIDs)
+ *     will fail with EPERM.
+ *   condition: Checked via ns_capable_setid(old->user_ns, CAP_SETGID) which
+ *     verifies the capability in the credentials' user namespace and sets
+ *     PF_SUPERPRIV flag on the task if capability is used.
+ *
+ * constraint: User namespace GID mapping
+ *   desc: Each of @rgid, @egid, and @sgid (when not -1) must have a valid
+ *     mapping in the caller's user namespace. The conversion via make_kgid()
+ *     must produce a valid kgid_t (not INVALID_GID). In the initial user
+ *     namespace, all 32-bit GID values are valid except (gid_t)-1. In other
+ *     user namespaces, only GIDs that have been explicitly mapped via
+ *     /proc/[pid]/gid_map are valid.
+ *   expr: gid_valid(make_kgid(current_user_ns(), gid)) for each gid != -1
+ *
+ * constraint: CONFIG_MULTIUSER kernel configuration
+ *   desc: This syscall is only available when the kernel is built with
+ *     CONFIG_MULTIUSER=y. This option is enabled by default and is required
+ *     for multi-user systems. Embedded systems may disable it to save space,
+ *     in which case all users are treated as root and this syscall is not
+ *     available.
+ *
+ * examples: setresgid(-1, -1, -1);  // No change (always succeeds)
+ *   setresgid(0, 0, 0);  // Become root group completely (requires CAP_SETGID)
+ *   setresgid(-1, 0, -1);  // Set only effective GID to root
+ *   setresgid(-1, getgid(), -1);  // Set effective GID to real GID
+ *   setresgid(1000, 1000, 1000);  // Set all group IDs to 1000
+ *   setresgid(-1, 1000, -1);  // Temporarily drop privileges (can restore via saved GID)
+ *   setresgid(getgid(), getgid(), getgid());  // Ensure all GIDs match real GID
+ *
+ * notes: This syscall provides more control than setregid(2) or setgid(2).
+ *   Unlike setregid(), it allows explicitly setting the saved set-group-ID
+ *   independently. Unlike setgid(), privileged processes can set the three
+ *   GIDs to different values.
+ *
+ *   This syscall originated in Linux 2.1.44 and is also available in HP-UX
+ *   and FreeBSD (since 4.2). It is NOT part of any POSIX standard, though
+ *   POSIX.1-2001 describes a similar interface.
+ *
+ *   The syscall number is 119 on x86-64, 170 (16-bit setresgid16) and 210
+ *   (32-bit setresgid32) on i386, and 149 in the generic syscall table.
+ *
+ *   Unlike setresuid(2), setresgid(2) does NOT check RLIMIT_NPROC since
+ *   group changes don't affect process count accounting. There is no
+ *   equivalent to set_user() or set_cred_ucounts() in the GID path.
+ *
+ *   The man page warns that setresgid() can fail even when called by root,
+ *   so applications must always check the return value. This is particularly
+ *   important when dropping privileges - a failed call could leave the
+ *   process running with elevated group privileges.
+ *
+ *   Threading: At the kernel level, GIDs are per-thread. However, POSIX
+ *   requires all threads to share credentials. NPTL uses signal-based
+ *   techniques to synchronize credential changes across threads. The glibc
+ *   wrapper handles this synchronization transparently.
+ *
+ *   The SafeSetID LSM module can enforce additional restrictions on GID
+ *   transitions based on a configured allowlist policy. If a transition is
+ *   denied by SafeSetID, the process receives SIGKILL in addition to the
+ *   EACCES return value.
+ *
+ * since-version: 2.1.44
+ */
 SYSCALL_DEFINE3(setresgid, gid_t, rgid, gid_t, egid, gid_t, sgid)
 {
 	return __sys_setresgid(rgid, egid, sgid);
