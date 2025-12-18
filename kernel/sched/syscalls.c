@@ -1726,12 +1726,200 @@ SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
 }
 
 /**
- * sys_sched_getparam - get the RT priority of a thread
- * @pid: the pid in question.
- * @param: structure containing the RT priority.
+ * sys_sched_getparam - Get the scheduling priority of a thread
+ * @pid: Thread ID to query, or 0 for the calling thread
+ * @param: User-space pointer to struct sched_param to receive the priority
  *
- * Return: On success, 0 and the RT priority is in @param. Otherwise, an error
- * code.
+ * long-desc: Retrieves the scheduling parameters (specifically the realtime
+ *   priority) of a thread. This syscall is the read-side complement to
+ *   sched_setparam() and provides a subset of the information available via
+ *   sched_getattr().
+ *
+ *   The @pid parameter identifies the target thread. If @pid is 0, the calling
+ *   thread's parameters are returned. The thread is looked up via
+ *   find_task_by_vpid(), which respects PID namespace boundaries - only threads
+ *   visible in the caller's PID namespace can be queried.
+ *
+ *   The @param structure receives a single field, sched_priority, which
+ *   contains the thread's realtime priority:
+ *   - For SCHED_FIFO and SCHED_RR (realtime policies): sched_priority is the
+ *     thread's RT priority in the range 1 to 99 (task->rt_priority), with
+ *     higher values meaning higher priority.
+ *   - For SCHED_NORMAL, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, and SCHED_EXT:
+ *     sched_priority is always 0. These policies do not use RT priority; nice
+ *     values or deadline parameters control scheduling instead.
+ *
+ *   POSIX specifies that sched_getparam() should only be called when
+ *   sched_getscheduler() returns SCHED_FIFO or SCHED_RR. The Linux
+ *   implementation extends this by returning 0 for all other policies rather
+ *   than returning an error, maintaining backwards compatibility.
+ *
+ *   The implementation acquires an RCU read lock to safely look up the thread
+ *   and read its scheduling policy and rt_priority. The RCU lock is released
+ *   before calling copy_to_user(), which may sleep. Since the read values are
+ *   simple integers, no additional locking is needed - the values are snapshots
+ *   that may change immediately after the syscall returns if another thread
+ *   modifies the target's scheduling parameters.
+ *
+ *   Permission checks are performed by the security_task_getscheduler() LSM
+ *   hook. By default, any thread can query any other thread's scheduling
+ *   parameters. However, LSMs like SELinux or Smack may restrict this based on
+ *   security policy.
+ *
+ *   Historical note: Prior to kernel 3.14 (commit ce5f7f8200ca), calling
+ *   sched_getparam() on a SCHED_DEADLINE task returned EINVAL. This was changed
+ *   to return sched_priority=0 for consistency with other non-RT policies.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, PID_MAX_LIMIT
+ *   constraint: Must be a valid thread ID in the caller's PID namespace, or 0
+ *     to query the calling thread. Negative values return EINVAL. A PID of 0 is
+ *     treated specially and always refers to the calling thread via 'current'.
+ *     Non-existent or invisible thread IDs return ESRCH.
+ *
+ * param: param
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to struct sched_param. The
+ *     structure must be writable by the kernel (copy_to_user must succeed).
+ *     NULL returns EINVAL. Invalid pointer returns EFAULT. The structure size
+ *     is sizeof(struct sched_param) which contains a single int sched_priority.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the scheduling parameters have been
+ *     written to @param. The sched_priority field will contain the RT priority
+ *     (1-99) for SCHED_FIFO/SCHED_RR tasks, or 0 for all other scheduling
+ *     policies.
+ *
+ * error: EINVAL, Invalid pid or param argument
+ *   desc: Returned when @pid is negative (pid < 0) or when @param is NULL.
+ *     This check is performed first, before any process lookup or permission
+ *     checks occur. Note that pid 0 is valid and refers to the calling thread.
+ *     The unlikely() hint is used on this check path for branch optimization.
+ *
+ * error: ESRCH, No thread found with specified PID
+ *   desc: No thread with the specified @pid exists in the caller's PID
+ *     namespace. The lookup uses find_task_by_vpid() which respects PID
+ *     namespace isolation - threads in parent or sibling PID namespaces are
+ *     not visible. This error also occurs if the thread existed but exited
+ *     before the lookup completed. When pid is 0, this error cannot occur
+ *     as find_process_by_pid() returns 'current' directly.
+ *
+ * error: EACCES, LSM denied the operation
+ *   desc: A Linux Security Module denied permission to query the target
+ *     thread's scheduling parameters via security_task_getscheduler(). SELinux
+ *     requires PROCESS__GETSCHED permission, Smack requires MAY_READ access.
+ *     Note: The man page does not document this error, but it is returned by
+ *     the actual kernel implementation when LSMs are active.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: The @param pointer is invalid and copy_to_user() failed. The pointer
+ *     may be unmapped, point to kernel memory, be read-only, or otherwise be
+ *     inaccessible for writing from user space. This error is returned after
+ *     all permission checks pass and the scheduling parameters have been read
+ *     from the target task.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired via scoped_guard(rcu) to protect the
+ *     find_process_by_pid() lookup and subsequent read of the task's policy
+ *     and rt_priority fields. This prevents the task_struct from being freed
+ *     while being accessed. The lock is released when the scoped_guard block
+ *     exits, which happens before the copy_to_user() call since that operation
+ *     may sleep. The comment in the source explicitly notes "This one might
+ *     sleep, we cannot do it with a spinlock held".
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: No interruptible wait points
+ *   desc: This syscall does not block in a signal-interruptible manner. The
+ *     RCU read-side critical section is non-blocking. While copy_to_user() may
+ *     fault and potentially sleep for page-in, this is not interruptible by
+ *     signals in a way that would return EINTR. The syscall never returns
+ *     EINTR or ERESTARTSYS.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: none
+ *   desc: This is a read-only syscall. It does not modify any kernel state,
+ *     does not allocate persistent resources, and has no lasting side effects.
+ *     The target task's state is not modified in any way. The only memory
+ *     modified is the user-space @param structure, which receives the output.
+ *   reversible: n/a
+ *
+ * capability: none
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: No capabilities are directly checked by this syscall.
+ *   without: By default, all processes can query any thread's scheduling
+ *     parameters. The kernel imposes no capability-based restrictions.
+ *   condition: LSMs may impose restrictions based on security policy, not
+ *     Linux capabilities. SELinux uses the PROCESS__GETSCHED permission,
+ *     Smack checks MAY_READ access between security labels.
+ *
+ * constraint: PID namespace visibility
+ *   desc: The target thread must be visible in the caller's PID namespace.
+ *     find_task_by_vpid() performs the lookup in task_active_pid_ns(current),
+ *     so processes can only query threads they can "see". Threads in parent
+ *     PID namespaces, sibling namespaces, or other containers are not
+ *     accessible and result in ESRCH.
+ *
+ * constraint: LSM policy restrictions
+ *   desc: Linux Security Modules may restrict access to scheduling information.
+ *     SELinux: requires PROCESS__GETSCHED permission from the calling process's
+ *     security context to the target process's security context.
+ *     Smack: requires MAY_READ access from the caller's Smack label to the
+ *     target task's Smack label.
+ *
+ * examples:
+ *   struct sched_param sp;
+ *   sched_getparam(0, &sp);  // Get own priority
+ *   sched_getparam(pid, &sp);  // Get another thread's priority
+ *   if (sched_getscheduler(pid) == SCHED_FIFO)
+ *       printf("RT priority: %d\n", sp.sched_priority);  // 1-99
+ *   else
+ *       printf("Not RT, priority: %d\n", sp.sched_priority);  // Always 0
+ *
+ * notes:
+ *   - POSIX.1-2001/2008 conformant. Available on systems defining
+ *     _POSIX_PRIORITY_SCHEDULING in <unistd.h>.
+ *   - POSIX says sched_getparam() should only be called when sched_getscheduler()
+ *     returns SCHED_FIFO or SCHED_RR. Linux extends this by returning 0 for
+ *     non-RT policies instead of an error.
+ *   - The sched_param structure has only one field: int sched_priority. Unlike
+ *     sched_attr, it cannot be extended without breaking ABI compatibility.
+ *   - For complete scheduling information including nice values, SCHED_DEADLINE
+ *     parameters, and utilization clamp values, use sched_getattr() instead.
+ *   - The returned value is a snapshot that may become stale immediately if
+ *     another thread calls sched_setscheduler() or sched_setparam() on the
+ *     target. No locks are held after the syscall returns.
+ *   - The scheduling parameters are per-thread attributes in Linux. The pid
+ *     parameter accepts either a process ID from getpid() or a thread ID from
+ *     gettid(). When a process ID is used, the main thread's parameters are
+ *     returned.
+ *   - For pthread applications, use pthread_getschedparam(3) which provides
+ *     both policy and priority in a single call.
+ *   - Prior to Linux 3.14, calling sched_getparam() on a SCHED_DEADLINE task
+ *     returned EINVAL. This was changed for consistency (commit ce5f7f8200ca).
+ *   - The man page does not document EACCES, but it can be returned by LSM
+ *     hooks (SELinux, Smack). Applications should handle both EACCES and the
+ *     documented errors for maximum portability.
+ *   - This syscall is very lightweight when the target thread is known to
+ *     exist - it only acquires RCU read lock and reads a few integers.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 {
