@@ -2497,13 +2497,240 @@ long sched_getaffinity(pid_t pid, struct cpumask *mask)
 }
 
 /**
- * sys_sched_getaffinity - get the CPU affinity of a process
- * @pid: pid of the process
- * @len: length in bytes of the bitmask pointed to by user_mask_ptr
- * @user_mask_ptr: user-space pointer to hold the current CPU mask
+ * sys_sched_getaffinity - get the CPU affinity mask of a thread
+ * @pid: thread ID of the target thread (0 means calling thread)
+ * @len: length in bytes of the buffer pointed to by user_mask_ptr
+ * @user_mask_ptr: user-space pointer to receive the current CPU affinity mask
  *
- * Return: size of CPU mask copied to user_mask_ptr on success. An
- * error code otherwise.
+ * long-desc: Retrieves the CPU affinity mask of the thread specified by @pid
+ *   and writes it to the buffer pointed to by @user_mask_ptr. The CPU affinity
+ *   mask indicates which CPUs the thread is currently eligible to run on. The
+ *   returned mask is the intersection of the thread's affinity mask and the
+ *   currently active CPUs (cpu_active_mask), so it reflects the CPUs on which
+ *   the thread can actually be scheduled.
+ *
+ *   The @pid argument is a thread ID (the value returned by gettid() or
+ *   clone()), not a process ID. To query the affinity of a specific thread in
+ *   a multi-threaded process, use that thread's TID. Using a TGID returns the
+ *   affinity of only the main thread. When @pid is 0, the calling thread's own
+ *   affinity is returned.
+ *
+ *   The @len parameter specifies the size in bytes of the buffer at
+ *   @user_mask_ptr. It must be large enough to hold at least nr_cpu_ids bits
+ *   (rounded up to bytes), and must be aligned to sizeof(unsigned long). If
+ *   these requirements are not met, the syscall returns -EINVAL. If @len is
+ *   larger than cpumask_size(), only cpumask_size() bytes are copied to
+ *   userspace. The returned value indicates how many bytes were actually
+ *   copied.
+ *
+ *   Unlike sched_setaffinity() which requires privilege to modify another
+ *   thread's affinity, sched_getaffinity() only requires permission via the
+ *   LSM security_task_getscheduler() hook. In standard DAC (no LSM), any
+ *   thread can query any other thread's affinity if it is visible in the
+ *   caller's PID namespace.
+ *
+ *   The mask is zero-filled before being populated, so any bits beyond the
+ *   actual number of CPUs will be zero. This was fixed in kernel 6.3 by
+ *   commit 6015b1aca1a23 which changed from alloc_cpumask_var() to
+ *   zalloc_cpumask_var() to ensure the entire buffer is initialized.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, PID_MAX_LIMIT
+ *   constraint: Must be either 0 (for the calling thread) or a valid thread ID
+ *     in the caller's PID namespace. Negative values are treated as a lookup
+ *     for a non-existent thread and return -ESRCH. The value is interpreted as
+ *     a TID (thread ID), not a TGID. Using a TGID will return only the main
+ *     thread's affinity.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Length in bytes of the user-space buffer. Must satisfy two
+ *     requirements: (1) len * 8 >= nr_cpu_ids (buffer must hold enough bits
+ *     for all possible CPU IDs), and (2) len must be aligned to
+ *     sizeof(unsigned long) (8 bytes on 64-bit, 4 bytes on 32-bit). Failure
+ *     to meet either requirement returns -EINVAL. If len > cpumask_size(),
+ *     only cpumask_size() bytes are copied. The standard glibc cpu_set_t is
+ *     128 bytes (1024 CPUs), which is sufficient for most systems.
+ *
+ * param: user_mask_ptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to a writable buffer of at
+ *     least @len bytes to receive the CPU affinity bitmask. The mask is a
+ *     bitmap where bit N set indicates CPU N is in the affinity set. If
+ *     @user_mask_ptr is NULL or points to inaccessible memory, copy_to_user()
+ *     fails and the syscall returns -EFAULT. The buffer need not be aligned,
+ *     though alignment may improve performance.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: min(len, cpumask_size())
+ *   desc: On success, returns the number of bytes copied to user_mask_ptr,
+ *     which is min(len, cpumask_size()). This value indicates how many bytes
+ *     of the mask are valid. Note that the kernel syscall returns the size on
+ *     success, while the glibc wrapper returns 0 on success and -1 on error.
+ *     The value returned can be used to determine the kernel's cpumask_size(),
+ *     which reflects NR_CPUS configuration.
+ *
+ * error: EINVAL, Invalid len argument
+ *   desc: Returned when the @len argument fails validation. Two checks are
+ *     performed: (1) len * BITS_PER_BYTE must be >= nr_cpu_ids, meaning the
+ *     buffer must be large enough to hold a bit for each possible CPU. On a
+ *     system with 256 possible CPUs, this requires at least 32 bytes. (2) len
+ *     must be a multiple of sizeof(unsigned long) (8 on 64-bit, 4 on 32-bit).
+ *     For the compat syscall on 64-bit kernels, alignment is to
+ *     sizeof(compat_ulong_t) which is 4 bytes.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed. The syscall allocates a temporary cpumask
+ *     structure via zalloc_cpumask_var() with GFP_KERNEL. This is a sleepable
+ *     allocation that only fails under extreme memory pressure. The cpumask
+ *     is freed before the syscall returns regardless of success or failure.
+ *
+ * error: ESRCH, No such process
+ *   desc: No thread with the specified @pid exists in the caller's PID
+ *     namespace. The lookup uses find_task_by_vpid() which respects PID
+ *     namespace isolation - threads in parent or sibling PID namespaces are
+ *     not visible. This error also occurs if the thread existed but exited
+ *     before the lookup completed. When @pid is 0, this error cannot occur
+ *     since find_process_by_pid() returns 'current' directly.
+ *
+ * error: EACCES, Permission denied (LSM)
+ *   desc: A Linux Security Module denied permission to query the target
+ *     thread's scheduling parameters via security_task_getscheduler(). SELinux
+ *     requires PROCESS__GETSCHED permission from the caller's security context
+ *     to the target's context. Smack requires MAY_READ access from the caller's
+ *     Smack label to the target's label. AppArmor does not implement this hook.
+ *     Note that unlike sched_setaffinity(), there is no DAC permission check
+ *     (CAP_SYS_NICE is not required), only LSM checks apply.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @user_mask_ptr pointer is invalid or not writable. Returned when
+ *     copy_to_user() fails to write to the user buffer. This occurs when the
+ *     pointer is NULL, points to unmapped memory, points to kernel memory,
+ *     points to read-only memory, or the buffer is not fully writable for the
+ *     required length.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired via guard(rcu)() to protect the
+ *     find_process_by_pid() lookup and subsequent access to the task's
+ *     cpus_mask. This prevents the task_struct from being freed while being
+ *     accessed. The lock is automatically released when the function returns.
+ *     The RCU critical section encompasses the task lookup, security check,
+ *     and cpumask read.
+ *
+ * lock: p->pi_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The target task's pi_lock (priority inheritance lock) is acquired
+ *     via guard(raw_spinlock_irqsave)(&p->pi_lock) while reading the task's
+ *     cpus_mask. This spinlock protects the task's scheduling-related fields
+ *     including cpus_mask from concurrent modification by sched_setaffinity().
+ *     The lock is held with interrupts disabled and is released before
+ *     returning from sched_getaffinity(). Note that copy_to_user() is called
+ *     after the lock is released since it may sleep.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Syscall has minimal blocking points
+ *   desc: This syscall does not have explicit signal handling. The
+ *     zalloc_cpumask_var() call uses GFP_KERNEL which may sleep but is not
+ *     interruptible. The copy_to_user() may also sleep during page faults
+ *     but is not interruptible. The syscall does not return EINTR or
+ *     ERESTARTSYS. A pending signal will be delivered after the syscall
+ *     completes.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: none
+ *   desc: This is a read-only query syscall that does not modify any kernel
+ *     state. The target task's affinity mask is only read, never modified.
+ *     The only kernel resource used is a temporary cpumask allocation which
+ *     is freed before returning.
+ *
+ * state-trans: none
+ *   desc: No state transitions occur. This syscall is purely informational
+ *     and does not change any task state.
+ *
+ * capability: none
+ *   desc: Unlike sched_setaffinity(), this syscall does not require any
+ *     capabilities for DAC permission. Any process can query any other
+ *     process's CPU affinity as long as the target is visible in the caller's
+ *     PID namespace. However, LSM policies (SELinux, Smack) may still restrict
+ *     access via the security_task_getscheduler() hook.
+ *
+ * constraint: PID namespace visibility
+ *   desc: The target thread must be visible in the caller's PID namespace.
+ *     find_task_by_vpid() performs the lookup in task_active_pid_ns(current),
+ *     so processes can only query threads they can "see". Threads in parent
+ *     PID namespaces, sibling namespaces, or other containers are not
+ *     accessible and return -ESRCH.
+ *
+ * constraint: LSM policy restrictions
+ *   desc: Linux Security Modules may restrict access to scheduling information.
+ *     SELinux: requires PROCESS__GETSCHED permission (getsched access vector).
+ *     Smack: requires MAY_READ access from caller's label to target's label.
+ *     The check is performed by security_task_getscheduler() before reading
+ *     the affinity mask. Denial returns -EACCES.
+ *
+ * constraint: Buffer size and alignment
+ *   desc: The len parameter must be large enough to hold nr_cpu_ids bits
+ *     (divide by 8 and round up for bytes) and must be aligned to
+ *     sizeof(unsigned long). These requirements ensure the buffer can hold
+ *     the mask and that the copy is efficient. Systems with many CPUs require
+ *     larger buffers; use CPU_ALLOC() and CPU_ALLOC_SIZE() from glibc for
+ *     dynamic sizing.
+ *
+ * examples: sched_getaffinity(0, sizeof(cpu_set_t), &mask);  // Get calling thread
+ *   sched_getaffinity(pid, sizeof(cpu_set_t), &mask);  // Get specific thread
+ *   sched_getaffinity(gettid(), 128, &mask);  // 128-byte (1024 CPU) mask
+ *
+ * notes: The glibc wrapper function for sched_getaffinity() differs from
+ *   the raw kernel syscall. The glibc version has signature:
+ *   int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask);
+ *   and returns 0 on success or -1 with errno set on failure. The raw syscall
+ *   returns the number of bytes copied on success.
+ *
+ *   The cpu_set_t data type used by glibc has a fixed size of 128 bytes,
+ *   meaning that the maximum CPU number that can be represented is 1023.
+ *   For systems with more CPUs, use CPU_ALLOC() to dynamically allocate
+ *   larger masks. The reliable method to determine the required size is to
+ *   call sched_getaffinity() with increasing mask sizes until it succeeds
+ *   without -EINVAL.
+ *
+ *   The returned mask reflects only currently active CPUs (cpu_active_mask).
+ *   CPUs that are offline or not yet brought online will have their bits
+ *   cleared even if the task's affinity includes them. This differs from
+ *   the user-requested mask stored by sched_setaffinity().
+ *
+ *   Historical bug (fixed in kernel 6.3): Prior to commit 6015b1aca1a23,
+ *   sched_getaffinity() used alloc_cpumask_var() instead of zalloc_cpumask_var(),
+ *   which could leave uninitialized data in the mask when cpumask_size() was
+ *   larger than the bits actually used (nr_cpu_ids). This could leak kernel
+ *   stack data to userspace in edge cases.
+ *
+ *   Compat syscall: A 32-bit compatible version (compat_sys_sched_getaffinity)
+ *   exists for 32-bit processes on 64-bit kernels. It uses compat_ulong_t
+ *   for alignment and compat_put_bitmap() for copying. The alignment
+ *   requirement is sizeof(compat_ulong_t) (4 bytes) instead of
+ *   sizeof(unsigned long) (8 bytes).
+ *
+ * since-version: 2.5.8
  */
 SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 		unsigned long __user *, user_mask_ptr)
