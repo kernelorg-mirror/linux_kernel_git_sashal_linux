@@ -481,6 +481,246 @@ static int get_itimerval(struct itimerspec64 *o, const struct __kernel_old_itime
 	return 0;
 }
 
+/**
+ * sys_setitimer - Set or disarm a per-process interval timer
+ * @which: Timer type selector (ITIMER_REAL, ITIMER_VIRTUAL, or ITIMER_PROF)
+ * @value: User pointer to new timer value, or NULL to disarm (deprecated)
+ * @ovalue: Optional user pointer to receive previous timer value
+ *
+ * long-desc: Sets or disarms one of the three per-process interval timers.
+ *   The new timer value is specified in @value, and the previous timer value
+ *   is optionally returned in @ovalue. Each timer type delivers a different
+ *   signal when it expires:
+ *
+ *   - ITIMER_REAL (0): A wall-clock timer that counts down in real time
+ *     regardless of process execution state. When it expires, SIGALRM is
+ *     delivered to the thread group leader. This timer uses high-resolution
+ *     timers (hrtimers) internally and is not affected by process scheduling.
+ *
+ *   - ITIMER_VIRTUAL (1): A CPU time timer that decrements only when the
+ *     process is executing in user mode. When it expires, SIGVTALRM is
+ *     delivered to the process.
+ *
+ *   - ITIMER_PROF (2): A CPU time timer that decrements when the process is
+ *     executing in either user or kernel mode (total CPU time). When it
+ *     expires, SIGPROF is delivered. This is commonly used for profiling.
+ *
+ *   The timer value structure contains two timeval fields:
+ *   - it_value: Time until the next timer expiration. If both tv_sec and
+ *     tv_usec are zero, the timer is disarmed (stopped). Otherwise, the
+ *     timer is armed and will expire after the specified duration.
+ *   - it_interval: Interval for periodic timers. If non-zero, the timer
+ *     automatically rearms after each expiration. If zero, the timer is
+ *     a one-shot timer that expires once and then disarms.
+ *
+ *   Passing NULL for @value is a deprecated Linux-specific misfeature that
+ *   disarms the timer (equivalent to setting it_value to zero). A kernel
+ *   warning is printed once when this is used. This behavior is non-portable
+ *   and will be removed in future kernels - many other UNIX systems treat
+ *   NULL @value as equivalent to getitimer().
+ *
+ *   Timer resolution is limited to microseconds at the userspace interface,
+ *   though the kernel internally uses nanosecond precision. For ITIMER_REAL,
+ *   the actual timer resolution depends on the hrtimer subsystem and may be
+ *   affected by CONFIG_HZ. For ITIMER_VIRTUAL and ITIMER_PROF, resolution
+ *   is tied to the scheduler tick (TICK_NSEC).
+ *
+ *   Each process has exactly one timer of each type. Setting a timer that
+ *   is already armed will first disarm the existing timer before arming
+ *   the new one, atomically returning the previous value if @ovalue is
+ *   provided. Timers are NOT inherited by child processes across fork() -
+ *   children start with all interval timers disarmed. Timers do persist
+ *   across execve() calls.
+ *
+ *   POSIX.1-2008 marks getitimer() and setitimer() as obsolescent,
+ *   recommending the use of the POSIX timer API (timer_create(),
+ *   timer_settime(), timer_delete()) instead. The POSIX timer API provides
+ *   more flexibility, including per-thread timers and additional clock types.
+ *
+ *   Under heavy system load, timer signal delivery may be delayed. For
+ *   ITIMER_REAL, if the timer expires again before the previous SIGALRM
+ *   is delivered, the signal may be lost since only one instance of a
+ *   standard signal can be pending at a time.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be one of ITIMER_REAL (0), ITIMER_VIRTUAL (1), or
+ *     ITIMER_PROF (2). Any other value returns EINVAL. These constants are
+ *     defined in <linux/time.h>.
+ *
+ * param: value
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to a struct __kernel_old_itimerval (struct itimerval
+ *     in userspace) containing the new timer value. May be NULL as a
+ *     deprecated way to disarm the timer (prints kernel warning once).
+ *     The timeval fields must satisfy: tv_sec >= 0 and tv_usec in range
+ *     [0, 999999]. Invalid timeval values return EINVAL. An invalid pointer
+ *     returns EFAULT.
+ *
+ * param: ovalue
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Optional pointer to a struct __kernel_old_itimerval to
+ *     receive the previous timer value. May be NULL if the previous value
+ *     is not needed. If provided, it must be a valid writable address;
+ *     an invalid pointer returns EFAULT. The previous value is written
+ *     atomically with setting the new value.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The timer is armed or disarmed according
+ *     to @value, and the previous value is written to @ovalue if provided.
+ *     On error, returns a negative errno value and timer state is unchanged.
+ *
+ * error: EINVAL, Invalid timeval fields in @value
+ *   desc: The @value structure contains invalid timeval values. Either
+ *     it_value.tv_sec or it_interval.tv_sec is negative, or it_value.tv_usec
+ *     or it_interval.tv_usec is >= 1000000 (USEC_PER_SEC). Validation is
+ *     performed by timeval_valid() in get_itimerval() before any timer
+ *     modification occurs.
+ *
+ * error: EINVAL, Invalid timer type
+ *   desc: The @which parameter is not one of ITIMER_REAL (0), ITIMER_VIRTUAL
+ *     (1), or ITIMER_PROF (2). This check is performed in do_setitimer()
+ *     after input validation, so EINVAL from invalid @value takes precedence.
+ *
+ * error: EFAULT, Cannot read @value from userspace
+ *   desc: The @value pointer is non-NULL but points to an invalid address
+ *     or unmapped memory. The copy_from_user() in get_itimerval() fails.
+ *     No timer modification is performed.
+ *
+ * error: EFAULT, Cannot write @ovalue to userspace
+ *   desc: The @ovalue pointer is non-NULL but points to an invalid address
+ *     or read-only memory. The copy_to_user() in put_itimerval() fails. Note
+ *     that the timer HAS been modified at this point - only the return of
+ *     the old value fails. The new timer is armed/disarmed as requested.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The signal handler spinlock is held with interrupts disabled
+ *     (spin_lock_irq/spin_unlock_irq) while modifying timer state. For
+ *     ITIMER_REAL, this protects access to signal->real_timer and
+ *     signal->it_real_incr. For ITIMER_VIRTUAL and ITIMER_PROF, this
+ *     protects access to signal->it[clock_id]. The lock may be briefly
+ *     released and reacquired in do_setitimer() for ITIMER_REAL if the
+ *     timer callback is currently executing.
+ *
+ * lock: hrtimer_cpu_base->softirq_expiry_lock (PREEMPT_RT only)
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: For ITIMER_REAL only, on PREEMPT_RT kernels, if the timer callback
+ *     (it_real_fn) is currently executing when hrtimer_try_to_cancel() is
+ *     called, the syscall will briefly block in hrtimer_cancel_wait_running()
+ *     waiting for the softirq_expiry_lock. This ensures the timer callback
+ *     completes before the timer is reused. On non-PREEMPT_RT kernels, this
+ *     path simply calls cpu_relax() in a loop.
+ *
+ * signal: SIGALRM
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When ITIMER_REAL timer expires
+ *   desc: When the ITIMER_REAL timer expires, SIGALRM is sent to the
+ *     thread group leader via kill_pid_info() in the it_real_fn() callback.
+ *     The signal is sent with SEND_SIG_PRIV privilege. For periodic timers,
+ *     the timer is rearmed in posixtimer_rearm_itimer() during signal
+ *     delivery (in dequeue_signal path), preventing DoS with very small
+ *     intervals.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * signal: SIGVTALRM
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When ITIMER_VIRTUAL timer expires
+ *   desc: When the ITIMER_VIRTUAL timer expires (process has consumed the
+ *     specified amount of user-mode CPU time), SIGVTALRM is sent to the
+ *     process. Timer expiration is checked during the scheduler tick in
+ *     the posix-cpu-timer code path.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * signal: SIGPROF
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When ITIMER_PROF timer expires
+ *   desc: When the ITIMER_PROF timer expires (process has consumed the
+ *     specified amount of total CPU time), SIGPROF is sent to the process.
+ *     Timer expiration is checked during the scheduler tick in the
+ *     posix-cpu-timer code path.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Per-process interval timer (signal_struct)
+ *   desc: Arms or disarms the specified interval timer in the process's
+ *     signal_struct. For ITIMER_REAL, modifies signal->real_timer (hrtimer)
+ *     and signal->it_real_incr. For ITIMER_VIRTUAL and ITIMER_PROF, modifies
+ *     signal->it[clock_id] (struct cpu_itimer containing expires and incr).
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Calling process (thread group)
+ *   desc: After setting the timer, when it expires, the corresponding
+ *     signal (SIGALRM, SIGVTALRM, or SIGPROF) will be sent to the process.
+ *     This is a deferred side effect - the signal is not sent during the
+ *     syscall itself but later when the timer expires.
+ *   condition: Timer is armed (it_value non-zero)
+ *   reversible: no
+ *
+ * state-trans: interval_timer
+ *   from: disarmed
+ *   to: armed
+ *   condition: it_value is non-zero (either tv_sec or tv_usec)
+ *   desc: The timer begins counting down and will deliver a signal when
+ *     it expires. If it_interval is non-zero, the timer becomes periodic.
+ *
+ * state-trans: interval_timer
+ *   from: armed
+ *   to: disarmed
+ *   condition: it_value is zero (both tv_sec and tv_usec are zero)
+ *   desc: The timer stops counting and will not deliver any more signals
+ *     until rearmed. Any pending timer is cancelled.
+ *
+ * state-trans: interval_timer
+ *   from: armed
+ *   to: armed (rearmed)
+ *   condition: Timer was already armed and new it_value is non-zero
+ *   desc: The old timer is cancelled and a new timer with the specified
+ *     value is armed. The previous remaining time and interval are returned
+ *     in @ovalue if provided.
+ *
+ * examples: setitimer(ITIMER_REAL, &val, &oval);  // Set real-time timer
+ *   setitimer(ITIMER_VIRTUAL, &val, NULL);  // Set virtual timer, ignore old
+ *   setitimer(ITIMER_PROF, &zero, &oval);  // Disarm profiling timer
+ *
+ * notes: The timeval to nanoseconds conversion uses a range-limited algorithm
+ *   that clamps values to KTIME_MAX to avoid multiplication overflow. This
+ *   was fixed in commit 35eb7258c009d ("itimer: Make timeval to nsec
+ *   conversion range limited"). For ITIMER_VIRTUAL and ITIMER_PROF, an
+ *   additional TICK_NSEC is added to the value in set_cpu_itimer() to ensure
+ *   the timer doesn't expire prematurely due to accounting granularity.
+ *   When the hrtimer callback (it_real_fn) is running at the moment
+ *   setitimer is called for ITIMER_REAL, the syscall uses a retry loop:
+ *   it releases siglock, waits for the callback via hrtimer_cancel_wait_running,
+ *   then reacquires siglock and retries. This ensures safe timer manipulation
+ *   even during concurrent expiration. The ITIMER_REAL timer is rearmed in
+ *   the signal delivery path (posixtimer_rearm_itimer called from
+ *   dequeue_signal) rather than self-rearming, which prevents DoS attacks
+ *   with extremely small intervals and reduces timer noise. This syscall
+ *   requires CONFIG_POSIX_TIMERS=y; when disabled, the syscall is not
+ *   available (returns ENOSYS).
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE3(setitimer, int, which, struct __kernel_old_itimerval __user *, value,
 		struct __kernel_old_itimerval __user *, ovalue)
 {
