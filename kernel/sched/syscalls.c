@@ -3136,12 +3136,128 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 }
 
 /**
- * sys_sched_get_priority_min - return minimum RT priority.
- * @policy: scheduling class.
+ * sys_sched_get_priority_min - Return minimum scheduling priority for a policy
+ * @policy: Scheduling policy to query (SCHED_FIFO, SCHED_RR, SCHED_NORMAL, etc.)
  *
- * Return: On success, this syscall returns the minimum
- * rt_priority that can be used by a given scheduling class.
- * On failure, a negative error code is returned.
+ * long-desc: Returns the minimum static priority value that can be used with
+ *   the specified scheduling policy. This syscall is one half of the pair
+ *   (along with sched_get_priority_max) that allows applications to portably
+ *   discover the valid priority range for a given scheduling class.
+ *
+ *   For realtime policies SCHED_FIFO and SCHED_RR, this returns 1, which is
+ *   the lowest static priority available for realtime tasks. Realtime
+ *   priorities range from 1 to 99, with higher numeric values indicating
+ *   higher scheduling priority. A realtime task with priority 1 will be
+ *   preempted by any realtime task with priority 2 or higher.
+ *
+ *   For non-realtime policies (SCHED_NORMAL, SCHED_BATCH, SCHED_IDLE) and
+ *   special policies (SCHED_DEADLINE, SCHED_EXT), this returns 0 because
+ *   these policies do not use the static priority mechanism. SCHED_NORMAL
+ *   and SCHED_BATCH use nice values instead, SCHED_DEADLINE uses explicit
+ *   deadline parameters, and SCHED_IDLE runs at the lowest possible priority.
+ *
+ *   The @policy parameter must be an exact scheduling policy value. Unlike
+ *   sched_setscheduler() which masks out the SCHED_RESET_ON_FORK flag, this
+ *   syscall treats the policy value literally. Passing SCHED_FIFO |
+ *   SCHED_RESET_ON_FORK will return EINVAL because the combined value does
+ *   not match any case in the switch statement.
+ *
+ *   This is a pure query syscall with no side effects. It acquires no locks,
+ *   performs no memory allocation, and cannot sleep. It is safe to call from
+ *   any process context and will always complete quickly.
+ *
+ *   Note: The POSIX name SCHED_OTHER corresponds to Linux's SCHED_NORMAL.
+ *   Both refer to the same policy (value 0) and return the same result.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: policy
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be exactly one of the following scheduling policy values:
+ *     SCHED_NORMAL (0), SCHED_FIFO (1), SCHED_RR (2), SCHED_BATCH (3),
+ *     SCHED_IDLE (5), SCHED_DEADLINE (6), or SCHED_EXT (7). The value must not
+ *     include SCHED_RESET_ON_FORK or any other flags - these are not masked
+ *     out and will cause EINVAL to be returned.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0 or 1 depending on policy
+ *   desc: On success, returns the minimum scheduling priority for the specified
+ *     policy. For SCHED_FIFO and SCHED_RR, returns 1 (the lowest realtime
+ *     priority). For all other valid policies (SCHED_NORMAL, SCHED_BATCH,
+ *     SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT), returns 0. On error, returns a
+ *     negative error code.
+ *
+ * error: EINVAL, Invalid scheduling policy
+ *   desc: The @policy argument is not a recognized scheduling policy value.
+ *     This occurs when: (1) The value is negative, (2) the value is 4 (which
+ *     was reserved for SCHED_ISO but never implemented), (3) the value is 8
+ *     or higher, or (4) the value includes the SCHED_RESET_ON_FORK flag
+ *     (0x40000000) or any other bits beyond the base policy value. Unlike
+ *     sched_setscheduler(), this syscall does NOT mask out SCHED_RESET_ON_FORK.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Syscall has no blocking or interruptible operations
+ *   desc: This syscall does not interact with signals in any way. It is a
+ *     pure lookup operation implemented as a switch statement that completes
+ *     in constant time without any blocking, sleeping, or interruptible points.
+ *     The syscall cannot return EINTR and does not need to be restarted.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: none
+ *   desc: This is a read-only query syscall. It does not modify any kernel
+ *     state, acquire any locks, allocate any memory, or produce any observable
+ *     side effects. The returned value is a compile-time constant based solely
+ *     on the policy argument.
+ *   reversible: n/a
+ *
+ * constraint: Valid policy enumeration
+ *   desc: The policy parameter must be an exact match for one of the defined
+ *     scheduling policy constants. The implementation uses a switch statement
+ *     without a default fallthrough for valid cases, so any unrecognized value
+ *     returns the pre-initialized -EINVAL. Policy value 4 (reserved for the
+ *     never-implemented SCHED_ISO) is not valid.
+ *
+ * examples:
+ *   sched_get_priority_min(SCHED_FIFO);  // Returns 1
+ *   sched_get_priority_min(SCHED_RR);    // Returns 1
+ *   sched_get_priority_min(SCHED_NORMAL);  // Returns 0 (SCHED_OTHER in POSIX)
+ *   sched_get_priority_min(SCHED_BATCH);   // Returns 0
+ *   sched_get_priority_min(SCHED_IDLE);    // Returns 0
+ *   sched_get_priority_min(SCHED_DEADLINE);  // Returns 0
+ *   sched_get_priority_min(SCHED_FIFO | SCHED_RESET_ON_FORK);  // Returns -EINVAL
+ *
+ * notes:
+ *   - POSIX.1-2001 and POSIX.1-2008 conformant. This interface is part of the
+ *     optional Realtime scheduling feature (_POSIX_PRIORITY_SCHEDULING).
+ *   - POSIX requires implementations to support at least 32 distinct priority
+ *     levels for SCHED_FIFO and SCHED_RR. Linux exceeds this with 99 levels
+ *     (priorities 1-99), giving a range of sched_get_priority_min() returning
+ *     1 and sched_get_priority_max() returning 99.
+ *   - The return value for SCHED_FIFO and SCHED_RR is 1, which is the lowest
+ *     valid realtime priority. This value has been stable since the
+ *     introduction of realtime scheduling in Linux.
+ *   - Portable applications should always query the priority range dynamically
+ *     using sched_get_priority_max() and this syscall rather than hardcoding
+ *     values, as the range may vary across POSIX-compliant systems.
+ *   - SCHED_DEADLINE priorities are not managed through static priorities at
+ *     all; deadline tasks use runtime/deadline/period parameters instead.
+ *     Returning 0 indicates static priority is not applicable.
+ *   - SCHED_EXT (BPF extensible scheduler, added in Linux 6.12) also returns 0
+ *     as it does not use static priorities.
+ *   - Unlike sched_setscheduler() and related syscalls, this function does NOT
+ *     strip the SCHED_RESET_ON_FORK flag from the policy value. Applications
+ *     must pass the bare policy value without any flags.
+ *   - The syscall has no privilege requirements and can be called by any process.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 {
