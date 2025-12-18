@@ -1384,6 +1384,357 @@ int ptrace_request(struct task_struct *child, long request,
 	return ret;
 }
 
+/**
+ * sys_ptrace - Trace and control execution of another process
+ * @request:	Operation to perform (PTRACE_* command)
+ * @pid:	Process/thread ID of the target tracee
+ * @addr:	Address parameter, meaning varies by request
+ * @data:	Data parameter, meaning varies by request
+ *
+ * long-desc: The ptrace syscall provides a means by which one process (the
+ *   tracer) can observe and control the execution of another process (the
+ *   tracee), and examine and change the tracee memory and registers. It is
+ *   primarily used for debugging and system call tracing (e.g., strace, gdb).
+ *   Operations are performed on individual threads, not whole processes. The
+ *   @request parameter selects the operation to perform. For most operations,
+ *   the tracer must first attach to the tracee using PTRACE_ATTACH or
+ *   PTRACE_SEIZE, and the tracee must be stopped (in TASK_TRACED state)
+ *   before the operation can proceed. PTRACE_TRACEME is called by the tracee
+ *   itself to request tracing by its parent. PTRACE_ATTACH sends SIGSTOP to
+ *   the tracee while PTRACE_SEIZE does not. Various PTRACE_O_* options can
+ *   be set via PTRACE_SETOPTIONS to receive notifications about fork, exec,
+ *   exit, and other events. The tracer receives wait() notifications when
+ *   the tracee stops. Signals delivered to a traced process cause it to stop
+ *   first, allowing the tracer to inspect and potentially modify or suppress
+ *   the signal before resuming the tracee.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: request
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be a valid PTRACE_* request constant. Core requests:
+ *     PTRACE_TRACEME (0) - request to be traced by parent,
+ *     PTRACE_PEEKTEXT/PEEKDATA (1,2) - read word from tracee memory,
+ *     PTRACE_PEEKUSR (3) - read word from USER area (regs),
+ *     PTRACE_POKETEXT/POKEDATA (4,5) - write word to tracee memory,
+ *     PTRACE_POKEUSR (6) - write word to USER area,
+ *     PTRACE_CONT (7) - restart stopped tracee,
+ *     PTRACE_KILL (8) - send SIGKILL (deprecated),
+ *     PTRACE_SINGLESTEP (9) - restart and stop after one instruction,
+ *     PTRACE_ATTACH (16) - attach to process sending SIGSTOP,
+ *     PTRACE_DETACH (17) - detach from tracee,
+ *     PTRACE_SYSCALL (24) - restart and stop at syscall entry/exit,
+ *     PTRACE_SETOPTIONS (0x4200) - set tracing options,
+ *     PTRACE_GETEVENTMSG (0x4201) - get event message,
+ *     PTRACE_GETSIGINFO (0x4202) - get signal info,
+ *     PTRACE_SETSIGINFO (0x4203) - set signal info,
+ *     PTRACE_GETREGSET (0x4204) - get registers via iovec,
+ *     PTRACE_SETREGSET (0x4205) - set registers via iovec,
+ *     PTRACE_SEIZE (0x4206) - attach without stopping,
+ *     PTRACE_INTERRUPT (0x4207) - stop a running tracee,
+ *     PTRACE_LISTEN (0x4208) - listen for events without resuming.
+ *     Architecture-specific requests also exist (PTRACE_GETREGS, etc.).
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: For PTRACE_TRACEME, @pid is ignored (current process marks
+ *     itself traceable). For all other requests, must be a valid thread ID
+ *     (not process ID) of an existing thread. The tracer must already be
+ *     attached to the tracee or be attaching via PTRACE_ATTACH/SEIZE. The
+ *     thread must exist in the tracer PID namespace view. Zero or negative
+ *     values result in -ESRCH. When tracing a multi-threaded process, each
+ *     thread must be attached individually.
+ *
+ * param: addr
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Meaning depends on @request:
+ *     PTRACE_PEEKTEXT/DATA/USR, POKETEXT/DATA/USR: address to read/write,
+ *     PTRACE_GETREGSET/SETREGSET: NT_* regset type,
+ *     PTRACE_SEIZE: must be 0 or returns -EIO,
+ *     PTRACE_GETSIGMASK/SETSIGMASK: must be sizeof(sigset_t),
+ *     PTRACE_GET_SYSCALL_INFO/SET_SYSCALL_INFO: buffer size,
+ *     PTRACE_SECCOMP_GET_FILTER: filter index,
+ *     For most other requests: ignored (should be 0).
+ *     Address alignment requirements are architecture-specific.
+ *
+ * param: data
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_OUT
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Meaning depends on @request:
+ *     PTRACE_PEEK*: pointer to store result,
+ *     PTRACE_POKE*: value to write,
+ *     PTRACE_CONT/SYSCALL/SINGLESTEP/DETACH: signal to deliver (0 = none),
+ *     PTRACE_SETOPTIONS: PTRACE_O_* option flags,
+ *     PTRACE_SEIZE: PTRACE_O_* option flags,
+ *     PTRACE_GET and SET requests: user pointer to data structure,
+ *     Signal number for resume must be valid (0-64) or returns -EIO.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: >= 0
+ *   desc: Return value depends on @request. PTRACE_PEEK* returns the read
+ *     value on success (caller must clear errno first as -1 may be valid).
+ *     PTRACE_GET_SYSCALL_INFO returns bytes available for output. Most
+ *     other requests return 0 on success. On error, returns negative errno.
+ *
+ * error: ESRCH, No such process or thread
+ *   desc: The specified @pid does not exist, is a zombie, the thread is not
+ *     being traced by this process, or (for non-ATTACH/SEIZE/KILL/INTERRUPT
+ *     requests) the tracee is not stopped in TASK_TRACED state. Also
+ *     returned if PTRACE_GETSIGINFO/SETSIGINFO called when no signal info
+ *     is available, or PTRACE_GETFDPIC when task has no mm.
+ *
+ * error: EPERM, Permission denied
+ *   desc: Various permission checks failed: (1) attempting to trace a
+ *     kernel thread (PF_KTHREAD), (2) attempting to trace self or same
+ *     thread group, (3) credential check failed (tracer UID/GID does not
+ *     match the tracee, and lacks CAP_SYS_PTRACE), (4) tracee dumpable
+ *     attribute is not SUID_DUMP_USER and tracer lacks CAP_SYS_PTRACE,
+ *     (5) LSM (SELinux, Yama, AppArmor, etc.) denied the operation,
+ *     (6) PTRACE_O_SUSPEND_SECCOMP requested without CAP_SYS_ADMIN,
+ *     (7) tracee already has a tracer for PTRACE_ATTACH/SEIZE,
+ *     (8) tracee is exiting, (9) already being traced for TRACEME.
+ *
+ * error: EIO, I/O or protocol error
+ *   desc: Invalid request or parameters: (1) unknown @request value,
+ *     (2) PTRACE_SEIZE with @addr != 0, (3) PTRACE_SEIZE with unknown
+ *     option flags in @data, (4) invalid signal number in @data for
+ *     resume/detach operations, (5) PTRACE_PEEKUSR/POKEUSR with invalid
+ *     or misaligned @addr, (6) memory access failed (PEEKTEXT/POKETEXT),
+ *     (7) architecture-specific errors from arch_ptrace().
+ *
+ * error: EFAULT, Bad memory address
+ *   desc: A user-space pointer argument (@data or address at @addr) is
+ *     invalid: points to unmapped memory, inaccessible memory, or memory
+ *     outside the user address space. Returned by copy_from_user/
+ *     copy_to_user failures, put_user/get_user failures, and access_ok
+ *     check failures for iovec and other structures.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: (1) PTRACE_SETOPTIONS with unknown option flags,
+ *     (2) PTRACE_PEEKSIGINFO with unknown flags or negative nr,
+ *     (3) PTRACE_GETSIGMASK/SETSIGMASK with @addr != sizeof(sigset_t),
+ *     (4) PTRACE_SET_SYSCALL_INFO with invalid flags, reserved fields,
+ *     or mismatched op type,
+ *     (5) PTRACE_GETREGSET/SETREGSET with misaligned iov_len,
+ *     (6) architecture-specific invalid register values.
+ *
+ * error: EBUSY, Resource busy (i386 only)
+ *   desc: On i386 architecture, debug register allocation or deallocation
+ *     failed when trying to set hardware breakpoints/watchpoints via
+ *     PTRACE_POKEUSR to debug registers.
+ *
+ * error: ERANGE, Value out of range
+ *   desc: PTRACE_SET_SYSCALL_INFO with syscall number or arguments that
+ *     cannot be represented in the target register width (e.g., 64-bit
+ *     value for 32-bit compat process).
+ *
+ * error: ERESTARTNOINTR, Interrupted by signal (internal)
+ *   desc: The cred_guard_mutex acquisition during PTRACE_ATTACH/SEIZE was
+ *     interrupted by a signal. This error is converted to -EINTR for
+ *     user space and the syscall is not automatically restarted. The
+ *     attachment was not completed.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired as read lock during ptrace_check_attach() to verify
+ *     tracer-tracee relationship. Acquired as write lock during
+ *     PTRACE_ATTACH/SEIZE (to add tracee to tracer ptraced list),
+ *     PTRACE_TRACEME (to set up parent-child tracing), and
+ *     PTRACE_DETACH (to remove tracee from ptraced list). Also acquired
+ *     during exit_ptrace() when tracer exits to detach all tracees.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Spinlock protecting signal-related task state. Acquired during:
+ *     ptrace_freeze_traced() to set JOBCTL_PTRACE_FROZEN and verify
+ *     tracee is in TASK_TRACED; ptrace_unfreeze_traced() to clear frozen
+ *     state; ptrace_resume() to set exit_code and wake tracee;
+ *     __ptrace_unlink() to clear ptrace flags and pending traps;
+ *     ptrace_set_stopped() to send SIGSTOP on attach;
+ *     PTRACE_INTERRUPT/LISTEN to manipulate job control state;
+ *     PTRACE_SETSIGMASK to modify blocked signal set;
+ *     ptrace_peek_siginfo() to iterate pending signals.
+ *
+ * lock: cred_guard_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Mutex protecting credential changes during exec. Acquired
+ *     during PTRACE_ATTACH/SEIZE to prevent race with exec changing
+ *     credentials. Uses mutex_lock_interruptible(), so can return
+ *     -ERESTARTNOINTR if interrupted by a signal.
+ *
+ * signal: SIGSTOP
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_STOP
+ *   condition: PTRACE_ATTACH request (not PTRACE_SEIZE)
+ *   desc: When attaching via PTRACE_ATTACH (not PTRACE_SEIZE), a SIGSTOP
+ *     is sent to the tracee to stop it. The tracer must wait() for this
+ *     stop before issuing other ptrace commands. PTRACE_SEIZE does not
+ *     send SIGSTOP, allowing the tracee to continue until it naturally
+ *     stops or PTRACE_INTERRUPT is used.
+ *   timing: KAPI_SIGNAL_TIME_IMMEDIATE
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: PTRACE_KILL request, or PTRACE_O_EXITKILL and tracer exits
+ *   desc: PTRACE_KILL sends SIGKILL to the tracee (deprecated, use
+ *     kill(2) instead). If PTRACE_O_EXITKILL option is set and the tracer
+ *     exits, SIGKILL is automatically sent to all tracees that had this
+ *     option enabled, preventing orphaned traced processes.
+ *   timing: KAPI_SIGNAL_TIME_IMMEDIATE
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: During PTRACE_ATTACH/SEIZE while acquiring cred_guard_mutex
+ *   desc: The mutex_lock_interruptible() call during attachment can be
+ *     interrupted by signals, causing the syscall to fail with EINTR.
+ *     This prevents attachment from blocking indefinitely if the tracee
+ *     is blocked in exec().
+ *   error: -ERESTARTNOINTR
+ *   timing: KAPI_SIGNAL_TIME_BLOCKING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: Tracee parent relationship
+ *   desc: PTRACE_ATTACH/SEIZE/TRACEME changes the tracee effective
+ *     parent to the tracer. The original parent is preserved in
+ *     real_parent. This affects wait() behavior and signal delivery.
+ *   condition: PTRACE_ATTACH, PTRACE_SEIZE, or PTRACE_TRACEME succeeds
+ *   reversible: yes (via PTRACE_DETACH or tracer exit)
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: Tracee execution state
+ *   desc: PTRACE_ATTACH sends SIGSTOP, stopping the tracee. PTRACE_CONT,
+ *     PTRACE_SYSCALL, PTRACE_SINGLESTEP resume execution. PTRACE_INTERRUPT
+ *     stops a running tracee. PTRACE_DETACH resumes and detaches.
+ *   condition: Various ptrace commands that affect tracee execution
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Tracee registers and memory
+ *   desc: PTRACE_POKE* commands write to tracee memory. PTRACE_POKEUSR
+ *     and PTRACE_SETREGS/SETFPREGS/SETREGSET modify tracee registers.
+ *     These changes persist across ptrace operations and affect tracee
+ *     execution when resumed.
+ *   condition: PTRACE_POKE*, PTRACE_SET* register commands
+ *   reversible: only by explicit restoration
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Tracee signal state
+ *   desc: PTRACE_SETSIGINFO modifies pending signal information.
+ *     PTRACE_SETSIGMASK changes the blocked signal mask. Resume commands
+ *     with nonzero @data inject signals. Signal injection/suppression
+ *     affects tracee signal handling.
+ *   condition: PTRACE_SETSIGINFO, PTRACE_SETSIGMASK, resume with signal
+ *   reversible: only by explicit restoration
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Tracee ptrace options
+ *   desc: PTRACE_SETOPTIONS sets flags controlling which events generate
+ *     stops (PTRACE_O_TRACEFORK, PTRACE_O_TRACEEXEC, etc.). Options
+ *     persist until changed or tracee detached.
+ *   condition: PTRACE_SETOPTIONS or PTRACE_SEIZE with options in @data
+ *   reversible: yes
+ *
+ * state-trans: tracee_state
+ *   from: running or stopped
+ *   to: TASK_TRACED (ptrace-stopped)
+ *   condition: PTRACE_ATTACH sends SIGSTOP causing stop; PTRACE_INTERRUPT
+ *     on PTRACE_SEIZE tracee; tracee hits ptrace event (syscall, signal)
+ *   desc: Tracee enters TASK_TRACED state, appearing stopped to wait().
+ *     While in this state, tracer can examine/modify tracee state.
+ *
+ * state-trans: tracee_state
+ *   from: TASK_TRACED
+ *   to: running
+ *   condition: PTRACE_CONT, PTRACE_SYSCALL, PTRACE_SINGLESTEP, or
+ *     PTRACE_DETACH command from tracer
+ *   desc: Tracee resumes execution. PTRACE_SYSCALL causes stop at next
+ *     syscall entry/exit. PTRACE_SINGLESTEP executes one instruction.
+ *
+ * state-trans: tracee_state
+ *   from: TASK_TRACED
+ *   to: TASK_STOPPED (group-stop)
+ *   condition: PTRACE_DETACH when process was in group-stop before trace
+ *   desc: If tracee was originally group-stopped (e.g., via SIGSTOP from
+ *     terminal), detaching restores group-stop state rather than resuming.
+ *
+ * capability: CAP_SYS_PTRACE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Tracing any process regardless of credential mismatch and
+ *     bypassing dumpable attribute restrictions
+ *   without: Tracer must have matching UID/GID with tracee effective,
+ *     saved, and real UIDs/GIDs. Tracee must be dumpable (have not executed
+ *     setuid/setgid binary). LSM checks still apply.
+ *   condition: Checked via ptrace_has_cap() during __ptrace_may_access()
+ *
+ * capability: CAP_SYS_ADMIN
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Setting PTRACE_O_SUSPEND_SECCOMP option
+ *   without: PTRACE_O_SUSPEND_SECCOMP in options returns -EPERM
+ *   condition: Required when PTRACE_O_SUSPEND_SECCOMP flag is set in
+ *     PTRACE_SETOPTIONS or PTRACE_SEIZE, and CONFIG_CHECKPOINT_RESTORE
+ *     and CONFIG_SECCOMP are enabled
+ *
+ * constraint: Yama LSM ptrace_scope
+ *   desc: When Yama LSM is active, /proc/sys/kernel/yama/ptrace_scope
+ *     controls ptrace restrictions: 0=classic (no Yama restrictions),
+ *     1=restricted (tracee must be descendant or PR_SET_PTRACER set),
+ *     2=admin-only (requires CAP_SYS_PTRACE), 3=no attach (ptrace
+ *     completely disabled). This is checked via security_ptrace_access_check().
+ *
+ * constraint: Namespace restrictions
+ *   desc: Tracer can only see tracees within its PID namespace view.
+ *     The @pid parameter is interpreted in the caller PID namespace.
+ *     CAP_SYS_PTRACE must be held in the target user namespace to
+ *     trace across user namespace boundaries.
+ *
+ * constraint: Seccomp interaction
+ *   desc: If tracee has seccomp filters, PTRACE_O_SUSPEND_SECCOMP can
+ *     suspend them (requires CAP_SYS_ADMIN and CONFIG_CHECKPOINT_RESTORE).
+ *     A tracer with its own seccomp filter active cannot set this option.
+ *     SECCOMP_RET_TRACE causes tracee to stop with PTRACE_EVENT_SECCOMP.
+ *
+ * examples: ptrace(PTRACE_TRACEME, 0, NULL, NULL);  // Child requests trace
+ *   ptrace(PTRACE_ATTACH, pid, NULL, NULL);  // Attach to process
+ *   ptrace(PTRACE_PEEKDATA, pid, addr, &val);  // Read memory
+ *   ptrace(PTRACE_CONT, pid, NULL, 0);  // Resume without signal
+ *   ptrace(PTRACE_CONT, pid, NULL, SIGCONT);  // Resume with signal
+ *   ptrace(PTRACE_DETACH, pid, NULL, 0);  // Detach from tracee
+ *
+ * notes: This syscall has been present since the earliest Linux versions.
+ *   The interface is complex and error-prone. For PTRACE_PEEK* requests,
+ *   caller must set errno=0 before call since -1 may be a valid return
+ *   value. PTRACE_KILL is deprecated since it may leave tracee in
+ *   inconsistent state; use kill(pid, SIGKILL) followed by PTRACE_DETACH.
+ *   When tracer exits, all tracees are automatically detached and resumed
+ *   (unless PTRACE_O_EXITKILL is set, which sends SIGKILL instead).
+ *   Race conditions exist: tracee may exit or exec between ptrace calls.
+ *   The caller should handle ESRCH gracefully. glibc does not provide a
+ *   wrapper for all request types; use syscall() directly for newer ones.
+ *   Thread group leaders change TID during exec, affecting ptrace tracking.
+ *   Historic CVEs: CAN-2003-0127 (privilege escalation), CVE-2013-0871
+ *   (PTRACE_SETREGS race condition). The 32-bit compat syscall
+ *   (compat_sys_ptrace) handles 32-bit processes on 64-bit kernels.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE4(ptrace, long, request, long, pid, unsigned long, addr,
 		unsigned long, data)
 {
