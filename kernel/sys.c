@@ -3603,6 +3603,180 @@ static void do_sys_times(struct tms *tms)
 	tms->tms_cstime = nsec_to_clock_t(cstime);
 }
 
+/**
+ * sys_times - Get process CPU time accounting information
+ * @tbuf: Pointer to user-space buffer for process time information, or NULL
+ *
+ * long-desc: Retrieves CPU time accounting information for the calling process
+ *   and stores it in the struct tms pointed to by @tbuf. The structure contains
+ *   four fields representing CPU time in clock ticks:
+ *
+ *   - tms_utime: User CPU time of the calling process (all threads combined).
+ *     This is the time spent executing user-mode instructions in the calling
+ *     process's threads. Obtained via thread_group_cputime_adjusted() which
+ *     iterates all threads in the thread group and sums their user time.
+ *
+ *   - tms_stime: System CPU time of the calling process (all threads combined).
+ *     This is the time the kernel spent executing on behalf of the calling
+ *     process's threads. Obtained via thread_group_cputime_adjusted().
+ *
+ *   - tms_cutime: User CPU time of waited-for terminated children. This is the
+ *     accumulated user time from all child processes that have been waited for
+ *     via wait(2), waitpid(2), wait4(2), or waitid(2). Grandchildren whose
+ *     parents (the direct children) did not wait for them are NOT included.
+ *     Read directly from current->signal->cutime.
+ *
+ *   - tms_cstime: System CPU time of waited-for terminated children. Same
+ *     semantics as tms_cutime but for system time. Read directly from
+ *     current->signal->cstime.
+ *
+ *   All times are converted from nanoseconds to clock ticks using
+ *   nsec_to_clock_t(). The number of clock ticks per second can be obtained
+ *   via sysconf(_SC_CLK_TCK) and is typically 100 (USER_HZ).
+ *
+ *   Linux extension: Unlike POSIX which requires @tbuf to be non-NULL, Linux
+ *   allows @tbuf to be NULL. In this case, no process time information is
+ *   returned and the syscall just returns the elapsed time value. This
+ *   extension is not portable to other UNIX implementations.
+ *
+ *   Return value semantics: The return value is the number of clock ticks
+ *   elapsed since an arbitrary point in the past (typically related to system
+ *   boot time). This value is calculated as jiffies_64_to_clock_t(get_jiffies_64()).
+ *
+ *   WARNING: The return value can overflow. On 32-bit systems with HZ=100,
+ *   overflow occurs after approximately 497 days. On some architectures
+ *   (notably i386) using the old system call conventions, there is a 41-second
+ *   window shortly after boot where times() can return -1, erroneously
+ *   indicating an error. Use clock_gettime(2) for reliable elapsed time
+ *   measurement.
+ *
+ *   The syscall uses force_successful_syscall_return() because the return
+ *   value can legitimately be any value including -1. On architectures with
+ *   separate error flags (alpha, ia64, ppc, sparc), this ensures the error
+ *   flag is not set even when returning -1.
+ *
+ *   Thread group accounting: The utime and stime values represent the total
+ *   CPU time for all threads in the calling process's thread group, not just
+ *   the calling thread. This is achieved by thread_group_cputime_adjusted()
+ *   which iterates over all threads via __for_each_thread().
+ *
+ *   Monotonicity guarantee: The cputime_adjust() function ensures that the
+ *   reported utime and stime values never decrease between calls, even if
+ *   the underlying scheduler accounting has minor inconsistencies. This is
+ *   achieved by tracking previous values in signal->prev_cputime.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: tbuf
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be either NULL (Linux extension) or a valid pointer to
+ *     a writable struct tms in user space. The structure must be properly
+ *     aligned and fully accessible.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: Non-negative clock_t value representing elapsed time since an
+ *     arbitrary point (typically boot time), converted to clock ticks. Note
+ *     that on success, the return value CAN be negative due to overflow or
+ *     the return value wrapping around. Use force_successful_syscall_return()
+ *     to distinguish from errors on architectures with separate error flags.
+ *   desc: Returns elapsed real time in clock ticks since an arbitrary past
+ *     reference point. On 64-bit systems, this is jiffies_64 converted to
+ *     USER_HZ units. The value may overflow on 32-bit clock_t after extended
+ *     uptime. Unlike most syscalls, -1 can be a valid return value.
+ *
+ * error: EFAULT, Invalid user-space buffer address
+ *   desc: The @tbuf pointer is non-NULL but points to memory that is not
+ *     accessible for writing. This error is returned by copy_to_user() when
+ *     it fails to write the struct tms to user space due to an invalid
+ *     address, unmapped memory, or insufficient permissions on the memory
+ *     region. If @tbuf is NULL, this error cannot occur.
+ *
+ * lock: sig->stats_lock
+ *   type: KAPI_LOCK_SEQLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Read-side seqlock acquired via scoped_seqlock_read() in
+ *     thread_group_cputime() to ensure consistent reading of sig->utime,
+ *     sig->stime, and sig->sum_sched_runtime. IRQs are saved while holding
+ *     this lock. The lock protects against concurrent updates by scheduler
+ *     tick accounting and child process termination handling.
+ *
+ * lock: prev_cputime.lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Raw spinlock acquired via raw_spin_lock_irqsave() in cputime_adjust()
+ *     to serialize concurrent callers and ensure monotonicity of reported
+ *     utime/stime values. This lock protects signal->prev_cputime.utime and
+ *     signal->prev_cputime.stime fields.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read-side critical section entered via guard(rcu)() in
+ *     thread_group_cputime() to safely iterate over threads in the thread
+ *     group using __for_each_thread(). Protects against thread list
+ *     modifications during iteration.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: signal->prev_cputime (utime, stime fields)
+ *   desc: The cputime_adjust() function may update the prev_cputime structure
+ *     to maintain monotonicity guarantees. If the newly calculated utime or
+ *     stime would be less than the previously reported values, the previous
+ *     values are retained and stored back. This is a side effect of ensuring
+ *     that times() never reports decreasing CPU usage.
+ *   condition: Always occurs when @tbuf is non-NULL
+ *   reversible: no
+ *
+ * constraint: Clock tick resolution
+ *   desc: All times are reported in USER_HZ clock ticks, typically 100 per
+ *     second. The actual kernel timer frequency (HZ) may differ but values
+ *     are converted via nsec_to_clock_t() and jiffies_64_to_clock_t().
+ *     Applications should use sysconf(_SC_CLK_TCK) to determine the actual
+ *     ticks per second value.
+ *
+ * constraint: Return value overflow
+ *   desc: The return value can overflow the clock_t range. On systems where
+ *     clock_t is a 32-bit signed integer and USER_HZ is 100, overflow occurs
+ *     after approximately 248 days (2^31 / 100 / 86400). The returned value
+ *     should only be used to measure elapsed time between calls, not as an
+ *     absolute timestamp. For reliable elapsed time measurement, use
+ *     clock_gettime(CLOCK_MONOTONIC) instead.
+ *
+ * constraint: Child time accumulation
+ *   desc: Child process times (cutime, cstime) are only accumulated when the
+ *     parent calls wait(2) family syscalls. A child that terminates without
+ *     being waited for will have its times lost. Grandchildren are only
+ *     counted if their direct parent waited for them before terminating.
+ *     expr: cutime/cstime include only waited-for children
+ *
+ * examples: times(NULL);  // Linux extension: just get elapsed ticks
+ *   struct tms t; times(&t);  // Standard usage: fill struct and get ticks
+ *   clock_t start = times(NULL); ... clock_t elapsed = times(NULL) - start;
+ *
+ * notes: The reference point for the return value changed between kernel
+ *   versions. Before Linux 2.6, it was system boot time. Since Linux 2.6,
+ *   it is (2^32/HZ) - 300 seconds before system boot, chosen so that the
+ *   value wraps around to a small positive number shortly after boot on
+ *   systems where jiffies started at 0. On i386 with certain syscall
+ *   conventions, there is a ~41 second window after boot where times() may
+ *   erroneously return (clock_t)-1 as if an error occurred.
+ *
+ *   The compat syscall (compat_sys_times) handles 32-bit userspace on 64-bit
+ *   kernels by using struct compat_tms with compat_clock_t fields and
+ *   converting values via clock_t_to_compat_clock_t().
+ *
+ *   This syscall does not check for pending signals and is not interruptible.
+ *   It also does not require any capabilities - any process can query its
+ *   own CPU time accounting.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 {
 	if (tbuf) {
