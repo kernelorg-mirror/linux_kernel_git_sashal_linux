@@ -5516,10 +5516,266 @@ static int do_rt_sigqueueinfo(pid_t pid, int sig, kernel_siginfo_t *info)
 }
 
 /**
- *  sys_rt_sigqueueinfo - send signal information to a signal
- *  @pid: the PID of the thread
- *  @sig: signal to be sent
- *  @uinfo: signal info to be sent
+ * sys_rt_sigqueueinfo - queue a signal with data to a process
+ * @pid: the thread group ID (process ID) of the target process
+ * @sig: signal number to send, or 0 for existence/permission check
+ * @uinfo: pointer to user-space siginfo_t structure containing signal data
+ *
+ * long-desc: Queues a signal with accompanying data (siginfo_t) to a process.
+ *   This is the low-level syscall underlying sigqueue(3), which sends real-time
+ *   signals with user-specified data. The receiver can retrieve the data by
+ *   establishing a signal handler with the SA_SIGINFO flag.
+ *
+ *   Unlike kill(2) which only sends a signal number, rt_sigqueueinfo allows
+ *   passing additional information via the siginfo_t structure. The caller must
+ *   populate the following fields in @uinfo:
+ *   - si_code: Must be a negative value (typically SI_QUEUE for sigqueue).
+ *     Positive si_code values are reserved for kernel-generated signals. The
+ *     kernel explicitly forbids si_code >= 0 or SI_TKILL (-6) when signaling
+ *     other processes, as this would allow spoofing kernel signals or tkill().
+ *     Exception: A process may use any si_code when signaling itself, which
+ *     enables checkpoint/restore functionality.
+ *   - si_pid: Sender's process ID (conventionally set by caller, not enforced)
+ *   - si_uid: Sender's user ID (conventionally set by caller, not enforced)
+ *   - si_value: Union containing either sival_int or sival_ptr for user data
+ *   The kernel automatically sets si_signo to the value of @sig, overwriting
+ *   any value provided by the user.
+ *
+ *   The signal is delivered to an arbitrary thread in the target process that
+ *   is not blocking the signal, via the process-wide shared pending queue.
+ *   For thread-specific delivery, use rt_tgsigqueueinfo(2) instead.
+ *
+ *   When @sig is 0 (the null signal), no signal is delivered, but existence
+ *   and permission checks are still performed. This can be used to verify
+ *   that a process exists and the caller has permission to signal it.
+ *
+ *   Real-time signals (SIGRTMIN to SIGRTMAX) are always queued and delivered
+ *   in FIFO order. Standard signals (1-31) coalesce: if the same signal is
+ *   already pending, the siginfo is not queued again.
+ *
+ *   This syscall is Linux-specific and not intended for direct application
+ *   use; applications should use sigqueue(3) instead.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, PID_MAX_LIMIT
+ *   constraint: Thread group ID (TGID/process ID) of the target process.
+ *     Must be a positive integer identifying a valid process in the caller's
+ *     PID namespace. Unlike kill(2), rt_sigqueueinfo does not support process
+ *     groups (negative pid) or broadcast signals (pid == -1), as POSIX.1b
+ *     does not define sigqueue behavior for process groups. Passing pid <= 0
+ *     will result in -ESRCH because find_vpid() will not find a matching
+ *     process.
+ *
+ * param: sig
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, _NSIG
+ *   constraint: Signal number from 0 to _NSIG (typically 64). Signal 0 is the
+ *     null signal used for existence/permission checking only. Standard signals
+ *     are 1-31, real-time signals are SIGRTMIN (32) to SIGRTMAX (64). Invalid
+ *     signal numbers (sig < 0 or sig > _NSIG) cause EINVAL.
+ *
+ * param: uinfo
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to a user-space siginfo_t structure. Must be readable
+ *     and point to a valid siginfo_t. The structure must be properly aligned
+ *     and at least sizeof(siginfo_t) bytes accessible. The si_code field is
+ *     validated: when signaling other processes, si_code must be negative
+ *     (user-generated) and cannot be SI_TKILL (-6). When signaling self
+ *     (pid == getpid()), any si_code is permitted for checkpoint/restore.
+ *     If the si_code is not a known value and the expansion area (bytes beyond
+ *     the standard siginfo_t) contains non-zero data, -E2BIG is returned.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. On error, returns a negative error code.
+ *     A return of 0 indicates the signal was successfully queued (or, for
+ *     sig == 0, that the process exists and is signalable).
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: The @uinfo pointer is invalid, inaccessible, or points to memory
+ *     that cannot be read. Returned by copy_from_user() when copying the
+ *     siginfo_t structure from user space fails.
+ *
+ * error: E2BIG, Unknown si_code with non-zero expansion data
+ *   desc: The si_code value in @uinfo is not a recognized siginfo layout code
+ *     and the expansion area (additional bytes beyond the standard kernel
+ *     siginfo fields) contains non-zero data. The kernel validates unknown
+ *     si_code values to ensure round-trip fidelity when copying siginfo
+ *     to/from user space. Zero out any unused fields to avoid this error.
+ *
+ * error: EPERM, Invalid si_code when signaling another process
+ *   desc: The caller attempted to send a signal to a different process with
+ *     si_code >= 0 (kernel-reserved) or si_code == SI_TKILL (-6). This
+ *     restriction prevents user space from spoofing kernel-generated signals
+ *     or impersonating tkill(). When signaling self (pid == task_pid_vnr()),
+ *     any si_code is allowed to support checkpoint/restore. Fix by using a
+ *     valid user si_code such as SI_QUEUE (-1).
+ *
+ * error: EINVAL, Invalid signal number
+ *   desc: The @sig argument is not a valid signal number (sig < 0 or
+ *     sig > _NSIG, typically > 64). Use a signal number in range 0-64.
+ *
+ * error: ESRCH, Process not found
+ *   desc: No process with the specified @pid exists in the caller's PID
+ *     namespace, the process has already exited, or @pid refers to a thread
+ *     that is no longer the thread group leader. The target must be identified
+ *     by its TGID (process ID), not an individual thread ID.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller does not have permission to send a signal to the target
+ *     process. Permission requires one of: (1) Both processes are in the same
+ *     thread group, (2) The caller has the CAP_KILL capability in the target's
+ *     user namespace, (3) The caller's real or effective UID matches the
+ *     target's real or saved set-user-ID, (4) For SIGCONT only, both processes
+ *     belong to the same session. Root (CAP_KILL) can signal any process.
+ *
+ * error: EACCES, Security module denied signal
+ *   desc: A Linux Security Module (SELinux, AppArmor, etc.) denied the signal
+ *     delivery via the security_task_kill() hook. This occurs after standard
+ *     Unix permission checks pass but the LSM policy prohibits the operation.
+ *     Check LSM audit logs for details on policy violations.
+ *
+ * error: EAGAIN, Signal queue limit exceeded
+ *   desc: The target process's pending signal queue is full, exceeding the
+ *     RLIMIT_SIGPENDING resource limit. This error only occurs for real-time
+ *     signals (SIGRTMIN to SIGRTMAX) that require individual queueing.
+ *     Standard signals (1-31) never return EAGAIN because they coalesce with
+ *     any existing pending signal of the same number. Also returned if kernel
+ *     memory allocation for the sigqueue structure fails under memory pressure.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during process lookup via find_vpid() and
+ *     pid_task(), and during permission checking in check_kill_permission().
+ *     Also held when accessing task credentials. The lock protects against
+ *     task_struct being freed during lookup. Multiple brief RCU critical
+ *     sections may occur.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-process signal handler spinlock acquired via lock_task_sighand()
+ *     when actually delivering the signal in do_send_sig_info(). Acquired with
+ *     interrupts disabled (spin_lock_irqsave). Protects the shared pending
+ *     signal queue and signal handler state during signal delivery.
+ *
+ * signal: Signal to target process
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_QUEUE
+ *   condition: Valid signal number (sig > 0) and permission granted
+ *   desc: The specified signal is queued to the target process's shared
+ *     pending signal set. The full siginfo_t data is preserved and will be
+ *     delivered to the signal handler if SA_SIGINFO is set. For standard
+ *     signals (1-31), if the signal is already pending, no additional siginfo
+ *     is queued. For real-time signals (SIGRTMIN-SIGRTMAX), each signal is
+ *     queued individually. An appropriate thread is woken if necessary.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Target process identified by @pid
+ *   desc: Queues the signal to the target process's shared pending signal set
+ *     and may wake sleeping threads. For SIGKILL, all threads are woken and
+ *     marked for termination. For SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU, process
+ *     group stop machinery is initiated. For SIGCONT, pending stop signals
+ *     are cleared.
+ *   condition: sig > 0 and permission granted
+ *   reversible: no (signal delivery cannot be undone once queued)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: Target process signal state
+ *   desc: For SIGCONT, any pending stop signals (SIGSTOP, SIGTSTP, SIGTTIN,
+ *     SIGTTOU) are removed from all threads' pending queues, and stopped
+ *     threads are woken. For stop signals, any pending SIGCONT is removed.
+ *     This mutual exclusion ensures consistent process state.
+ *   condition: sig is SIGCONT or a stop signal
+ *   reversible: yes (by sending the opposite signal)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Target process threads
+ *   desc: Target threads may be woken from interruptible sleep to process the
+ *     signal. For SIGKILL or SIGSTOP, threads are woken unconditionally.
+ *     For other signals, at least one thread not blocking the signal is woken.
+ *   condition: sig > 0 and signal not ignored
+ *   reversible: yes (threads return to prior state after signal handling)
+ *
+ * capability: CAP_KILL
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Sending signals to any process in the target's user namespace
+ *     without requiring UID matching
+ *   without: Must have real/effective UID matching target's real/saved UID,
+ *     or for SIGCONT, same session membership
+ *   condition: Checked in kill_ok_by_cred() via ns_capable() against the
+ *     target process's user namespace
+ *
+ * constraint: PID namespace isolation
+ *   desc: The @pid is interpreted within the caller's PID namespace. Processes
+ *     in different PID namespaces may have the same numeric PID but refer to
+ *     different processes. A process can only signal processes visible in its
+ *     PID namespace (same namespace or descendant namespaces).
+ *
+ * constraint: Init process protection
+ *   desc: The init process (PID 1) and container init processes can only
+ *     receive signals for which they have installed explicit handlers.
+ *     SIGKILL and SIGSTOP sent to init are silently dropped unless forced
+ *     by the kernel or sent from an ancestor PID namespace. Processes with
+ *     the SIGNAL_UNKILLABLE flag have similar protection.
+ *
+ * constraint: RLIMIT_SIGPENDING for real-time signals
+ *   desc: For real-time signals (SIGRTMIN-SIGRTMAX), the number of pending
+ *     signals is limited by the target's RLIMIT_SIGPENDING resource limit.
+ *     When this limit is exceeded, sigqueue_alloc() fails and -EAGAIN is
+ *     returned. Standard signals bypass this limit by coalescing.
+ *
+ * constraint: si_code restrictions
+ *   desc: When signaling another process (pid != self), si_code must be
+ *     negative (SI_FROMUSER) and cannot be SI_TKILL. Valid values include
+ *     SI_QUEUE (-1), SI_TIMER (-2), SI_MESGQ (-3), SI_ASYNCIO (-4),
+ *     SI_SIGIO (-5), and SI_ASYNCNL (-60). Positive codes (SI_USER, SI_KERNEL,
+ *     and kernel fault codes) are reserved for kernel-generated signals.
+ *
+ * examples:
+ *   // Queue SIGRTMIN with user data to process 1234
+ *   siginfo_t info = {0};
+ *   info.si_code = SI_QUEUE;
+ *   info.si_pid = getpid();
+ *   info.si_uid = getuid();
+ *   info.si_value.sival_int = 42;
+ *   syscall(SYS_rt_sigqueueinfo, 1234, SIGRTMIN, &info);
+ *
+ * notes:
+ *   - This syscall is Linux-specific; not portable to other Unix systems.
+ *   - No glibc wrapper exists; use syscall(2) for direct invocation.
+ *   - Applications should use sigqueue(3) which provides a proper wrapper.
+ *   - Unlike kill(2), this syscall does NOT support negative @pid values for
+ *     process groups or broadcast. Use kill(2) for those use cases.
+ *   - The signal is delivered to the process-wide shared pending queue, so
+ *     any thread not blocking the signal may receive it. For thread-targeted
+ *     delivery, use rt_tgsigqueueinfo(2) instead.
+ *   - Historical note: Before Linux 2.6.39, the si_code check was more
+ *     permissive (only blocked positive codes). The SI_TKILL restriction was
+ *     added to prevent spoofing tkill() signals. Before Linux 3.8, even
+ *     self-signals were restricted, but this was relaxed for checkpoint/restore.
+ *   - The compat syscall (compat_sys_rt_sigqueueinfo) handles 32-bit user space
+ *     on 64-bit kernels with appropriate siginfo_t structure conversion.
+ *   - For kernel threads (PF_KTHREAD), signals are silently ignored unless
+ *     the thread explicitly enables signal handling.
+ *   - Available since Linux 2.2 (introduced with real-time signals support).
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE3(rt_sigqueueinfo, pid_t, pid, int, sig,
 		siginfo_t __user *, uinfo)
