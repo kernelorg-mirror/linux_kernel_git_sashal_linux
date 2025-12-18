@@ -4130,9 +4130,248 @@ static void prepare_kill_siginfo(int sig, struct kernel_siginfo *info,
 }
 
 /**
- *  sys_kill - send a signal to a process
- *  @pid: the PID of the process
- *  @sig: signal to be sent
+ * sys_kill - send a signal to a process or process group
+ * @pid: target process or process group identifier
+ * @sig: signal number to send, or 0 for existence/permission check
+ *
+ * long-desc: Sends a signal to a process or group of processes identified by
+ *   @pid. The interpretation of @pid determines the signal destination:
+ *
+ *   - pid > 0: Signal is sent to the process with the specified process ID.
+ *   - pid == 0: Signal is sent to every process in the process group of the
+ *     calling process, including the caller itself.
+ *   - pid == -1: Signal is sent to every process for which the caller has
+ *     permission to send signals, except for process 1 (init) and the calling
+ *     process itself. This is a broadcast to all accessible processes.
+ *   - pid < -1: Signal is sent to every process in the process group whose
+ *     PGID equals the absolute value of pid (i.e., process group -pid).
+ *
+ *   When @sig is 0 (the null signal), no signal is sent, but existence and
+ *   permission checks are still performed. This can be used to check if a
+ *   process exists and the caller has permission to signal it. Note that
+ *   zombie processes are considered to exist until reaped by wait().
+ *
+ *   Permission to send a signal requires one of the following:
+ *   1. The caller has the CAP_KILL capability in the target's user namespace.
+ *   2. The caller's real or effective UID matches the target's real or saved
+ *      set-user-ID.
+ *
+ *   Exception: SIGCONT can always be sent to any process in the same session
+ *   as the caller, regardless of UID matching. This enables job control to
+ *   work correctly.
+ *
+ *   For process groups (pid <= 0), the syscall succeeds if the signal was
+ *   successfully sent to at least one member of the group. EPERM errors from
+ *   individual processes are ignored as long as at least one delivery succeeds.
+ *   The special case of pid == -1 excludes the calling process from receiving
+ *   the signal.
+ *
+ *   When a process signals itself with an unblocked signal (and no other
+ *   thread in the process is waiting to accept it), the signal is guaranteed
+ *   to be delivered before kill() returns. This enables synchronous
+ *   self-signaling patterns.
+ *
+ *   Special handling exists for signals sent to init (PID 1): only signals
+ *   for which init has explicitly installed a handler can be delivered.
+ *   SIGKILL and SIGSTOP are ignored by init unless forced by the kernel.
+ *   Processes with the SIGNAL_UNKILLABLE flag (init and its descendants in
+ *   certain configurations) have similar protection.
+ *
+ *   The signal information (siginfo_t) passed to the target's signal handler
+ *   will have si_code set to SI_USER, si_pid set to the caller's thread group
+ *   ID (TGID), and si_uid set to the caller's real UID. For signals sent
+ *   across user namespaces, si_uid is translated appropriately.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: INT_MIN + 1, INT_MAX
+ *   constraint: pid_t value interpreted as process ID, process group ID, or
+ *     special broadcast value. INT_MIN is explicitly rejected to avoid
+ *     undefined behavior from negation (-INT_MIN is undefined in C).
+ *
+ * param: sig
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, _NSIG
+ *   constraint: Signal number from 0 to _NSIG (typically 64 on most
+ *     architectures, 128 on MIPS). Signal 0 is the null signal used for
+ *     existence/permission checking only. Standard signals are 1-31,
+ *     real-time signals are SIGRTMIN (typically 32) to SIGRTMAX.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. For process groups (pid <= 0), success means
+ *     the signal was delivered to at least one process in the group. For the
+ *     null signal (sig == 0), success means the target exists and the caller
+ *     has permission to signal it.
+ *
+ * error: EINVAL, Invalid signal number
+ *   desc: The signal number @sig is invalid (less than 0 or greater than
+ *     _NSIG, which is typically 64). Also returned if @pid equals INT_MIN,
+ *     which would cause undefined behavior when negated to find the process
+ *     group ID.
+ *
+ * error: ESRCH, No such process or process group
+ *   desc: No process or process group matching @pid could be found. For
+ *     pid > 0, the specified process does not exist (or is a zombie that has
+ *     not yet been reaped, but note that zombies DO exist). For pid == 0,
+ *     the caller's process group is empty (should never happen in practice).
+ *     For pid < -1, no process group with PGID == -pid exists. For pid == -1,
+ *     no process other than init and the caller exists that can be signaled.
+ *     Also returned for pid == INT_MIN as a special case to avoid undefined
+ *     behavior.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller lacks permission to signal the target. Permission requires
+ *     CAP_KILL capability in the target's user namespace, or real/effective UID
+ *     matching target's real/saved-set-UID. SIGCONT only requires same session.
+ *     For process groups (pid <= 0), EPERM is returned only if permission was
+ *     denied for ALL members; success if at least one signal was delivered.
+ *
+ * error: EACCES, LSM security module denied the signal
+ *   desc: A Linux Security Module (SELinux, AppArmor, Smack, or Landlock)
+ *     denied permission to send the signal. This occurs after standard Unix
+ *     permission checks pass. SELinux maps signal types to permissions
+ *     (e.g., SIGKILL requires 'sigkill' permission, SIGSTOP requires 'sigstop',
+ *     sig == 0 requires 'signull' for existence checks). The specific error
+ *     code may vary by LSM; some use EPERM instead of EACCES.
+ *
+ * error: ENOMEM, Memory allocation failed for audit record
+ *   desc: The kernel could not allocate memory for an audit record. This can
+ *     occur when auditing is enabled and the syscall needs to log multiple
+ *     target processes (pid == -1 broadcast case). The allocation uses
+ *     GFP_ATOMIC, so this error is rare but possible under memory pressure.
+ *     This error is returned before any signals are sent.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Read lock acquired when iterating over processes for process group
+ *     or broadcast signals (pid <= 0). Held while calling group_send_sig_info()
+ *     for each target process. The lock protects the task list from concurrent
+ *     modification during iteration.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during process lookup (find_vpid, pid_task)
+ *     and permission checking (check_kill_permission). Also held briefly when
+ *     accessing task credentials. Multiple acquire/release cycles may occur
+ *     during syscall execution.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-process signal handler spinlock acquired via lock_task_sighand()
+ *     when actually delivering the signal in do_send_sig_info(). Acquired with
+ *     interrupts disabled (spin_lock_irqsave). Protects the signal queue and
+ *     signal handler state during signal delivery.
+ *
+ * signal: Signal delivery to target
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_QUEUE
+ *   condition: Valid signal number (sig > 0) and permission granted
+ *   desc: The specified signal is queued to the target process's pending
+ *     signal set. For standard signals (1-31), if the signal is already
+ *     pending, no additional signal is queued (signals do not stack). For
+ *     real-time signals (SIGRTMIN-SIGRTMAX), signals are always queued and
+ *     delivered in order. The target thread is woken if necessary.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Target process(es) identified by @pid
+ *   desc: Queues the signal to the target process's pending signal set and
+ *     may wake sleeping threads. For SIGKILL, all threads in the target
+ *     process are woken and marked for termination. For SIGSTOP/SIGTSTP/
+ *     SIGTTIN/SIGTTOU, the process group stop machinery is initiated.
+ *   condition: sig > 0 and permission granted
+ *   reversible: no (signal delivery cannot be undone)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: Target process signal state
+ *   desc: For SIGCONT, any pending stop signals (SIGSTOP, SIGTSTP, SIGTTIN,
+ *     SIGTTOU) are removed from all threads' pending queues, and stopped
+ *     threads are woken. For stop signals, any pending SIGCONT is removed.
+ *     This mutual exclusion ensures consistent process state.
+ *   condition: sig is SIGCONT or a stop signal
+ *   reversible: yes (by sending the opposite signal)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Target process threads
+ *   desc: Target threads may be woken from sleep to process the signal. For
+ *     SIGKILL, all threads are woken unconditionally. For other signals,
+ *     at least one thread that is not blocking the signal is woken.
+ *   condition: sig > 0 and signal not ignored
+ *   reversible: yes (thread eventually returns to sleep or continues)
+ *
+ * capability: CAP_KILL
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Sending signals to any process in the target's user namespace
+ *     without requiring UID matching
+ *   without: Must have real/effective UID matching target's real/saved UID,
+ *     or for SIGCONT, same session membership
+ *   condition: Checked in kill_ok_by_cred() via ns_capable() for each
+ *     target process
+ *
+ * constraint: PID namespace isolation
+ *   desc: The @pid argument is interpreted within the caller's PID namespace.
+ *     A process can only signal processes visible in its PID namespace or
+ *     child namespaces. PID translation is handled by find_vpid() and
+ *     task_pid_vnr(). Cross-namespace signaling requires the target to be
+ *     in a descendant PID namespace.
+ *
+ * constraint: Init process protection
+ *   desc: The init process (PID 1) can only receive signals for which it has
+ *     installed explicit signal handlers. SIGKILL and SIGSTOP sent to init
+ *     are silently dropped unless the signal originates from an ancestor PID
+ *     namespace. Processes with SIGNAL_UNKILLABLE flag have similar protection.
+ *
+ * constraint: Thread-group semantics
+ *   desc: kill() sends signals to the thread group leader and the signal is
+ *     shared among all threads. Use tgkill() or tkill() to target specific
+ *     threads. For pid > 0, the signal is sent to the process (thread group),
+ *     not to a specific thread with that TID.
+ *
+ * examples:
+ *   kill(1234, SIGTERM);     // Send SIGTERM to process 1234
+ *   kill(1234, 0);           // Check if process 1234 exists and is signalable
+ *   kill(0, SIGINT);         // Send SIGINT to all processes in caller's pgrp
+ *   kill(-1, SIGTERM);       // Broadcast SIGTERM to all accessible processes
+ *   kill(-4567, SIGHUP);     // Send SIGHUP to process group 4567
+ *
+ * notes:
+ *   - POSIX.1-2008 compliant. Linux semantics match System V rather than BSD
+ *     for permission checking (checks saved-set-UID, not just real/effective).
+ *   - The kill(-1, sig) broadcast case has a historical bug in kernels 2.6.0
+ *     through 2.6.7 where EPERM was returned if ANY process could not be
+ *     signaled, even though signals were delivered to permitted processes.
+ *     This was fixed to return success if at least one signal was delivered.
+ *   - A race condition fix in kernel 2.6.24 (commit d36174bc2bce) handles the
+ *     case where a process is executing exec() while being signaled. The
+ *     kill_pid_info_type() function retries if lock_task_sighand() fails due
+ *     to the target being in the middle of de_thread() or __exit_signal().
+ *   - For real-time signals (SIGRTMIN-SIGRTMAX) sent via kill(), the signal
+ *     is queued if possible but may fall back to non-queued delivery under
+ *     memory pressure. Use sigqueue() for guaranteed queuing with siginfo.
+ *   - Kernel threads (PF_KTHREAD) can only receive signals from the kernel,
+ *     not from user processes. Attempts to signal kernel threads silently
+ *     succeed but the signal is ignored unless force is set.
+ *   - The si_pid and si_uid fields in the siginfo_t delivered to the target
+ *     are translated appropriately for cross-namespace signaling. If the
+ *     caller's PID is not visible in the target's namespace, si_pid is set
+ *     to 0.
+ *
+ * since-version: 1.0
  */
 SYSCALL_DEFINE2(kill, pid_t, pid, int, sig)
 {
