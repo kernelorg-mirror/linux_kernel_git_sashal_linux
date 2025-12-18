@@ -570,6 +570,223 @@ out:
 	return error;
 }
 
+/**
+ * sys_timer_create - Create a POSIX per-process interval timer
+ * @which_clock: Clock ID specifying the clock to use for the timer
+ * @timer_event_spec: Pointer to sigevent structure specifying notification
+ * @created_timer_id: Pointer to store the created timer ID
+ *
+ * long-desc: Creates a new per-process POSIX interval timer. The timer is
+ *   initially disarmed and must be armed using timer_settime(). The kernel
+ *   preallocates a queued real-time signal for each timer, so the number
+ *   of timers is limited by RLIMIT_SIGPENDING. Timer IDs are unique within
+ *   the process and are allocated sequentially starting from 0, though the
+ *   specific allocation algorithm may change between kernel versions.
+ *   Timers are not inherited by children across fork() and are disarmed
+ *   and deleted during execve(). A timer created with SIGEV_NONE is valid
+ *   but will never generate a signal; it can still be queried with
+ *   timer_gettime(). Timers created with SIGEV_THREAD_ID deliver signals
+ *   to a specific thread rather than the process as a whole.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which_clock
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   constraint: Must be a valid clock ID. Standard clocks: CLOCK_REALTIME (0),
+ *     CLOCK_MONOTONIC (1), CLOCK_PROCESS_CPUTIME_ID (2),
+ *     CLOCK_THREAD_CPUTIME_ID (3), CLOCK_BOOTTIME (7), CLOCK_TAI (11).
+ *     Alarm clocks requiring CAP_WAKE_ALARM: CLOCK_REALTIME_ALARM (8),
+ *     CLOCK_BOOTTIME_ALARM (9). Dynamic clocks encoded as ~fd where fd is
+ *     a file descriptor to a PTP or similar clock device (not supported for
+ *     timer creation). CPU clocks can encode specific PIDs/TIDs.
+ *     CLOCK_MONOTONIC_RAW (4), CLOCK_REALTIME_COARSE (5), and
+ *     CLOCK_MONOTONIC_COARSE (6) do not support timer creation.
+ *
+ * param: timer_event_spec
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to a struct sigevent. May be NULL, in which case
+ *     defaults to SIGEV_SIGNAL with signal SIGALRM and si_value set to
+ *     the timer ID. If non-NULL, sigev_notify must be one of: SIGEV_NONE
+ *     (no notification), SIGEV_SIGNAL (signal delivery), SIGEV_THREAD
+ *     (handled in userspace via librt, kernel sees SIGEV_THREAD_ID), or
+ *     SIGEV_THREAD_ID (signal to specific thread). For signal delivery,
+ *     sigev_signo must be a valid signal number (1-64, excluding invalid
+ *     signals). For SIGEV_THREAD_ID, sigev_notify_thread_id must be a
+ *     valid thread ID within the calling process.
+ *
+ * param: created_timer_id
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONZERO
+ *   constraint: Must be a valid pointer to a timer_t (int). In normal mode,
+ *     the kernel writes the allocated timer ID. In restore mode (enabled via
+ *     prctl PR_TIMER_CREATE_RESTORE_IDS), reads the requested ID from this
+ *     location first, then writes it back on success.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success and stores the timer ID at @created_timer_id.
+ *     The timer ID is a small non-negative integer unique within the process.
+ *
+ * error: EFAULT, Cannot copy sigevent from userspace
+ *   desc: The @timer_event_spec pointer is non-NULL but points to memory
+ *     that is not readable, or @created_timer_id points to memory that
+ *     cannot be written or read (in restore mode).
+ *
+ * error: EINVAL, Invalid clock ID
+ *   desc: The @which_clock value does not correspond to a known clock.
+ *     This includes values >= MAX_CLOCKS (16) that don't encode a valid
+ *     dynamic clock, and CPU clock IDs with invalid PID/TID encodings.
+ *
+ * error: EOPNOTSUPP, Clock does not support timers
+ *   desc: The specified clock exists but does not support timer creation.
+ *     This includes CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
+ *     CLOCK_MONOTONIC_COARSE, and dynamic clocks (file descriptor based
+ *     clocks like PTP). Also returned for CLOCK_REALTIME_ALARM and
+ *     CLOCK_BOOTTIME_ALARM when no RTC device is available for wakeup.
+ *
+ * error: EPERM, Missing CAP_WAKE_ALARM capability
+ *   desc: @which_clock is CLOCK_REALTIME_ALARM or CLOCK_BOOTTIME_ALARM
+ *     and the calling process does not have CAP_WAKE_ALARM capability.
+ *     These clocks can wake the system from suspend.
+ *
+ * error: EINVAL, Invalid sigevent specification
+ *   desc: The sigevent structure contains invalid values: sigev_notify is
+ *     not SIGEV_NONE, SIGEV_SIGNAL, or SIGEV_THREAD_ID; sigev_signo is
+ *     invalid (0 or > _NSIG) when signal notification is requested; or
+ *     sigev_notify_thread_id specifies a thread that doesn't exist or
+ *     doesn't belong to the calling process.
+ *
+ * error: EAGAIN, Resource temporarily unavailable
+ *   desc: Timer could not be created due to resource exhaustion. This can
+ *     occur when: (1) memory allocation for the timer structure fails,
+ *     (2) the RLIMIT_SIGPENDING limit has been reached (the kernel
+ *     preallocates a signal queue entry per timer), (3) no timer ID is
+ *     available (unlikely, requires creating INT_MAX timers), or (4) in
+ *     restore mode, too many concurrent restore attempts are happening.
+ *
+ * error: EBUSY, Timer ID already in use (restore mode only)
+ *   desc: When timer restore mode is enabled via prctl
+ *     PR_TIMER_CREATE_RESTORE_IDS, the requested timer ID read from
+ *     @created_timer_id is already allocated to another timer.
+ *
+ * error: EINVAL, Invalid requested timer ID (restore mode only)
+ *   desc: When timer restore mode is enabled, the requested timer ID
+ *     read from @created_timer_id exceeds INT_MAX.
+ *
+ * lock: posix_timers_hashtable[hash].lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-bucket spinlock protecting the timer hash table during
+ *     insertion. Acquired via scoped_guard(spinlock) in posix_timer_add().
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Process signal handler lock protecting the posix_timers list in
+ *     signal_struct. Acquired when linking the timer to the process.
+ *
+ * lock: new_timer->it_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-timer spinlock protecting timer state. Acquired when
+ *     initializing and linking the timer to prevent concurrent access.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock held when validating sigevent thread ID and
+ *     when accessing PID structures for CPU clock timers.
+ *
+ * signal: SIGALRM
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: When timer expires and notification is SIGEV_SIGNAL with
+ *     default configuration (NULL sigevent or sigev_signo == SIGALRM).
+ *   desc: The default signal delivered when a timer expires. Signal delivery
+ *     is queued using the preallocated sigqueue; if the signal is ignored
+ *     when the timer fires, the signal is discarded but overrun counting
+ *     continues. This is the post-expiration behavior, not immediate.
+ *   timing: KAPI_SIGNAL_TIME_DEFERRED
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_QUEUE
+ *   condition: When timer expires and notification is SIGEV_SIGNAL or
+ *     SIGEV_THREAD_ID with custom sigev_signo.
+ *   desc: Custom signal specified by sigev_signo is delivered when the
+ *     timer expires. The siginfo_t structure contains si_code=SI_TIMER,
+ *     si_signo=sigev_signo, si_value=sigev_value, si_overrun=overrun count
+ *     (capped at DELAYTIMER_MAX), and si_timerid=timer_id.
+ *   timing: KAPI_SIGNAL_TIME_DEFERRED
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_CREATE
+ *   target: POSIX interval timer
+ *   desc: Allocates a new k_itimer structure and associated resources
+ *     including a preallocated sigqueue entry. The timer is added to
+ *     both a global hash table (for O(1) lookup by ID) and the process's
+ *     posix_timers list. Timer consumes memory until deleted.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Timer structure and signal queue
+ *   desc: Allocates memory from posix_timers_cache slab cache for the
+ *     k_itimer structure. Also increments RLIMIT_SIGPENDING counter
+ *     for the preallocated signal queue entry. Both are freed when
+ *     the timer is deleted via timer_delete().
+ *   reversible: yes
+ *
+ * state-trans: timer
+ *   from: nonexistent
+ *   to: disarmed
+ *   condition: Successful timer creation
+ *   desc: New timer is created in disarmed state. It must be armed using
+ *     timer_settime() before it will generate any expirations.
+ *
+ * capability: CAP_WAKE_ALARM
+ *   type: KAPI_CAP_GRANT_PERMISSION
+ *   allows: Creating timers with CLOCK_REALTIME_ALARM or CLOCK_BOOTTIME_ALARM
+ *   without: Timer creation fails with -EPERM for alarm clocks
+ *   condition: Always checked for CLOCK_REALTIME_ALARM and CLOCK_BOOTTIME_ALARM
+ *
+ * constraint: RLIMIT_SIGPENDING
+ *   desc: The number of timers a process can create is limited by
+ *     RLIMIT_SIGPENDING because each timer preallocates a signal queue
+ *     entry. This limit is shared with pending signals. The default
+ *     soft limit is typically calculated as max(ulimit, 1024) signals.
+ *   expr: active_timers + pending_signals <= RLIMIT_SIGPENDING
+ *
+ * constraint: Memory availability
+ *   desc: Timer creation requires allocating approximately 200-300 bytes
+ *     from slab cache (size of struct k_itimer). Under extreme memory
+ *     pressure, allocation may fail with -EAGAIN.
+ *
+ * examples: timer_create(CLOCK_MONOTONIC, NULL, &timerid);  // Default SIGALRM
+ *   timer_create(CLOCK_REALTIME, &sev, &tid);  // Custom notification
+ *   timer_create(CLOCK_PROCESS_CPUTIME_ID, &sev, &tid);  // CPU time timer
+ *
+ * notes: Timer IDs have been unique within the process since kernel 3.10;
+ *   earlier kernels used system-wide unique IDs. The prctl interface
+ *   PR_TIMER_CREATE_RESTORE_IDS (since 6.x) allows requesting specific
+ *   timer IDs for checkpoint/restore scenarios. SIGEV_THREAD notification
+ *   is implemented in userspace by glibc/librt which creates a helper
+ *   thread; the kernel only sees SIGEV_THREAD_ID. For CLOCK_PROCESS_CPUTIME_ID
+ *   and CLOCK_THREAD_CPUTIME_ID, encoding a PID of 0 targets the calling
+ *   process/thread. Auxiliary clocks (CLOCK_AUX and above) may be available
+ *   depending on kernel configuration but are typically not used for timers.
+ *
+ * since-version: 2.6
+ */
 SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
 		struct sigevent __user *, timer_event_spec,
 		timer_t __user *, created_timer_id)
