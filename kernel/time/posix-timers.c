@@ -1386,7 +1386,185 @@ static void posix_timer_delete(struct k_itimer *timer)
 	}
 }
 
-/* Delete a POSIX.1b interval timer. */
+/**
+ * sys_timer_delete - Delete a POSIX per-process interval timer
+ * @timer_id: The ID of the timer to delete
+ *
+ * long-desc: Deletes the specified POSIX per-process interval timer. If the
+ *   timer is currently armed, it is automatically disarmed before deletion.
+ *   The timer ID becomes immediately invalid and may be reused by subsequent
+ *   timer_create() calls. Any pending signal from the deleted timer is
+ *   discarded and will not be delivered.
+ *
+ *   If the timer callback is currently executing (for hrtimer-based or CPU
+ *   time timers), the syscall will wait for the callback to complete before
+ *   proceeding with deletion. This ensures safe cleanup but means the syscall
+ *   may block briefly on PREEMPT_RT kernels where timer callbacks run in
+ *   thread context.
+ *
+ *   The timer must belong to the calling process. Attempting to delete a
+ *   timer created by another process or an invalid timer ID results in
+ *   EINVAL. Timers are automatically deleted when the last thread of a
+ *   process exits or when the process calls execve().
+ *
+ *   Per POSIX.1-2008, the disposition of pending signals from deleted timers
+ *   is implementation-defined. Linux discards any pending signal from the
+ *   deleted timer and removes it from the signal queue. The timer's
+ *   preallocated signal queue entry is freed, decrementing the
+ *   RLIMIT_SIGPENDING counter.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: timer_id
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, INT_MAX
+ *   constraint: Must be a valid timer ID returned by timer_create() for the
+ *     calling process. Valid timer IDs are non-negative integers in the
+ *     range 0 to INT_MAX. The timer must not have been previously deleted.
+ *     Timer IDs are per-process; a timer ID from another process cannot
+ *     be used. Values outside the valid range or timer IDs that have already
+ *     been deleted or never existed are rejected.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The timer is fully destroyed, its resources
+ *     are freed, and its timer ID may be reused by future timer_create()
+ *     calls. Any pending signal from the timer has been discarded.
+ *
+ * error: EINVAL, Invalid timer ID
+ *   desc: The @timer_id does not correspond to a valid timer owned by the
+ *     calling process. This occurs when: (1) the timer ID was never created
+ *     by timer_create(), (2) the timer was already deleted by a previous
+ *     timer_delete() call, (3) the timer belongs to a different process,
+ *     (4) the timer_id value exceeds INT_MAX or is negative, or (5) the
+ *     timer is in an invalid intermediate state during creation or deletion.
+ *     The timer lookup validates both the timer ID and process ownership
+ *     using the calling process's signal structure.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during the timer hash table lookup to prevent
+ *     the timer structure from being freed while it is being accessed. Also
+ *     held during timer_wait_running() to safely release and reacquire the
+ *     timer lock when waiting for a running callback to complete.
+ *
+ * lock: timer->it_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-timer spinlock acquired with interrupts disabled via
+ *     spin_lock_irq(). Protects the timer's internal state during the
+ *     deletion process. The lock is held while invalidating the timer,
+ *     removing it from the signal list, and attempting to cancel any
+ *     pending timer callback. May be released and reacquired if waiting
+ *     for a running callback to complete.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Process signal handler lock protecting the posix_timers list in
+ *     signal_struct. Acquired when removing the timer from the process's
+ *     timer list and when cleaning up any entries on the ignored timers
+ *     list. This lock ensures atomic removal from both lists.
+ *
+ * lock: timer_bucket->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-bucket spinlock protecting the timer hash table. Acquired
+ *     during posix_timer_unhash_and_free() to safely remove the timer
+ *     from the hash table using hlist_del_rcu().
+ *
+ * side-effect: KAPI_EFFECT_RESOURCE_DESTROY
+ *   target: POSIX interval timer
+ *   desc: Destroys the specified timer and releases all associated resources.
+ *     The timer is removed from the process's posix_timers list, removed
+ *     from the global timer hash table, and scheduled for RCU-protected
+ *     freeing. The timer ID becomes available for reuse.
+ *   condition: Always on successful deletion
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_FREE_MEMORY
+ *   target: Timer structure and signal queue
+ *   desc: Frees the k_itimer structure via kfree_rcu() after an RCU grace
+ *     period. The preallocated sigqueue entry is freed, decrementing the
+ *     RLIMIT_SIGPENDING counter. The timer's PID reference is released
+ *     via put_pid().
+ *   condition: When reference count reaches zero (may be deferred if signal queued)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Timer callback
+ *   desc: If the timer is armed, it is disarmed by canceling the underlying
+ *     hrtimer, alarm timer, or CPU timer. For hrtimer-based timers, this
+ *     calls hrtimer_try_to_cancel(). For CPU timers, the timer is removed
+ *     from the per-process or per-thread timer queue. Any running callback
+ *     is waited for before proceeding.
+ *   condition: When timer was armed at deletion time
+ *   reversible: no
+ *
+ * state-trans: timer
+ *   from: armed
+ *   to: deleted
+ *   condition: Timer was armed when timer_delete() was called
+ *   desc: Armed timer is disarmed and then destroyed. The underlying hrtimer,
+ *     CPU timer, or alarm timer is canceled before the timer is removed.
+ *
+ * state-trans: timer
+ *   from: disarmed
+ *   to: deleted
+ *   condition: Timer was disarmed when timer_delete() was called
+ *   desc: Disarmed timer is destroyed immediately. No timer cancellation
+ *     is needed, but the timer is still removed from all lists and freed.
+ *
+ * constraint: Timer ownership
+ *   desc: The timer must belong to the calling process. The lookup function
+ *     validates that timer->it_signal matches current->signal to ensure
+ *     process isolation. One process cannot delete another process's timers.
+ *
+ * constraint: Single deletion
+ *   desc: A timer can only be deleted once. After successful deletion, the
+ *     timer ID is invalidated and any subsequent timer_delete() with the
+ *     same ID will fail with EINVAL until the ID is reused by timer_create().
+ *
+ * examples: timer_delete(timerid);  // Delete a previously created timer
+ *   if (timer_delete(id) < 0 && errno == EINVAL) { ... }  // Handle invalid ID
+ *
+ * notes: There is no compat syscall variant for timer_delete because timer_t
+ *   is defined as int on all architectures, which has the same size and
+ *   representation on both 32-bit and 64-bit systems.
+ *
+ *   The syscall may briefly block waiting for a timer callback to complete.
+ *   On non-PREEMPT_RT kernels, hrtimer callbacks run in hard or soft IRQ
+ *   context, so the wait is typically just a cpu_relax() spin. On PREEMPT_RT
+ *   kernels, timer callbacks run in thread context and the syscall acquires
+ *   the softirq_expiry_lock to synchronize with the callback thread.
+ *
+ *   POSIX specifies that the disposition of pending signals from a deleted
+ *   timer is implementation-defined. Linux handles this by marking the timer
+ *   as invalid before removing it from lists. If a signal was queued, it is
+ *   silently discarded during delivery when the invalid state is detected.
+ *   The it_signal_seq counter is incremented to invalidate any in-flight
+ *   signal delivery.
+ *
+ *   Race conditions between timer_delete() and concurrent timer operations
+ *   (timer_settime, timer_gettime, signal delivery) are handled by the
+ *   timer spinlock and the RCU-protected lookup. A timer being deleted
+ *   cannot be looked up by other syscalls once it_signal is marked invalid.
+ *
+ *   CPU time timers (CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID) use
+ *   a different deletion path through posix_cpu_timer_del() which acquires
+ *   sighand->siglock instead of using hrtimer cancellation.
+ *
+ * since-version: 2.6
+ */
 SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
 {
 	struct k_itimer *timer;
