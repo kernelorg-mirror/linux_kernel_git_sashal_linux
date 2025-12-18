@@ -996,22 +996,136 @@ SYSCALL_DEFINE2(timer_gettime32, timer_t, timer_id,
 #endif
 
 /**
- * sys_timer_getoverrun - Get the number of overruns of a POSIX.1b interval timer
- * @timer_id:	The timer ID which identifies the timer
+ * sys_timer_getoverrun - Get overrun count for a POSIX per-process timer
+ * @timer_id: The ID of the timer to query
  *
- * The "overrun count" of a timer is one plus the number of expiration
- * intervals which have elapsed between the first expiry, which queues the
- * signal and the actual signal delivery. On signal delivery the "overrun
- * count" is calculated and cached, so it can be returned directly here.
+ * long-desc: Returns the timer expiration overrun count for the specified
+ *   POSIX per-process interval timer. The overrun count represents the
+ *   number of additional timer expirations that occurred between the time
+ *   when the timer signal was generated (queued) and when it was delivered
+ *   or accepted by the process. This mechanism allows applications to
+ *   account for missed expirations that occur while a signal is pending.
  *
- * As this is relative to the last queued signal the returned overrun count
- * is meaningless outside of the signal delivery path and even there it
- * does not accurately reflect the current state when user space evaluates
- * it.
+ *   The overrun count is computed and cached at signal delivery time in the
+ *   timer's it_overrun_last field. This syscall simply returns that cached
+ *   value, making it a fast operation. However, this also means the returned
+ *   value only reflects the state at the last signal delivery and may not
+ *   represent current timer state if the timer has expired again since then.
  *
- * Returns:
- *	-EINVAL		@timer_id is invalid
- *	1..INT_MAX	The number of overruns related to the last delivered signal
+ *   Per POSIX.1-2008, only one signal is queued per timer regardless of how
+ *   many times it expires while the signal is pending. The overrun count
+ *   captures these additional expirations. For interval timers, if the
+ *   interval is very short relative to system scheduling latency, very high
+ *   overrun counts are possible.
+ *
+ *   The overrun count is clamped to INT_MAX (DELAYTIMER_MAX as defined by
+ *   POSIX) when it exceeds that value. Prior to Linux 4.19, the counter
+ *   could overflow and wrap around to negative values; this was fixed in
+ *   commit 78c9c4dfbf8c ("posix-timers: Sanitize overrun handling").
+ *
+ *   For SIGEV_NONE timers, which never generate signals, the overrun count
+ *   is not meaningful. For timers that have never expired or whose signal
+ *   has never been delivered, the return value is unspecified by POSIX but
+ *   Linux returns 0.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: timer_id
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid timer ID returned by timer_create() for
+ *     the calling process. Valid timer IDs are non-negative integers in
+ *     the range 0 to INT_MAX. The timer must not have been deleted via
+ *     timer_delete(). Timer IDs are per-process; a timer created by another
+ *     process cannot be queried. Values greater than INT_MAX are rejected
+ *     as invalid.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_RANGE
+ *   success: 0
+ *   desc: On success, returns the timer overrun count as a non-negative
+ *     integer. A return value of 0 means no overruns occurred (or the
+ *     timer has not yet expired/delivered a signal). Values 1 through
+ *     INT_MAX-1 represent the actual overrun count. A return value of
+ *     INT_MAX (2147483647) indicates that the actual overrun count was
+ *     equal to or exceeded INT_MAX and has been clamped. The si_overrun
+ *     field in the delivered siginfo_t contains the same value, allowing
+ *     signal handlers to access overrun information without a syscall.
+ *
+ * error: EINVAL, Invalid timer ID
+ *   desc: The @timer_id does not correspond to a valid timer owned by the
+ *     calling process. This occurs when: (1) the timer ID was never created
+ *     by timer_create(), (2) the timer was deleted by timer_delete(),
+ *     (3) the timer belongs to a different process, (4) the timer_id value
+ *     exceeds INT_MAX, or (5) the timer is in an invalid intermediate state
+ *     during creation or deletion. The timer lookup uses both the timer ID
+ *     and the calling process's signal structure to validate ownership.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during the hash table lookup to prevent
+ *     the timer from being freed while it is being accessed. The lock is
+ *     acquired via guard(rcu)() in __lock_timer() before searching the
+ *     timer hash table and released automatically when the guard goes
+ *     out of scope.
+ *
+ * lock: timr->it_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-timer spinlock acquired with interrupts disabled via
+ *     spin_lock_irq() in __lock_timer(). This lock protects the timer's
+ *     internal state including the overrun counter. The lock is held while
+ *     reading it_overrun_last and released via spin_unlock_irq() when the
+ *     scoped guard (lock_timer class) exits. IRQs are disabled to prevent
+ *     timer interrupt handlers from accessing the timer concurrently.
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: Timer state
+ *   desc: This syscall is read-only and does not modify any timer state
+ *     or kernel data structures. It simply reads and returns the cached
+ *     it_overrun_last value from the timer structure.
+ *
+ * constraint: Timer ownership
+ *   desc: The timer must belong to the calling process. Each POSIX timer
+ *     is associated with the signal_struct of the process that created it.
+ *     The lookup function validates that timr->it_signal == current->signal
+ *     before returning the timer, ensuring process isolation.
+ *
+ * constraint: Timer validity
+ *   desc: The timer must be in a valid state (not being created or deleted).
+ *     During creation, timr->it_signal has bit 0 set to mark it as invalid
+ *     until initialization completes. During deletion, the same bit is set
+ *     to prevent access. The lookup fails if this bit is set.
+ *
+ * examples: count = timer_getoverrun(timerid);  // Get overrun count
+ *   if (count == INT_MAX) { ... }  // Overflow occurred, actual count unknown
+ *
+ * notes: The overrun count is only meaningful in the context of signal
+ *   delivery. POSIX specifies that the return value is unspecified if no
+ *   expiration signal has been delivered for the timer. In practice, Linux
+ *   initializes it_overrun_last to 0, so newly created or never-expired
+ *   timers return 0.
+ *
+ *   The si_overrun field in siginfo_t provides the same information as this
+ *   syscall without the overhead of a system call. Signal handlers can read
+ *   si_overrun directly from the siginfo_t parameter. However, note that
+ *   si_overrun is only valid for SI_TIMER signals.
+ *
+ *   There is no compat syscall variant for timer_getoverrun because both
+ *   the parameter (timer_t) and return value (int) are the same size on
+ *   32-bit and 64-bit systems.
+ *
+ *   Race condition note: The returned overrun count reflects the state at
+ *   the last signal delivery. If the timer expires again after that delivery
+ *   but before this syscall is invoked, those new overruns are not included
+ *   in the returned value - they will be reported with the next signal.
+ *
+ * since-version: 2.6
  */
 SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
 {
