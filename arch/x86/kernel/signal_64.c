@@ -240,8 +240,240 @@ Efault:
 	return -EFAULT;
 }
 
-/*
- * Do a signal return; undo the signal stack.
+/**
+ * sys_rt_sigreturn - return from signal handler and restore process context
+ *
+ * long-desc: Restores the process context saved on the user stack during signal
+ *   delivery, allowing execution to resume at the point where the signal
+ *   interrupted the process. This syscall is called implicitly by the signal
+ *   trampoline when a signal handler returns; it should NEVER be called
+ *   directly by user programs.
+ *
+ *   When a signal is delivered, the kernel creates a signal frame on the user
+ *   stack containing the complete CPU state (registers, flags, instruction
+ *   pointer, stack pointer), FPU/SIMD state, blocked signal mask, and alternate
+ *   signal stack configuration. The signal handler executes with a modified
+ *   context, and when it returns, the signal trampoline (typically in vdso or
+ *   libc) invokes this syscall to restore the original context.
+ *
+ *   The syscall reads the signal frame from the stack at (sp - 8) on x86-64,
+ *   validates it, and restores: (1) the blocked signal mask, (2) alternate
+ *   signal stack settings, (3) CPU register context including segment registers,
+ *   (4) FPU/SIMD state, and (5) shadow stack pointer (on CET-enabled systems).
+ *   Execution then resumes at the restored instruction pointer, not at the
+ *   caller of sigreturn.
+ *
+ *   On x86-64, special handling exists for the SS segment selector to maintain
+ *   compatibility with legacy programs like DOSEMU and CRIU. If the saved SS is
+ *   invalid and UC_STRICT_RESTORE_SS is not set, the kernel substitutes a valid
+ *   flat data segment instead of failing. This allows programs that construct
+ *   signal frames from scratch without proper SS values to continue working.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_NO_RETURN
+ *   success: restored_ax
+ *   desc: This syscall does not return in the conventional sense. On success,
+ *     execution resumes at the instruction pointer stored in the signal frame,
+ *     with all registers restored to their saved values. The apparent "return
+ *     value" seen by the resumed code is the value of RAX/EAX from the signal
+ *     frame. On failure, the kernel sends SIGSEGV to the process and returns 0,
+ *     but this return value is never seen as the process handles the signal.
+ *
+ * error: SIGSEGV, Invalid signal frame
+ *   desc: If the signal frame cannot be read (address not accessible, unmapped
+ *     memory, or copy_from_user fails), or if any component restoration fails
+ *     (sigcontext, FPU state, alternate stack, shadow stack), the kernel sends
+ *     SIGSEGV via force_sig(). The process does not see an error return code;
+ *     instead it receives a SIGSEGV signal. Common causes include: corrupted
+ *     stack pointer, signal frame overwritten by handler, invalid frame address
+ *     not satisfying access_ok(), or deliberately malformed frame in sigreturn-
+ *     oriented programming (SROP) attacks. On systems with CET shadow stack
+ *     enabled, mismatched or corrupted shadow stack tokens also trigger this.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Acquired by set_current_blocked() when restoring the signal mask.
+ *     The lock is held briefly while updating current->blocked and potentially
+ *     recalculating pending signals. Released before the syscall continues
+ *     with other restorations.
+ *
+ * lock: mm->mmap_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: On systems with shadow stack (CET) enabled, shstk_pop_sigframe() may
+ *     briefly acquire the mmap_lock in read mode via mmap_read_lock_killable()
+ *     to verify the shadow stack VMA when the SSP is at a page boundary. This
+ *     is only acquired when the SSP is exactly page-aligned, which is uncommon.
+ *     The lock is released before the function returns.
+ *
+ * signal: SIGSEGV
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: Signal frame validation or restoration fails
+ *   desc: When any step of the context restoration fails, the kernel sends
+ *     SIGSEGV to the process via force_sig(SIGSEGV) in signal_fault(). This is
+ *     a synchronous fault signal that cannot be blocked or ignored. If the
+ *     process has a SIGSEGV handler, it will be invoked, but the original
+ *     sigreturn operation has failed and cannot be retried. Causes include
+ *     invalid frame address, unreadable memory, corrupt sigcontext, invalid
+ *     FPU state, corrupt alternate stack data, or shadow stack token mismatch.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: CPU registers (all general purpose, RIP, RSP, RFLAGS, CS, SS)
+ *   desc: All CPU general-purpose registers are restored from the sigcontext
+ *     structure in the signal frame. This includes RAX-R15, RIP (instruction
+ *     pointer), RSP (stack pointer), and RFLAGS. The CS and SS segment
+ *     selectors are also restored, with their RPL bits forced to ring 3 for
+ *     security. On success, execution continues at the restored RIP with the
+ *     restored register values.
+ *   reversible: no (process state is overwritten)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: FPU/SIMD state
+ *   desc: The complete floating-point unit state is restored from the fpstate
+ *     area in the signal frame via fpu__restore_sig(). This includes x87 FPU
+ *     registers, SSE registers (XMM0-XMM15), and any extended state like AVX
+ *     (YMM registers), AVX-512, or AMX state depending on CPU capabilities.
+ *     If FPU state restoration fails, the FPU state is cleared to the initial
+ *     state to prevent information leakage.
+ *   condition: Signal frame contains FPU state (fpstate pointer non-NULL)
+ *   reversible: no (FPU state is overwritten)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->blocked (signal mask)
+ *   desc: The blocked signal mask is restored from uc_sigmask in the signal
+ *     frame via set_current_blocked(). SIGKILL and SIGSTOP are automatically
+ *     removed from the mask as they cannot be blocked. This may trigger
+ *     immediate delivery of previously blocked signals that became unblocked.
+ *   reversible: yes (via subsequent sigprocmask or signal handler)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Alternate signal stack (sas_ss_sp, sas_ss_size, sas_ss_flags)
+ *   desc: The alternate signal stack settings are restored from uc_stack in
+ *     the signal frame via restore_altstack(). This includes the stack base
+ *     address, size, and flags (including SS_AUTODISARM if it was set).
+ *     Errors from restore_altstack() are silently ignored except for EFAULT.
+ *   reversible: yes (via subsequent sigaltstack syscall)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Shadow stack pointer (SSP)
+ *   desc: On Intel processors with Control-flow Enforcement Technology (CET)
+ *     enabled, the shadow stack pointer is restored from a token saved during
+ *     signal delivery via restore_signal_shadow_stack(). The token contains
+ *     the SSP value XORed with its stack address for validation. An invalid
+ *     or mismatched token causes the syscall to fail with SIGSEGV.
+ *   condition: CET shadow stack is enabled (X86_FEATURE_USER_SHSTK)
+ *   reversible: no (shadow stack state is overwritten)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->restart_block.fn
+ *   desc: The restart block function pointer is set to do_no_restart_syscall
+ *     by restore_sigcontext(). This invalidates any pending syscall restart
+ *     that was in progress when the signal was delivered, ensuring that a
+ *     subsequent erroneous restart_syscall invocation returns -EINTR instead
+ *     of attempting to restart a stale operation.
+ *   reversible: no (restart block is invalidated)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: FRED software event flag (on FRED-enabled systems)
+ *   desc: On systems with Intel Flexible Return and Event Delivery (FRED),
+ *     the software event flag in the augmented SS is cleared via
+ *     prevent_single_step_upon_eretu() to prevent immediate repeat of a
+ *     single-step trap when the trap flag (TF) is set. This only occurs
+ *     when TF is clear in the current context (not being actively debugged).
+ *   condition: FRED is enabled and TF is not set
+ *   reversible: no
+ *
+ * state-trans: process_execution_context
+ *   from: signal handler execution context
+ *   to: pre-signal interrupted context
+ *   condition: Successful sigreturn completion
+ *   desc: The process transitions from executing in the signal handler context
+ *     (with potentially different register values, signal mask, and stack) back
+ *     to the context that existed when the signal was delivered. All register
+ *     values, the signal mask, and the alternate signal stack configuration are
+ *     restored to their pre-signal state.
+ *
+ * constraint: Signal frame must be valid and accessible
+ *   desc: The signal frame must be located at a valid user-space address that
+ *     passes access_ok() verification. The frame address is computed as
+ *     (sp - 8) on x86-64. The frame must contain valid data written by the
+ *     kernel during signal delivery. User modification of the frame is
+ *     supported (this is how handlers like DOSEMU work), but invalid data
+ *     causes SIGSEGV.
+ *
+ * constraint: Must be called from signal trampoline only
+ *   desc: This syscall is intended to be called only from the signal
+ *     trampoline code that the kernel arranges to execute when a signal
+ *     handler returns. The trampoline is typically located in the vdso
+ *     (vdso_image.sym___kernel_rt_sigreturn) or in glibc. Direct calls
+ *     from application code will fail because the stack does not contain
+ *     a valid signal frame at the expected location.
+ *
+ * constraint: Segment selectors forced to ring 3
+ *   desc: For security, the restored CS and SS segment selectors have their
+ *     RPL (Requested Privilege Level) bits forced to 3 (user mode) via
+ *     OR with 0x03. This prevents privilege escalation by manipulating the
+ *     signal frame to contain kernel segment selectors.
+ *
+ * constraint: EFLAGS sanitization
+ *   desc: Only certain EFLAGS bits are restored from the signal frame
+ *     (defined by FIX_EFLAGS mask: AC, OF, DF, TF, SF, ZF, AF, PF, CF, RF).
+ *     System flags like IOPL and IF are not restored from user-controlled
+ *     data for security.
+ *
+ * examples:
+ *   // This syscall should NEVER be called directly. It is invoked by the
+ *   // signal trampoline. The following shows the kernel-internal flow:
+ *   // 1. Signal delivered: kernel creates signal frame on user stack
+ *   // 2. Signal handler executes
+ *   // 3. Handler returns to trampoline (in vdso or libc)
+ *   // 4. Trampoline: mov $15, %rax; syscall  // NR_rt_sigreturn
+ *   // 5. Kernel restores context, execution resumes at interrupted location
+ *   //
+ *   // Direct syscall (will fail without proper frame):
+ *   // syscall(SYS_rt_sigreturn);  // DON'T DO THIS - causes SIGSEGV
+ *
+ * notes:
+ *   This syscall is architecture-specific. Each architecture implements its own
+ *   version to handle its unique register set and calling conventions. On x86,
+ *   there are multiple variants: rt_sigreturn for 64-bit, sys32_rt_sigreturn
+ *   for 32-bit compatibility, and x32_rt_sigreturn for the x32 ABI.
+ *
+ *   SECURITY: This syscall is the target of sigreturn-oriented programming
+ *   (SROP) attacks where an attacker crafts a fake signal frame on the stack
+ *   to gain arbitrary control of register values via a single gadget. While
+ *   the kernel cannot prevent SROP attacks entirely (as the frame must be
+ *   modifiable for legitimate use cases), it does validate frame addresses
+ *   and sanitizes security-critical values like segment selectors and EFLAGS.
+ *   Some kernels implement additional mitigations like frame cookies, though
+ *   this is not universal. See LWN.net article on "Sigreturn-oriented
+ *   programming and its mitigation" for details.
+ *
+ *   The UC_SIGCONTEXT_SS and UC_STRICT_RESTORE_SS flags in uc_flags control SS
+ *   restoration behavior for compatibility with legacy programs. When
+ *   UC_STRICT_RESTORE_SS is set (for signals from 64-bit code), the saved SS
+ *   is restored exactly. When clear (for signals from segmented 16/32-bit code
+ *   or legacy sigframes), an invalid SS is silently replaced with __USER_DS.
+ *   This is needed for DOSEMU and old CRIU versions.
+ *
+ *   The syscall number is 15 on x86-64 and 173 on i386. The signal trampoline
+ *   code that invokes this syscall is typically in the vdso, making it subject
+ *   to ASLR. However, the syscall itself requires no arguments since all
+ *   necessary information is on the stack.
+ *
+ *   glibc does not provide a wrapper for this syscall. The glibc "sigreturn"
+ *   function simply returns -1 with errno set to ENOSYS because direct calls
+ *   are never correct.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE0(rt_sigreturn)
 {
