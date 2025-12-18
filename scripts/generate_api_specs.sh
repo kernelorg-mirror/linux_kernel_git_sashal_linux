@@ -49,6 +49,7 @@ cat <<EOF
 #include <uapi/linux/watch_queue.h>
 #include <uapi/linux/falloc.h>
 #include <uapi/linux/wait.h>
+#include <uapi/linux/reboot.h>
 
 #ifdef CONFIG_KAPI_SPEC
 

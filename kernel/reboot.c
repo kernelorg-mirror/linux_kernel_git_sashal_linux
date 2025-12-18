@@ -717,13 +717,271 @@ EXPORT_SYMBOL_GPL(kernel_power_off);
 
 DEFINE_MUTEX(system_transition_mutex);
 
-/*
- * Reboot system call: for obvious reasons only root may call it,
- * and even root needs to set up some magic numbers in the registers
- * so that some mistake won't make this reboot the whole machine.
- * You can also set the meaning of the ctrl-alt-del-key here.
+/**
+ * sys_reboot - Reboot, halt, power off, hibernate, or control Ctrl-Alt-Del
+ * @magic1: First magic number for verification (must be LINUX_REBOOT_MAGIC1)
+ * @magic2: Second magic number for verification (one of LINUX_REBOOT_MAGIC2*)
+ * @cmd: The reboot command to execute
+ * @arg: Optional argument (only used with LINUX_REBOOT_CMD_RESTART2)
  *
- * reboot doesn't sync: do that yourself before calling this.
+ * long-desc: Performs various system shutdown and control operations. For
+ *   safety, this syscall requires two "magic" numbers to be passed to prevent
+ *   accidental invocations. The @magic1 parameter must be LINUX_REBOOT_MAGIC1
+ *   (0xfee1dead), and @magic2 must be one of LINUX_REBOOT_MAGIC2 (672274793),
+ *   LINUX_REBOOT_MAGIC2A (85072278), LINUX_REBOOT_MAGIC2B (369367448), or
+ *   LINUX_REBOOT_MAGIC2C (537993216). These additional magic values were added
+ *   in different kernel versions: MAGIC2A in 2.1.17, MAGIC2B in 2.1.97, and
+ *   MAGIC2C in 2.5.71.
+ *
+ *   The syscall can restart the system, halt it, power it off, hibernate to
+ *   disk, execute a preloaded kexec kernel, or control the behavior of the
+ *   Ctrl-Alt-Del key combination.
+ *
+ *   IMPORTANT: This syscall does NOT sync filesystems. Call sync(2) before
+ *   invoking reboot() with destructive commands to avoid data loss.
+ *
+ *   When called from a non-initial PID namespace, the behavior is different:
+ *   RESTART/RESTART2 terminates all processes in the namespace and reports
+ *   the init process as killed by SIGHUP; HALT/POWER_OFF terminates all
+ *   processes and reports init as killed by SIGINT. Other commands return
+ *   -EINVAL from non-initial PID namespaces.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: magic1
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be exactly LINUX_REBOOT_MAGIC1 (0xfee1dead). Any other
+ *     value causes the syscall to return -EINVAL.
+ *
+ * param: magic2
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be one of LINUX_REBOOT_MAGIC2, LINUX_REBOOT_MAGIC2A,
+ *     LINUX_REBOOT_MAGIC2B, or LINUX_REBOOT_MAGIC2C. The values encode Linus
+ *     Torvalds' and his daughters' birthdates in decimal DDMMYYYY format.
+ *
+ * param: cmd
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be one of LINUX_REBOOT_CMD_RESTART, LINUX_REBOOT_CMD_HALT,
+ *     LINUX_REBOOT_CMD_CAD_ON, LINUX_REBOOT_CMD_CAD_OFF, LINUX_REBOOT_CMD_POWER_OFF,
+ *     LINUX_REBOOT_CMD_RESTART2, LINUX_REBOOT_CMD_SW_SUSPEND, or LINUX_REBOOT_CMD_KEXEC.
+ *     LINUX_REBOOT_CMD_RESTART (0x01234567) restarts the system.
+ *     LINUX_REBOOT_CMD_HALT (0xCDEF0123) halts the system.
+ *     LINUX_REBOOT_CMD_CAD_ON (0x89ABCDEF) enables Ctrl-Alt-Del for reboot.
+ *     LINUX_REBOOT_CMD_CAD_OFF (0x00000000) makes Ctrl-Alt-Del send SIGINT
+ *     to init. LINUX_REBOOT_CMD_POWER_OFF (0x4321FEDC) powers off the system.
+ *     LINUX_REBOOT_CMD_RESTART2 (0xA1B2C3D4) restarts with a command string
+ *     from @arg. LINUX_REBOOT_CMD_SW_SUSPEND (0xD000FCE2) hibernates to disk
+ *     (requires CONFIG_HIBERNATION). LINUX_REBOOT_CMD_KEXEC (0x45584543)
+ *     executes a preloaded kexec kernel (requires CONFIG_KEXEC_CORE).
+ *
+ * param: arg
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER | KAPI_PARAM_OPTIONAL
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Only used when @cmd is LINUX_REBOOT_CMD_RESTART2. Points to
+ *     a NUL-terminated string (up to 255 bytes) that is passed to the reboot
+ *     handler as the restart command. For all other commands, this parameter
+ *     is ignored and may be NULL.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_NO_RETURN
+ *   success: 0
+ *   desc: For LINUX_REBOOT_CMD_CAD_ON and LINUX_REBOOT_CMD_CAD_OFF, returns
+ *     0 on success. For LINUX_REBOOT_CMD_SW_SUSPEND, returns 0 on successful
+ *     resume from hibernation. For LINUX_REBOOT_CMD_KEXEC with preserve_context,
+ *     returns 0 on successful return from kexec. For LINUX_REBOOT_CMD_RESTART,
+ *     LINUX_REBOOT_CMD_RESTART2, LINUX_REBOOT_CMD_HALT, and
+ *     LINUX_REBOOT_CMD_POWER_OFF, the syscall does not return on success as
+ *     the system is rebooted, halted, or powered off. For standard
+ *     LINUX_REBOOT_CMD_KEXEC, the syscall does not return on success as the
+ *     new kernel takes over.
+ *
+ * error: EPERM, Missing CAP_SYS_BOOT capability
+ *   desc: The calling process does not have the CAP_SYS_BOOT capability
+ *     in the user namespace associated with its PID namespace. This check
+ *     uses ns_capable() with the pid namespace's user_ns.
+ *
+ * error: EINVAL, Invalid magic numbers
+ *   desc: The @magic1 parameter is not LINUX_REBOOT_MAGIC1, or @magic2 is
+ *     not one of LINUX_REBOOT_MAGIC2, LINUX_REBOOT_MAGIC2A, LINUX_REBOOT_MAGIC2B,
+ *     or LINUX_REBOOT_MAGIC2C. This safety check prevents accidental reboots.
+ *
+ * error: EINVAL, Invalid command
+ *   desc: The @cmd parameter is not one of the recognized reboot commands.
+ *     This includes LINUX_REBOOT_CMD_SW_SUSPEND when CONFIG_HIBERNATION is
+ *     not enabled, and LINUX_REBOOT_CMD_KEXEC when CONFIG_KEXEC_CORE is not
+ *     enabled.
+ *
+ * error: EINVAL, Invalid command in non-init PID namespace
+ *   desc: When called from a non-initial PID namespace, only RESTART,
+ *     RESTART2, HALT, and POWER_OFF commands are valid. Other commands
+ *     (CAD_ON, CAD_OFF, SW_SUSPEND, KEXEC) return EINVAL. This is returned
+ *     by reboot_pid_ns().
+ *
+ * error: EFAULT, Failed to copy restart command from user space
+ *   desc: For LINUX_REBOOT_CMD_RESTART2, the @arg pointer is invalid or
+ *     points to unmapped memory. The strncpy_from_user() call failed to
+ *     copy the restart command string.
+ *
+ * error: EBUSY, Kexec operation in progress
+ *   desc: For LINUX_REBOOT_CMD_KEXEC, another kexec operation is currently
+ *     in progress. The kexec_trylock() call failed because the kexec_lock
+ *     is already held.
+ *
+ * error: EINVAL, No kexec image loaded
+ *   desc: For LINUX_REBOOT_CMD_KEXEC, no kernel image has been loaded via
+ *     kexec_load() or kexec_file_load(). The global kexec_image pointer
+ *     is NULL.
+ *
+ * error: EPERM, Hibernation not available
+ *   desc: For LINUX_REBOOT_CMD_SW_SUSPEND, hibernation is not available on
+ *     this system. This can occur if no swap is configured, the system
+ *     lacks sufficient swap space, or hibernation has been disabled.
+ *
+ * error: EOPNOTSUPP, Compression algorithm not available
+ *   desc: For LINUX_REBOOT_CMD_SW_SUSPEND, the configured hibernation
+ *     compression algorithm is not available in the kernel's crypto
+ *     subsystem.
+ *
+ * error: EBUSY, Hibernation snapshot device in use
+ *   desc: For LINUX_REBOOT_CMD_SW_SUSPEND, hibernate_acquire() failed
+ *     because the snapshot device (/dev/snapshot) is currently open.
+ *
+ * error: EAGAIN, Live update reboot preparation failed
+ *   desc: For LINUX_REBOOT_CMD_KEXEC with live update enabled,
+ *     liveupdate_reboot() failed to serialize the session or finalize
+ *     kexec handover (KHO). The operation may be retried.
+ *
+ * capability: CAP_SYS_BOOT
+ *   type: KAPI_CAP_REQUIRED
+ *   allows: Allows performing any reboot, halt, power-off, hibernate, or
+ *     kexec operation. Also allows changing Ctrl-Alt-Del behavior.
+ *   without: Returns -EPERM immediately before any other validation.
+ *   condition: Checked via ns_capable() in the user namespace associated
+ *     with the calling process's PID namespace.
+ *
+ * lock: system_transition_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Global mutex protecting system state transitions. Acquired before
+ *     processing the command in the switch statement. Prevents races between
+ *     concurrent reboot/suspend operations. Released on error or after
+ *     non-destructive commands (CAD_ON, CAD_OFF). For destructive commands
+ *     (RESTART, HALT, POWER_OFF), the lock is held until system termination.
+ *
+ * lock: kexec_lock
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   condition: Only for LINUX_REBOOT_CMD_KEXEC
+ *   desc: Protects the global kexec_image pointer. Acquired with trylock
+ *     semantics (non-blocking) to prevent waiting while holding
+ *     system_transition_mutex.
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   condition: Only in non-init PID namespace
+ *   desc: Read lock acquired by reboot_pid_ns() when sending SIGKILL to
+ *     the child_reaper process of the PID namespace.
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: When called from non-init PID namespace with RESTART,
+ *     RESTART2, HALT, or POWER_OFF command.
+ *   desc: Sends SIGKILL to the child_reaper (init process) of the calling
+ *     process's PID namespace to terminate all processes in the namespace.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE | KAPI_EFFECT_IRREVERSIBLE
+ *   target: Entire system
+ *   condition: RESTART, RESTART2, HALT, or POWER_OFF commands
+ *   desc: Terminates all processes and reboots, halts, or powers off the
+ *     system. This is an irreversible operation. Unsaved data will be lost.
+ *     Call sync(2) before invoking if data preservation is needed.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: C_A_D global variable
+ *   condition: CAD_ON or CAD_OFF commands
+ *   desc: CAD_ON sets C_A_D to 1, enabling immediate system restart when
+ *     Ctrl-Alt-Del is pressed. CAD_OFF sets C_A_D to 0, causing Ctrl-Alt-Del
+ *     to send SIGINT to the init process instead.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM | KAPI_EFFECT_IRREVERSIBLE
+ *   target: System hibernation image
+ *   condition: SW_SUSPEND command
+ *   desc: Creates a hibernation image on the configured swap device and
+ *     powers off the system. On resume, the system state is restored from
+ *     the image. Requires CONFIG_HIBERNATION.
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE | KAPI_EFFECT_IRREVERSIBLE
+ *   target: PID namespace processes
+ *   condition: RESTART, RESTART2, HALT, or POWER_OFF from non-init namespace
+ *   desc: All processes in the PID namespace are terminated. The namespace's
+ *     init process exit status reflects the command: killed by SIGHUP for
+ *     RESTART/RESTART2, killed by SIGINT for HALT/POWER_OFF.
+ *   reversible: no
+ *
+ * state-trans: system_state
+ *   from: SYSTEM_RUNNING
+ *   to: SYSTEM_RESTART
+ *   condition: RESTART or RESTART2 command
+ *   desc: System state transitions to SYSTEM_RESTART as part of the
+ *     kernel_restart() shutdown sequence.
+ *
+ * state-trans: system_state
+ *   from: SYSTEM_RUNNING
+ *   to: SYSTEM_HALT
+ *   condition: HALT command
+ *   desc: System state transitions to SYSTEM_HALT as part of the
+ *     kernel_halt() shutdown sequence.
+ *
+ * state-trans: system_state
+ *   from: SYSTEM_RUNNING
+ *   to: SYSTEM_POWER_OFF
+ *   condition: POWER_OFF command
+ *   desc: System state transitions to SYSTEM_POWER_OFF as part of the
+ *     kernel_power_off() shutdown sequence.
+ *
+ * examples: reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+ *       LINUX_REBOOT_CMD_RESTART, NULL);  // Restart system
+ *   reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+ *       LINUX_REBOOT_CMD_POWER_OFF, NULL);  // Power off system
+ *   reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+ *       LINUX_REBOOT_CMD_RESTART2, "recovery");  // Restart to recovery
+ *   reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+ *       LINUX_REBOOT_CMD_CAD_ON, NULL);  // Enable Ctrl-Alt-Del reboot
+ *
+ * notes: The magic2 values encode birthdates: MAGIC2 (1969-12-28, Linus),
+ *   MAGIC2A (1996-12-05, first daughter), MAGIC2B (1998-04-16, second
+ *   daughter), MAGIC2C (2000-11-20, third daughter) in decimal DDMMYYYY.
+ *
+ *   If POWER_OFF is requested but the system cannot power off (no power-off
+ *   handler registered), the syscall internally converts this to HALT and
+ *   sets a flag to indicate the fallback occurred.
+ *
+ *   The HALT and POWER_OFF commands call do_exit(0) after the respective
+ *   kernel_halt() or kernel_power_off() functions, which means the syscall
+ *   code path does not return normally.
+ *
+ *   For containers using PID namespaces, this syscall provides namespace-
+ *   aware reboot semantics introduced in Linux 3.4. Container runtimes
+ *   can use this to implement container restart/shutdown commands.
+ *
+ * since-version: 1.0
  */
 SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		void __user *, arg)
