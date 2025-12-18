@@ -4582,14 +4582,266 @@ static int do_tkill(pid_t tgid, pid_t pid, int sig)
 }
 
 /**
- *  sys_tgkill - send signal to one specific thread
- *  @tgid: the thread group ID of the thread
- *  @pid: the PID of the thread
- *  @sig: signal to be sent
+ * sys_tgkill - send signal to one specific thread with thread group verification
+ * @tgid: the thread group ID (process ID) containing the target thread
+ * @pid: the thread ID (TID) of the target thread within the thread group
+ * @sig: signal number to send, or 0 for existence/permission check
  *
- *  This syscall also checks the @tgid and returns -ESRCH even if the PID
- *  exists but it's not belonging to the target process anymore. This
- *  method solves the problem of threads exiting and PIDs getting reused.
+ * long-desc: Sends a signal to a specific thread identified by both its thread
+ *   group ID (TGID, which is the process ID) and its thread ID (TID). This
+ *   syscall provides a race-condition-free alternative to tkill() by verifying
+ *   that the target thread still belongs to the expected thread group before
+ *   delivering the signal.
+ *
+ *   The key advantage over tkill() is protection against TID recycling: if a
+ *   thread terminates and its TID is assigned to a new thread in a different
+ *   process, tgkill() will return -ESRCH because the TGID won't match. This
+ *   prevents accidentally signaling unintended targets.
+ *
+ *   The signal is delivered directly to the specified thread's private pending
+ *   signal queue (not the process-wide shared queue). The signal information
+ *   (siginfo_t) passed to the target's signal handler will have si_code set
+ *   to SI_TKILL (-6), si_pid set to the caller's thread group ID (TGID), and
+ *   si_uid set to the caller's real UID.
+ *
+ *   When @sig is 0 (the null signal), no signal is sent, but existence and
+ *   permission checks are still performed. This can be used to verify that
+ *   a thread exists in the specified thread group and the caller has
+ *   permission to signal it.
+ *
+ *   Permission to send a signal requires one of the following:
+ *   1. The caller and target are in the same thread group (same process).
+ *   2. The caller has the CAP_KILL capability in the target's user namespace.
+ *   3. The caller's real or effective UID matches the target's real or saved
+ *      set-user-ID.
+ *
+ *   Exception: SIGCONT can always be sent to any thread in the same session
+ *   as the caller, regardless of UID matching.
+ *
+ *   For standard signals (1-31), if the same signal is already pending for
+ *   the target thread, no additional signal is queued (standard signals do
+ *   not stack). For real-time signals (SIGRTMIN to SIGRTMAX), each signal
+ *   is queued individually and delivered in order, subject to the
+ *   RLIMIT_SIGPENDING resource limit.
+ *
+ *   This syscall is the preferred method for thread-directed signal delivery
+ *   and is used internally by pthread_kill() and pthread_cancel() in glibc's
+ *   NPTL implementation.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: tgid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, PID_MAX_LIMIT
+ *   constraint: Thread group ID (TGID/PID) of the process containing the target
+ *     thread. Must be a positive integer; values <= 0 are rejected with EINVAL.
+ *     The TGID is interpreted within the caller's PID namespace. For a
+ *     single-threaded process, the TGID equals the process's PID. For
+ *     multi-threaded processes, the TGID equals the PID of the thread group
+ *     leader (the initial thread that called clone() to create other threads).
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 1, PID_MAX_LIMIT
+ *   constraint: Thread ID (TID) of the target thread within the thread group.
+ *     Must be a positive integer; values <= 0 are rejected with EINVAL.
+ *     The TID is interpreted within the caller's PID namespace. Note: despite
+ *     the parameter name "pid", this is semantically a TID. For single-threaded
+ *     processes, TID equals TGID. For multi-threaded processes, each thread
+ *     has a unique TID assigned at creation via clone().
+ *
+ * param: sig
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, _NSIG
+ *   constraint: Signal number from 0 to _NSIG (typically 64). Signal 0 is
+ *     the null signal used for existence/permission checking only. Standard
+ *     signals are 1-31, real-time signals are SIGRTMIN (32) to SIGRTMAX (64).
+ *     Invalid signal numbers cause EINVAL to be returned.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the signal was successfully queued
+ *     for delivery to the target thread (or for sig == 0, that the thread
+ *     exists in the specified thread group and is signalable). Note that
+ *     success does not guarantee the signal will be delivered; the target
+ *     may have blocked or ignored it, or may be an init process protected
+ *     from signals it hasn't explicitly handled.
+ *
+ * error: EINVAL, Invalid thread group ID, thread ID, or signal number
+ *   desc: Returned if @tgid is less than or equal to 0, if @pid is less than
+ *     or equal to 0, or if @sig is greater than _NSIG (typically 64). Both
+ *     @tgid and @pid must be valid positive identifiers. Unlike kill(),
+ *     tgkill() does not accept special values like -1 or process group IDs.
+ *
+ * error: ESRCH, No such thread or thread group mismatch
+ *   desc: Returned in one of these conditions: (1) No thread with the
+ *     specified TID exists in the caller's PID namespace. (2) A thread with
+ *     the specified TID exists but does not belong to the thread group
+ *     identified by @tgid. This second case is the key protection tgkill()
+ *     provides against TID recycling races. The thread may have terminated
+ *     and its TID recycled to a thread in a different process.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller lacks permission to signal the target thread. Permission
+ *     requires either: (1) being in the same thread group, (2) CAP_KILL
+ *     capability in the target's user namespace, or (3) real/effective UID
+ *     matching target's real/saved-set-UID. For SIGCONT, same session
+ *     membership is also sufficient. This error is returned after verifying
+ *     the thread exists in the specified thread group but before attempting
+ *     signal delivery.
+ *
+ * error: EACCES, LSM security module denied the signal
+ *   desc: A Linux Security Module (SELinux, AppArmor, Smack, or Landlock)
+ *     denied permission to send the signal via the security_task_kill() hook.
+ *     This check occurs after standard Unix permission checks pass. The
+ *     specific error code may vary by LSM; some modules use EPERM instead.
+ *
+ * error: EAGAIN, Signal queue limit exceeded
+ *   desc: The target thread's pending signal queue is full, exceeding the
+ *     RLIMIT_SIGPENDING resource limit. This error only occurs for real-time
+ *     signals (SIGRTMIN to SIGRTMAX) that must be queued. Standard signals
+ *     (1-31) never return EAGAIN; they either coalesce with an existing
+ *     pending signal or are delivered without queueing additional siginfo.
+ *     Also returned if kernel memory allocation for the signal queue entry
+ *     fails under memory pressure.
+ *
+ * error: ENOMEM, Audit subsystem memory allocation failed
+ *   desc: When audit is enabled, the kernel may need to allocate memory to
+ *     record signal delivery information. If this allocation fails, -ENOMEM
+ *     is returned. This is rare and only occurs when: (1) audit is enabled,
+ *     (2) multiple target PIDs are being tracked in a single syscall context,
+ *     and (3) kernel memory is exhausted. Most tgkill() calls will not
+ *     encounter this error.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held during thread lookup via find_task_by_vpid()
+ *     and during permission checking in check_kill_permission(). Also held
+ *     when accessing task credentials. The lock is held across both the
+ *     lookup and permission check phases but released before signal delivery.
+ *     Protects against task_struct being freed during lookup.
+ *
+ * lock: sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Per-thread signal handler spinlock acquired via lock_task_sighand()
+ *     when delivering the signal in do_send_sig_info(). Acquired with
+ *     interrupts disabled (spin_lock_irqsave). Protects the pending signal
+ *     queue and signal handler state. If this lock cannot be acquired (thread
+ *     exiting with sighand == NULL), the syscall succeeds anyway as the thread
+ *     is considered to have received the signal just before termination.
+ *
+ * signal: Signal delivery to target thread
+ *   direction: KAPI_SIGNAL_SEND
+ *   action: KAPI_SIGNAL_ACTION_QUEUE
+ *   condition: Valid signal number (sig > 0) and permission granted
+ *   desc: The specified signal is queued to the target thread's private
+ *     pending signal queue (not the process-wide shared queue). The siginfo_t
+ *     has si_code set to SI_TKILL, si_pid set to caller's TGID, and si_uid
+ *     set to caller's real UID. The target thread is woken if it was sleeping
+ *     in an interruptible state and the signal is not blocked.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Target thread identified by @tgid:@pid
+ *   desc: Queues the signal to the target thread's pending signal set and
+ *     may wake the thread. For SIGKILL, the thread is woken unconditionally
+ *     and marked for termination (though only affects the specific thread,
+ *     not the entire process unless sent to all threads). For SIGSTOP and
+ *     other stop signals, process group stop machinery may be initiated.
+ *   condition: sig > 0 and permission granted
+ *   reversible: no (signal delivery cannot be undone once queued)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: Target thread signal state
+ *   desc: For SIGCONT, any pending stop signals (SIGSTOP, SIGTSTP, SIGTTIN,
+ *     SIGTTOU) are removed from both the thread's private queue and the
+ *     process shared queue. For stop signals, any pending SIGCONT is removed.
+ *     This mutual exclusion ensures consistent thread/process state.
+ *   condition: sig is SIGCONT or a stop signal
+ *   reversible: yes (by sending the opposite signal)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Target thread
+ *   desc: The target thread may be woken from interruptible sleep to process
+ *     the signal. For SIGKILL or SIGSTOP, the thread is woken unconditionally.
+ *     For other signals, the thread is woken only if the signal is not blocked
+ *     and not ignored. Uses signal_wake_up() internally.
+ *   condition: sig > 0 and signal not blocked/ignored
+ *   reversible: yes (thread returns to prior state after signal handling)
+ *
+ * capability: CAP_KILL
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Sending signals to any thread in the target's user namespace
+ *     without requiring UID matching or same-thread-group membership
+ *   without: Must be in same thread group, or have real/effective UID matching
+ *     target's real/saved UID, or for SIGCONT, same session membership
+ *   condition: Checked in kill_ok_by_cred() via ns_capable() against the
+ *     target thread's user namespace
+ *
+ * constraint: PID namespace isolation
+ *   desc: Both @tgid and @pid arguments are interpreted within the caller's
+ *     PID namespace. A thread can only signal threads visible in its PID
+ *     namespace or descendant namespaces. PID/TID translation is handled by
+ *     find_task_by_vpid() and task_tgid_vnr(). Cross-namespace signaling
+ *     requires the target to be in the caller's namespace or a descendant.
+ *
+ * constraint: Init process protection
+ *   desc: The init process (PID 1) and threads within container init processes
+ *     can only receive signals for which they have installed explicit handlers.
+ *     SIGKILL and SIGSTOP sent to init threads are silently dropped unless
+ *     forced by the kernel or sent from an ancestor PID namespace. Threads
+ *     with the SIGNAL_UNKILLABLE flag have similar protection.
+ *
+ * constraint: RLIMIT_SIGPENDING for real-time signals
+ *   desc: For real-time signals (SIGRTMIN-SIGRTMAX), the number of pending
+ *     signals is limited by the sender's RLIMIT_SIGPENDING resource limit.
+ *     When this limit is exceeded, sigqueue_alloc() fails and -EAGAIN is
+ *     returned. Standard signals bypass this limit by coalescing with
+ *     existing pending signals of the same type.
+ *
+ * examples:
+ *   tgkill(getpid(), gettid(), SIGUSR1);  // Signal self (always safe)
+ *   tgkill(child_pid, child_tid, SIGTERM); // Signal specific child thread
+ *   tgkill(tgid, tid, 0);  // Check if thread exists in thread group
+ *   tgkill(1, 1, SIGTERM); // Signal init (requires CAP_KILL or UID match)
+ *
+ * notes:
+ *   - RECOMMENDED: Always use tgkill() instead of tkill() to avoid TID
+ *     recycling race conditions. The tgkill() syscall verifies both the
+ *     thread group ID and thread ID before delivering the signal.
+ *   - Available since Linux 2.5.75. Glibc wrapper added in version 2.30.
+ *   - Linux-specific; not portable to other Unix systems; not POSIX.
+ *   - The pthread_kill() and pthread_cancel() functions in glibc internally
+ *     use tgkill(), not tkill().
+ *   - A kernel memory info leak via tkill/tgkill was fixed in commit
+ *     b9e146d8eb3b9 (kernel 3.10): the si_ptr field could leak kernel memory
+ *     to compat (32-bit) processes receiving signals from 64-bit processes.
+ *   - For kernel threads (PF_KTHREAD), signals are silently ignored unless
+ *     the kernel explicitly enables signal handling for that thread.
+ *   - When the target thread is in the middle of exec() via de_thread(), the
+ *     signal may be delivered to the new thread group leader instead.
+ *   - If lock_task_sighand() fails because the thread is exiting, the syscall
+ *     returns success (0) as the thread is considered to have received the
+ *     signal just before death.
+ *   - Real-time signals sent via tgkill() include full siginfo (unlike kill()
+ *     which may drop siginfo under memory pressure for RT signals).
+ *   - The original design goal (LWN 2003) was that tgkill could theoretically
+ *     replace kill() and tkill() using special -1 values, but this flexibility
+ *     was not implemented; both tgid and pid must be positive.
+ *
+ * since-version: 2.5.75
  */
 SYSCALL_DEFINE3(tgkill, pid_t, tgid, pid_t, pid, int, sig)
 {
