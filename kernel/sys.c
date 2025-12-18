@@ -2906,6 +2906,103 @@ SYSCALL_DEFINE3(setresgid, gid_t, rgid, gid_t, egid, gid_t, sgid)
 	return __sys_setresgid(rgid, egid, sgid);
 }
 
+/**
+ * sys_getresgid - Get the real, effective, and saved group IDs
+ * @rgidp: Pointer to store the real group ID
+ * @egidp: Pointer to store the effective group ID
+ * @sgidp: Pointer to store the saved set-group-ID
+ *
+ * long-desc: Retrieves the real group ID, effective group ID, and saved
+ *   set-group-ID of the calling process, storing them in the locations
+ *   pointed to by @rgidp, @egidp, and @sgidp respectively. The GIDs are
+ *   translated from the kernel's internal representation to the caller's
+ *   user namespace. This syscall is the counterpart to setresgid(2).
+ *
+ *   The real GID identifies the group of the user who owns the process and
+ *   is inherited from the parent process. The effective GID determines the
+ *   process's group permissions for file access and other operations. The
+ *   saved set-group-ID allows a set-group-ID program to temporarily drop
+ *   group privileges and later regain them.
+ *
+ *   If a GID has no mapping in the caller's user namespace (which can happen
+ *   when a process enters a user namespace where its GIDs are not mapped),
+ *   the overflow GID (typically 65534, configured via /proc/sys/kernel/overflowgid)
+ *   is returned instead. This "munging" ensures the syscall never fails due
+ *   to unmapped GIDs.
+ *
+ * context-flags: KAPI_CTX_PROCESS
+ *
+ * param: rgidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a gid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * param: egidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a gid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * param: sgidp
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must be a valid user-space pointer to a gid_t (4 bytes). Cannot
+ *     be NULL. The memory must be writable by the calling process.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success. The real, effective, and saved GIDs are written
+ *     to the locations pointed to by @rgidp, @egidp, and @sgidp respectively.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: One of @rgidp, @egidp, or @sgidp points to an address outside the
+ *     process's accessible address space, or the memory is not writable. The
+ *     pointers are validated sequentially (rgidp first, then egidp, then sgidp),
+ *     so if EFAULT is returned, some values may have been written while others
+ *     were not. Specifically, if @egidp fails, @rgidp has already been written;
+ *     if @sgidp fails, both @rgidp and @egidp have been written.
+ *
+ * examples: gid_t rgid, egid, sgid;
+ *   getresgid(&rgid, &egid, &sgid);  // Retrieve all three GIDs
+ *   if (egid != rgid) { ... }  // Running with elevated group privileges
+ *   if (sgid == 0) { ... }  // Can regain root group privileges via setresgid
+ *
+ * notes: This syscall requires no special capabilities; any process can read
+ *   its own group IDs.
+ *
+ *   The syscall originated in Linux 2.1.44 and is also available on HP-UX
+ *   and FreeBSD (since 4.2). It is NOT part of any POSIX standard.
+ *
+ *   The syscall number is 120 on x86-64, 171 (16-bit getresgid16) and 211
+ *   (32-bit getresgid32) on i386, and 150 in the generic syscall table.
+ *
+ *   On 32-bit platforms with 16-bit GID support (CONFIG_UID16), a separate
+ *   getresgid16 syscall exists. GIDs larger than 65535 are truncated to the
+ *   overflow GID (65534) by the high2lowgid() macro.
+ *
+ *   This syscall does not acquire any locks. The credentials are accessed via
+ *   current_cred() which uses RCU-protected access to the current task
+ *   credentials. Since a task can only modify its own credentials (via
+ *   set*gid syscalls), this access is inherently safe without additional
+ *   synchronization.
+ *
+ *   Unlike setresgid(2), this syscall has no interaction with LSM modules,
+ *   capability checks, or user namespace restrictions (beyond GID mapping).
+ *
+ *   Threading: At the kernel level, GIDs are per-thread. However, POSIX
+ *   requires all threads to share credentials. The glibc wrapper for
+ *   setresgid(2) uses signal-based synchronization to ensure all threads
+ *   see consistent credentials. Since getresgid only reads, no such
+ *   synchronization is needed for this syscall.
+ *
+ * since-version: 2.1.44
+ */
 SYSCALL_DEFINE3(getresgid, gid_t __user *, rgidp, gid_t __user *, egidp, gid_t __user *, sgidp)
 {
 	const struct cred *cred = current_cred();
