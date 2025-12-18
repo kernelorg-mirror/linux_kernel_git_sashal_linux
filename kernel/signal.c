@@ -3168,7 +3168,197 @@ out:
  */
 
 /**
- *  sys_restart_syscall - restart a system call
+ * sys_restart_syscall - restart a system call after signal interruption
+ *
+ * long-desc: Restarts a system call that was interrupted by a signal and needs
+ *   special handling for its restart. This syscall is NEVER called directly by
+ *   user applications - it is invoked automatically by the kernel's signal
+ *   delivery mechanism when a syscall returns -ERESTART_RESTARTBLOCK.
+ *
+ *   The restart mechanism exists to handle syscalls like nanosleep(), poll(),
+ *   futex(), and clock_nanosleep() that need to adjust their behavior when
+ *   restarted after a signal. Unlike simple syscalls that can be restarted by
+ *   re-executing with the original arguments (handled via -ERESTARTSYS), these
+ *   syscalls need to account for time that elapsed during signal handling.
+ *
+ *   When a syscall like nanosleep() is interrupted by a signal:
+ *   1. The syscall stores restart information in current->restart_block,
+ *      including a pointer to a restart handler function (restart_block.fn)
+ *   2. The syscall returns -ERESTART_RESTARTBLOCK (516)
+ *   3. If the signal has a handler, that handler executes
+ *   4. When returning from the signal handler, the kernel replaces the return
+ *      value with the syscall number for restart_syscall (__NR_restart_syscall)
+ *   5. The kernel decrements the instruction pointer to re-execute the syscall
+ *      instruction, but now it invokes restart_syscall instead
+ *   6. restart_syscall calls the registered restart handler function, which
+ *      resumes the original operation with adjusted parameters
+ *
+ *   The restart_block structure contains a union with operation-specific data:
+ *   - futex: stores uaddr, val, flags, bitset, time, uaddr2 for futex_wait
+ *   - nanosleep: stores clockid, type, rmtp/compat_rmtp, expires for sleep ops
+ *   - poll: stores ufds, nfds, has_timeout, tv_sec, tv_nsec for poll()
+ *
+ *   For nanosleep and similar time-based syscalls, the restart handler uses
+ *   the absolute expiration time stored in restart_block rather than the
+ *   original relative duration. This ensures the process sleeps only for the
+ *   remaining time, accounting for time spent in the signal handler. This
+ *   behavior is required by POSIX which specifies that nanosleep() must not
+ *   return early due to signals if no handler is registered.
+ *
+ *   The restart_block.fn pointer defaults to do_no_restart_syscall() which
+ *   simply returns -EINTR. This ensures that if userspace erroneously calls
+ *   restart_syscall without a valid restart block, or after sigreturn() has
+ *   cleared the restart block, the call fails gracefully with EINTR.
+ *
+ *   Security note: Since kernel 6.3, nanosleep and related syscalls initialize
+ *   restart_block.fn to do_no_restart_syscall at entry to prevent union field
+ *   confusion if restart_syscall is called after a different syscall (like
+ *   futex or poll) had set up a restart block.
+ *
+ *   Architecture note: On x86-64, the syscall number is 219. On i386, it is 0
+ *   (replacing the original setup() syscall). The kernel handles 32-bit
+ *   compatibility via TS_COMPAT_RESTART flag and __NR_ia32_restart_syscall.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: depends on restart handler
+ *   desc: The return value is determined entirely by the restart handler
+ *     function stored in restart_block.fn. Common return values include:
+ *     - 0: The restarted operation completed successfully (e.g., sleep expired)
+ *     - Positive value: Operation-specific success (e.g., poll returns count)
+ *     - -EINTR: The restart handler was do_no_restart_syscall, or the restarted
+ *       operation was interrupted again by a signal with a handler
+ *     - -EFAULT: The restart handler accessed invalid user memory (e.g., rmtp
+ *       pointer in nanosleep became invalid)
+ *     - -ETIMEDOUT: For futex operations that timed out
+ *     - -EWOULDBLOCK: For futex operations where the value changed
+ *     - Any other error from the specific restart handler
+ *
+ * error: EINTR, No valid restart block or interrupted again
+ *   desc: Returned by do_no_restart_syscall() when restart_block.fn was not
+ *     set to a valid restart handler. This occurs when: (1) userspace calls
+ *     restart_syscall directly without a pending restart, (2) sigreturn()
+ *     cleared the restart block, (3) another syscall overwrote the restart
+ *     block, or (4) the restarted operation was interrupted by another signal.
+ *     This is the most common error and indicates the original operation
+ *     should be considered interrupted.
+ *
+ * error: EFAULT, Invalid user-space pointer in restart block
+ *   desc: Returned by restart handlers (e.g., hrtimer_nanosleep_restart,
+ *     do_restart_poll) when user-space pointers stored in the restart block
+ *     have become invalid. For nanosleep, this occurs if the rmtp pointer for
+ *     writing remaining time is no longer accessible. For poll, this occurs if
+ *     the ufds array is no longer accessible. This can happen if the user
+ *     unmapped the memory during signal handling.
+ *
+ * error: ETIMEDOUT, Futex wait operation timed out
+ *   desc: Returned by futex_wait_restart() when the restarted futex wait
+ *     operation times out without being woken by futex_wake(). The timeout
+ *     is based on the absolute time stored in restart_block.futex.time.
+ *
+ * error: EWOULDBLOCK, Futex value mismatch
+ *   desc: Returned by futex_wait_restart() when the futex value at uaddr has
+ *     changed from the expected value stored in restart_block.futex.val.
+ *     This indicates the waited condition may have been satisfied.
+ *
+ * error: ERESTART_RESTARTBLOCK, Another restart needed
+ *   desc: Returned by restart handlers (e.g., hrtimer_nanosleep_restart,
+ *     do_restart_poll) when the restarted operation is again interrupted by
+ *     a stop signal (SIGSTOP, SIGTSTP, etc.) followed by SIGCONT. In this case,
+ *     the restart_block is updated with new parameters and this error code
+ *     triggers another restart_syscall invocation when the process resumes.
+ *     This is an internal kernel error code that is never seen by userspace.
+ *
+ * signal: Any signal during restart handler execution
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RESTART
+ *   condition: Signal delivered while restart handler is sleeping
+ *   desc: The restart handlers (nanosleep, futex, poll) perform blocking
+ *     operations that can be interrupted by signals. If interrupted by a stop
+ *     signal followed by SIGCONT, the handler returns -ERESTART_RESTARTBLOCK
+ *     to trigger another restart. If interrupted by a signal with a handler,
+ *     the kernel converts this to -EINTR or allows restart depending on the
+ *     SA_RESTART flag. The key purpose of restart_syscall is to ensure that
+ *     time spent stopped (SIGSTOP/SIGTSTP then SIGCONT) is properly accounted
+ *     for in timeout calculations.
+ *   error: -EINTR, -ERESTART_RESTARTBLOCK
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: yes (via this syscall)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: current->restart_block
+ *   desc: Restart handlers may modify the restart_block to prepare for another
+ *     potential restart. For example, hrtimer_nanosleep_restart() updates the
+ *     nanosleep.expires field with the new absolute expiration time. After
+ *     successful completion, sigreturn() typically resets restart_block.fn to
+ *     do_no_restart_syscall to invalidate the restart block.
+ *   reversible: yes (via sigreturn or another syscall)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: calling thread
+ *   desc: Restart handlers like hrtimer_nanosleep_restart(), do_restart_poll(),
+ *     and futex_wait_restart() cause the calling thread to sleep until their
+ *     completion condition is met (timeout expires, poll events occur, futex
+ *     is woken, etc.). This can cause the thread to be descheduled for
+ *     significant periods.
+ *   reversible: yes (when handler returns)
+ *
+ * state-trans: restart_block
+ *   from: fn points to valid restart handler (e.g., hrtimer_nanosleep_restart)
+ *   to: fn points to do_no_restart_syscall (after sigreturn completes)
+ *   condition: Normal completion of signal handling sequence
+ *   desc: The restart_block is set up by the original syscall when it returns
+ *     -ERESTART_RESTARTBLOCK. After the signal is handled and sigreturn()
+ *     returns, the restart_block.fn is reset to do_no_restart_syscall by the
+ *     arch-specific sigreturn implementation to prevent stale restart data
+ *     from being used by a subsequent erroneous restart_syscall call.
+ *
+ * constraint: Kernel-internal use only
+ *   desc: This syscall should NEVER be called directly by applications. It is
+ *     invoked automatically by the kernel's signal handling mechanism. Direct
+ *     calls will either return -EINTR (if restart_block.fn is the default
+ *     do_no_restart_syscall) or produce undefined behavior if a stale restart
+ *     block from a previous syscall is present. There is no glibc wrapper for
+ *     this syscall.
+ *
+ * constraint: Valid restart_block required
+ *   desc: The syscall relies on current->restart_block being properly
+ *     initialized by a previous syscall that returned -ERESTART_RESTARTBLOCK.
+ *     The restart_block.fn pointer must point to a valid restart handler
+ *     function, and the union fields must contain valid data for that handler.
+ *     If these conditions are not met, behavior is undefined (though typically
+ *     results in -EINTR or crashes in the restart handler).
+ *
+ * examples:
+ *   // This syscall is NEVER called directly. Example of kernel-internal flow:
+ *   // 1. User calls: nanosleep(&req, &rem);
+ *   // 2. nanosleep() is interrupted by SIGSTOP, then resumed by SIGCONT
+ *   // 3. Kernel automatically invokes restart_syscall() to continue sleeping
+ *   // 4. hrtimer_nanosleep_restart() calculates remaining time and sleeps
+ *   // 5. Returns 0 when sleep completes, or remaining time written to rem
+ *
+ * notes:
+ *   - Introduced in Linux 2.5.51 to solve the nanosleep POSIX compliance issue.
+ *     Prior to this, nanosleep could not properly account for time spent in
+ *     signal handlers or stopped state.
+ *   - The syscall number varies by architecture: 219 on x86-64, 0 on i386
+ *     (replacing the obsolete setup() syscall), 128 on generic architectures.
+ *   - Applications that use ptrace to trace syscalls will see restart_syscall
+ *     invocations after SIGSTOP/SIGCONT sequences during blocking operations.
+ *     This is normal and expected behavior.
+ *   - The kernel selftests in tools/testing/selftests/seccomp/seccomp_bpf.c
+ *     include tests that verify restart_syscall is correctly invoked after
+ *     SIGSTOP/SIGCONT interrupts nanosleep.
+ *   - seccomp filters can intercept restart_syscall. The seccomp test suite
+ *     demonstrates using SECCOMP_RET_TRACE to observe restart_syscall(0x200).
+ *   - Race condition note: A security fix in kernel 6.3 (commit 9f76d59173d9d)
+ *     addressed potential union confusion where nanosleep could clobber futex
+ *     or poll restart data if restart_syscall was erroneously called.
+ *
+ * since-version: 2.5.51
  */
 SYSCALL_DEFINE0(restart_syscall)
 {
