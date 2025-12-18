@@ -3024,11 +3024,229 @@ SYSCALL_DEFINE3(getresgid, gid_t __user *, rgidp, gid_t __user *, egidp, gid_t _
 }
 
 
-/*
- * "setfsuid()" sets the fsuid - the uid used for filesystem checks. This
- * is used for "access()" and for the NFS daemon (letting nfsd stay at
- * whatever uid it wants to). It normally shadows "euid", except when
- * explicitly set by setfsuid() or for access..
+/**
+ * sys_setfsuid - Set the filesystem user ID of the calling process
+ * @uid: New filesystem user ID to set
+ *
+ * long-desc: Sets the filesystem user ID (fsuid) of the calling process.
+ *   The fsuid is the user ID that the kernel uses when checking permissions
+ *   for filesystem operations (file access, creation, modification, etc.),
+ *   while the effective user ID is used for most other permission checks.
+ *
+ *   Normally the fsuid automatically shadows the effective user ID - whenever
+ *   the euid changes, the fsuid changes to match it. The setfsuid() syscall
+ *   allows a process to explicitly set its fsuid to a different value,
+ *   creating a divergence between fsuid and euid.
+ *
+ *   The primary historical use case is the NFS server daemon (nfsd), which
+ *   needs to access files on behalf of different users without changing its
+ *   actual effective user ID. By using setfsuid(), nfsd can change only its
+ *   filesystem access identity while keeping its effective UID (and thus
+ *   its ability to receive signals, etc.) unchanged.
+ *
+ *   Permission model:
+ *   - The fsuid may be set to any value that equals the current real UID,
+ *     effective UID, saved set-user-ID, or the current fsuid itself
+ *   - With CAP_SETUID capability, the fsuid may be set to any UID that has
+ *     a valid mapping in the caller's user namespace
+ *   - If these conditions are not met, the call silently fails
+ *
+ *   CRITICAL DESIGN FLAW: Unlike most syscalls, setfsuid() ALWAYS returns
+ *   the previous filesystem user ID, regardless of whether the call succeeded
+ *   or failed. This makes it impossible to directly determine if the call
+ *   succeeded. To check for success, the caller must make a subsequent call
+ *   to setfsuid(-1) (which always fails since -1 is an invalid UID) and
+ *   verify that it returns the expected new fsuid value.
+ *
+ *   User namespace support: The @uid value is interpreted in the context of
+ *   the caller's user namespace. It is converted to a kernel-internal kuid_t
+ *   using make_kuid(). If @uid has no mapping in the caller's user namespace,
+ *   the call silently fails (returns the old fsuid without making changes).
+ *
+ *   Capability side effects: When the fsuid changes, the commoncap LSM
+ *   adjusts filesystem-related capabilities via cap_task_fix_setuid() with
+ *   LSM_SETID_FS flag:
+ *   - If transitioning from fsuid == 0 (root) to fsuid != 0, the CAP_FS_SET
+ *     capabilities (CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH,
+ *     CAP_FOWNER, CAP_FSETID, CAP_MKNOD, CAP_LINUX_IMMUTABLE) are dropped
+ *     from the effective capability set
+ *   - If transitioning from fsuid != 0 to fsuid == 0 (root), the CAP_FS_SET
+ *     capabilities are raised in the effective set (from permitted caps)
+ *   These adjustments can be suppressed by setting SECURE_NO_SETUID_FIXUP
+ *   in the securebits via prctl(PR_SET_SECUREBITS).
+ *
+ *   DEPRECATION NOTE: This syscall is considered obsolete and should be
+ *   avoided in new applications. The original motivation (avoiding signal
+ *   delivery to processes with the same euid) was eliminated in Linux 2.0
+ *   when the signal delivery rules changed. Modern applications should use
+ *   setresuid(2) or setreuid(2) instead, or rely on the automatic fsuid
+ *   tracking of euid changes.
+ *
+ *   This syscall is only available when CONFIG_MULTIUSER is enabled.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: uid
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid UID that the caller has permission to set.
+ *     For unprivileged callers (without CAP_SETUID), must equal the current
+ *     real UID, effective UID, saved set-user-ID, or current filesystem UID.
+ *     For privileged callers (with CAP_SETUID), may be any UID that has a
+ *     mapping in the caller's user namespace. The value (uid_t)-1 is NOT
+ *     valid and will cause the call to silently fail (it fails uid_valid()).
+ *
+ * return:
+ *   type: KAPI_TYPE_UINT
+ *   check-type: KAPI_RETURN_CUSTOM
+ *   success: Previous filesystem UID
+ *   desc: ALWAYS returns the previous filesystem user ID of the calling
+ *     process, regardless of whether the call succeeded or failed. This is
+ *     a known design flaw documented in the man page. The returned value is
+ *     the fsuid translated to the caller's user namespace via from_kuid_munged().
+ *     If the fsuid has no mapping in the caller's namespace, the overflow UID
+ *     (typically 65534) is returned instead.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process credential filesystem UID (fsuid)
+ *   desc: Updates the calling process's filesystem user ID if all permission
+ *     checks pass. The credentials are atomically replaced via RCU in
+ *     commit_creds(). Only the fsuid field is modified; real UID, effective
+ *     UID, and saved set-user-ID remain unchanged.
+ *   condition: Permission check passes (uid matches uid/euid/suid/fsuid or
+ *     caller has CAP_SETUID) AND uid is valid in caller's namespace AND
+ *     LSM hook approves AND new fsuid differs from old fsuid
+ *   reversible: yes, by calling setfsuid() with the previous fsuid value
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process effective capabilities (CAP_FS_SET)
+ *   desc: The commoncap LSM adjusts filesystem-related capabilities when
+ *     fsuid transitions to or from root (UID 0 in the namespace). When
+ *     dropping from fsuid==0 to fsuid!=0, CAP_FS_SET (CAP_CHOWN, CAP_MKNOD,
+ *     CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID,
+ *     CAP_LINUX_IMMUTABLE) is dropped from effective caps. When raising
+ *     from fsuid!=0 to fsuid==0, CAP_FS_SET is raised (from permitted caps).
+ *   condition: fsuid changes AND involves root AND SECURE_NO_SETUID_FIXUP
+ *     is not set in securebits
+ *   reversible: partially, caps can be regained by setting fsuid back to 0
+ *     if permitted caps still include them
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Process dumpability flag
+ *   desc: If the filesystem UID changes, the process's dumpability may be
+ *     affected. In commit_creds(), if fsuid differs from the old value,
+ *     set_dumpable() is called with the suid_dumpable sysctl value,
+ *     potentially making the process non-dumpable. Also, pdeath_signal is
+ *     cleared to 0 to prevent security issues from signal delivery after
+ *     credential changes.
+ *   condition: Filesystem UID changes
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Keyring state (via key_fsuid_changed)
+ *   desc: If the filesystem UID changes, key_fsuid_changed() is called to
+ *     update the ownership of the thread keyring to match the new fsuid.
+ *     The thread keyring's uid field is set to the new fsuid. This ensures
+ *     proper key access control after credential changes.
+ *   condition: Filesystem UID changes (CONFIG_KEYS enabled)
+ *   reversible: no
+ *
+ * side-effect: KAPI_EFFECT_NETWORK
+ *   target: Process connector notification (PROC_EVENT_UID)
+ *   desc: If the filesystem UID changes, a PROC_EVENT_UID notification is
+ *     sent via the process connector (proc_id_connector). This allows
+ *     userspace processes monitoring the connector socket to be notified
+ *     of credential changes.
+ *   condition: Filesystem UID changes (CONFIG_PROC_EVENTS enabled)
+ *   reversible: no
+ *
+ * state-trans: credentials
+ *   from: original credential state with old fsuid
+ *   to: new credential state with updated fsuid
+ *   condition: All permission checks pass
+ *   desc: The process credentials atomically transition from the old state
+ *     to the new state via commit_creds(). The old credentials are released
+ *     via put_cred_many(). RCU is used to ensure safe concurrent access to
+ *     credentials by other kernel code (via rcu_assign_pointer).
+ *
+ * capability: CAP_SETUID
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Setting the filesystem UID to any valid UID in the caller's
+ *     user namespace, regardless of the current real UID, effective UID,
+ *     saved set-user-ID, or current filesystem UID.
+ *   without: Can only set fsuid to a value that equals the current real UID,
+ *     effective UID, saved set-user-ID, or current filesystem UID. Attempts
+ *     to set to other values silently fail.
+ *   condition: Checked via ns_capable_setid(old->user_ns, CAP_SETUID) which
+ *     verifies the capability in the credentials' user namespace and sets
+ *     PF_SUPERPRIV flag on the task if capability is used.
+ *
+ * constraint: User namespace UID mapping
+ *   desc: The @uid parameter must have a valid mapping in the caller's user
+ *     namespace. The conversion via make_kuid() must produce a valid kuid_t
+ *     (not INVALID_UID). In the initial user namespace, all 32-bit UID values
+ *     are valid except (uid_t)-1. In other user namespaces, only UIDs that
+ *     have been explicitly mapped via /proc/[pid]/uid_map are valid. If the
+ *     UID is not valid, the call silently fails.
+ *   expr: uid_valid(make_kuid(current_user_ns(), uid))
+ *
+ * constraint: LSM policy (SafeSetID)
+ *   desc: If the SafeSetID LSM is enabled, the UID transition must be
+ *     explicitly allowed in the SafeSetID policy. SafeSetID calls the
+ *     security_task_fix_setuid() hook and can deny the operation. Unlike
+ *     other setid syscalls, if SafeSetID denies a setfsuid() call, the
+ *     process is NOT killed (SafeSetID only kills on setuid/setreuid/setresuid
+ *     denials, not setfsuid). The call simply silently fails.
+ *
+ * constraint: CONFIG_MULTIUSER kernel configuration
+ *   desc: This syscall is only available when the kernel is built with
+ *     CONFIG_MULTIUSER=y. This option is enabled by default and is required
+ *     for multi-user systems. Embedded systems may disable it to save space,
+ *     in which case this syscall is not available.
+ *
+ * examples: uid_t old_fsuid = setfsuid(1000);  // Try to set fsuid to 1000
+ *   if (setfsuid(-1) != 1000) { handle_error(); }  // Verify success
+ *   setfsuid(getuid());  // Set fsuid to real UID
+ *   setfsuid(0);  // Set fsuid to root (requires CAP_SETUID or uid/euid/suid==0)
+ *
+ * notes: SILENT FAILURE WARNING: This syscall silently fails in several cases:
+ *   the uid is not valid in the callers user namespace (uid_valid() fails),
+ *   memory allocation fails in prepare_creds(), permission check fails (uid
+ *   does not match and no CAP_SETUID), or LSM hook denies the operation
+ *   (security_task_fix_setuid() returns non-zero). In ALL these cases, the
+ *   syscall returns the old fsuid without any error indication. Always verify
+ *   success by checking with setfsuid(-1).
+ *
+ *   The syscall number is 122 on x86-64, 138 (16-bit setfsuid16) and 215
+ *   (32-bit setfsuid32) on i386, and 151 in the generic syscall table.
+ *
+ *   On 32-bit platforms with 16-bit UID support (CONFIG_UID16), a separate
+ *   setfsuid16 syscall exists that uses old_uid_t (16-bit). UIDs are converted
+ *   via low2highuid() before calling __sys_setfsuid().
+ *
+ *   Historical context: setfsuid() was introduced in Linux 1.2 to address
+ *   a security issue where the NFS server needed to access files as different
+ *   users without changing its euid. At that time, processes could send
+ *   signals to other processes with the same euid, so changing euid could
+ *   make nfsd vulnerable to signals from unprivileged processes. Since
+ *   Linux 2.0 changed signal delivery rules (requiring matching real or
+ *   saved set-user-ID), this motivation no longer exists.
+ *
+ *   The fsuid is automatically reset to match the effective UID whenever
+ *   the euid changes via setuid(), setreuid(), setresuid(), or execve() of
+ *   a setuid program. Only explicit setfsuid() calls can make fsuid differ
+ *   from euid.
+ *
+ *   Threading: At the kernel level, the fsuid is per-thread (stored in
+ *   per-task credentials). POSIX does not specify fsuid behavior, and glibc
+ *   does not synchronize setfsuid() across threads (unlike setuid() etc.).
+ *   Each thread can have a different fsuid.
+ *
+ *   The man page marks this syscall as [[deprecated]] and recommends against
+ *   its use in new applications.
+ *
+ * since-version: 1.2
  */
 long __sys_setfsuid(uid_t uid)
 {
