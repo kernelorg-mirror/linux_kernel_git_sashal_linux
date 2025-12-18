@@ -5971,10 +5971,218 @@ static int sigsuspend(sigset_t *set)
 }
 
 /**
- *  sys_rt_sigsuspend - replace the signal mask for a value with the
- *	@unewset value until a signal is received
- *  @unewset: new signal mask value
- *  @sigsetsize: size of sigset_t type
+ * sys_rt_sigsuspend - atomically replace signal mask and wait for a signal
+ * @unewset: pointer to new signal mask to install temporarily
+ * @sigsetsize: size of the sigset_t structure in bytes
+ *
+ * long-desc: Atomically replaces the calling thread's signal mask with the
+ *   set pointed to by @unewset and suspends execution until delivery of a
+ *   signal whose action is to invoke a signal handler or to terminate the
+ *   process. This syscall provides the real-time signal extension of the
+ *   original sigsuspend(), supporting the full 64-signal sigset_t structure
+ *   required for real-time signals (SIGRTMIN to SIGRTMAX).
+ *
+ *   The atomicity guarantee is critical: it ensures no window exists between
+ *   changing the signal mask and entering the wait state where a signal could
+ *   be missed. This is essential for reliable signal-based synchronization
+ *   patterns.
+ *
+ *   The typical usage pattern is:
+ *   1. Block a set of signals using sigprocmask(SIG_BLOCK, ...)
+ *   2. Enter a critical section where the signals should not interrupt
+ *   3. Call rt_sigsuspend() with the original (unblocked) mask to atomically
+ *      unblock the signals and wait for one to arrive
+ *   4. The signal handler executes with the signal temporarily unblocked
+ *   5. Upon return, the original signal mask is automatically restored
+ *
+ *   The signal mask specified by @unewset temporarily replaces the thread's
+ *   blocked signal mask. However, SIGKILL and SIGSTOP are always stripped
+ *   from this mask - they cannot be blocked and will always be delivered
+ *   immediately. Attempting to block them via @unewset has no effect.
+ *
+ *   When a signal is delivered:
+ *   - If the signal has a handler: The handler executes with the original
+ *     signal mask (from before rt_sigsuspend) restored. After the handler
+ *     returns, rt_sigsuspend() returns -EINTR to the caller.
+ *   - If the signal terminates the process: rt_sigsuspend() never returns.
+ *   - If the signal is ignored: It does not cause rt_sigsuspend() to return.
+ *
+ *   The signal mask restoration is handled via the TIF_RESTORE_SIGMASK thread
+ *   flag, which causes the arch-specific signal return path to restore
+ *   current->saved_sigmask after delivering the signal.
+ *
+ *   This syscall always returns -1 (error); there is no "successful" return.
+ *   The expected return is -EINTR indicating a signal was caught. This is
+ *   conformant with POSIX, which specifies that sigsuspend() always returns
+ *   -1 with errno set to EINTR.
+ *
+ *   Historical note: This syscall was introduced in Linux 2.2 as part of the
+ *   real-time signal extension. It replaces the original sigsuspend() syscall
+ *   which used a 32-bit old_sigset_t that could not represent real-time signals.
+ *   The glibc sigsuspend() wrapper transparently calls rt_sigsuspend() when
+ *   available. The @sigsetsize parameter was added for future compatibility
+ *   with potentially different sigset_t sizes, though currently only
+ *   sizeof(sigset_t) is accepted.
+ *
+ *   Bug fix history: Prior to kernel 4.4, a spurious wakeup (e.g., from a
+ *   debugger or spurious interrupt) could cause rt_sigsuspend() to return
+ *   prematurely without a signal being pending. This was fixed by adding a
+ *   loop that rechecks signal_pending() after each wakeup.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: unewset
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must point to a valid user-space sigset_t structure containing
+ *     the signal mask to use while suspended. The structure is copied into
+ *     kernel space via copy_from_user(). The pointer must be properly aligned
+ *     for a sigset_t (typically 8-byte alignment on 64-bit systems). Any signals
+ *     specified in the mask are blocked; signals NOT in the mask are unblocked
+ *     and can wake the caller. Note that SIGKILL (9) and SIGSTOP (19) are
+ *     automatically removed from the mask - they cannot be blocked.
+ *
+ * param: sigsetsize
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must exactly equal sizeof(sigset_t), which is 8 bytes on most
+ *     64-bit architectures (_NSIG_WORDS * sizeof(unsigned long) = 1 * 8 = 8)
+ *     and 16 bytes on 32-bit architectures (_NSIG_WORDS * sizeof(unsigned long)
+ *     = 2 * 4 = 8, but often 16 for alignment). Any other value results in
+ *     -EINVAL. This parameter exists for forward compatibility with potential
+ *     future sigset_t size changes, though such changes have never occurred.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: never succeeds
+ *   desc: This syscall never returns successfully. It always returns -1 with
+ *     errno set to indicate the condition. The only expected "normal" return
+ *     is -EINTR, indicating a signal was caught and its handler has returned.
+ *     This behavior is mandated by POSIX. The kernel internally returns
+ *     -ERESTARTNOHAND which is converted to -EINTR by the signal delivery
+ *     mechanism when a signal handler is invoked.
+ *
+ * error: EINTR, Signal was caught
+ *   desc: A signal was delivered whose action was to invoke a signal handler.
+ *     The signal handler has completed execution and returned. This is the
+ *     expected "normal" return from rt_sigsuspend() and indicates successful
+ *     completion of the wait. The original signal mask has been restored.
+ *     Internally, the syscall returns -ERESTARTNOHAND (514), which is converted
+ *     to -EINTR by the arch-specific signal handling code when a signal handler
+ *     is present for the delivered signal.
+ *
+ * error: EINVAL, Invalid sigsetsize
+ *   desc: The @sigsetsize parameter does not equal sizeof(sigset_t). On x86_64,
+ *     sigset_t is 8 bytes; on 32-bit systems it may be 8 or 16 bytes depending
+ *     on architecture. The check is performed before any other validation.
+ *     This error is returned immediately without accessing @unewset.
+ *
+ * error: EFAULT, Invalid pointer
+ *   desc: The @unewset pointer is invalid or points to memory that is not
+ *     readable by the calling process. This is detected by copy_from_user()
+ *     failing to read sizeof(sigset_t) bytes from the user-space address.
+ *     The pointer may be NULL, point to unmapped memory, or point to a
+ *     read-protected page. No partial read is performed; the entire sigset_t
+ *     must be readable.
+ *
+ * lock: current->sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-process signal handler spinlock is acquired with interrupts
+ *     disabled (spin_lock_irq) in __set_current_blocked() when changing the
+ *     signal mask. The lock protects current->blocked and serializes with
+ *     signal delivery. The lock is held briefly only during the mask change,
+ *     not during the actual sleep. If the new mask equals the current mask
+ *     (sigequalsets returns true), the lock is not acquired at all.
+ *
+ * signal: Any unblocked signal
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: Signal is not blocked by the temporary mask and has a handler
+ *   desc: The syscall suspends until any signal not blocked by @unewset is
+ *     delivered. When such a signal arrives and has a registered handler, the
+ *     handler executes with the original signal mask restored, then the syscall
+ *     returns -EINTR. If the signal's disposition is SIG_IGN, it is discarded
+ *     and does not wake the syscall. If the signal's disposition is SIG_DFL
+ *     and that default terminates the process, the syscall never returns.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_TERMINATE
+ *   condition: SIGKILL delivered (cannot be blocked or caught)
+ *   desc: SIGKILL is automatically removed from the temporary mask and will
+ *     always terminate the process. The syscall never returns in this case.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * signal: SIGSTOP
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_STOP
+ *   condition: SIGSTOP delivered (cannot be blocked or caught)
+ *   desc: SIGSTOP is automatically removed from the temporary mask and will
+ *     always stop the process. When the process is continued (SIGCONT), the
+ *     syscall resumes waiting. SIGSTOP does not cause the syscall to return.
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: current->blocked, current->saved_sigmask
+ *   desc: Temporarily modifies the calling thread's signal mask (current->blocked)
+ *     to the value specified by @unewset (with SIGKILL and SIGSTOP removed).
+ *     The original signal mask is saved in current->saved_sigmask before
+ *     modification. The TIF_RESTORE_SIGMASK thread flag is set to ensure the
+ *     original mask is restored when returning to user space after signal
+ *     delivery.
+ *   condition: Always, after successful parameter validation
+ *   reversible: yes (automatic on signal delivery)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: calling thread
+ *   desc: The calling thread enters TASK_INTERRUPTIBLE state and yields the
+ *     CPU via schedule(). The thread remains descheduled until a deliverable
+ *     signal arrives, which may be indefinitely if all signals are blocked.
+ *     The wait is performed in a loop to handle spurious wakeups (e.g., from
+ *     debuggers or spurious interrupts).
+ *   reversible: yes (when signal arrives)
+ *
+ * state-trans: signal_mask
+ *   from: original blocked mask
+ *   to: @unewset mask (minus SIGKILL/SIGSTOP)
+ *   condition: Entering the suspend wait
+ *   desc: The thread's signal mask transitions to the temporary mask for the
+ *     duration of the wait. This allows signals that were blocked to be
+ *     received while suspended.
+ *
+ * state-trans: signal_mask
+ *   from: temporary @unewset mask
+ *   to: original blocked mask (from saved_sigmask)
+ *   condition: Signal handler invoked
+ *   desc: When a signal is delivered and its handler is about to execute, the
+ *     original signal mask is restored from saved_sigmask. This ensures the
+ *     signal handler runs with the expected signal mask, not the temporary
+ *     suspend mask.
+ *
+ * examples: rt_sigsuspend(&empty_mask, sizeof(sigset_t));  // Wait for any signal
+ *   rt_sigsuspend(&block_all_but_sigusr1, sizeof(sigset_t));  // Wait for SIGUSR1
+ *
+ * notes: The syscall is not restartable - if interrupted by a signal with a
+ *   handler, it always returns -EINTR regardless of SA_RESTART. This is because
+ *   the purpose of rt_sigsuspend() is specifically to wait for a signal, so
+ *   automatic restart would defeat that purpose. The internal -ERESTARTNOHAND
+ *   return code ensures this behavior: when a signal handler exists, it is
+ *   converted to -EINTR; when no handler exists (signal ignored or default
+ *   action), the syscall is restarted internally.
+ *
+ *   The compat variant (compat_sys_rt_sigsuspend) handles 32-bit processes on
+ *   64-bit kernels, using get_compat_sigset() instead of copy_from_user() to
+ *   properly convert the 32-bit sigset_t representation.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE2(rt_sigsuspend, sigset_t __user *, unewset, size_t, sigsetsize)
 {
