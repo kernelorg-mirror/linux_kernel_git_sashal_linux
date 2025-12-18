@@ -256,6 +256,262 @@ out:
 	return error;
 }
 
+/**
+ * sys_setpriority - Set the scheduling priority (nice value) for processes
+ * @which: Target type selector (PRIO_PROCESS, PRIO_PGRP, or PRIO_USER)
+ * @who: Target identifier interpreted according to @which
+ * @niceval: New nice value to set (range -20 to 19)
+ *
+ * long-desc: Sets the scheduling nice value for one or more processes. The nice
+ *   value affects the relative CPU time allocation: lower nice values mean
+ *   higher priority (more CPU time), higher nice values mean lower priority.
+ *
+ *   The @which parameter determines how @who is interpreted:
+ *   - PRIO_PROCESS (0): @who is a process ID. If @who is 0, the calling
+ *     process is targeted. Uses find_task_by_vpid() which respects PID
+ *     namespace boundaries.
+ *   - PRIO_PGRP (1): @who is a process group ID. If @who is 0, the calling
+ *     process's process group is targeted. All threads in the process group
+ *     are affected, iterated via do_each_pid_thread().
+ *   - PRIO_USER (2): @who is a user ID. If @who is 0, the calling process's
+ *     real UID is targeted. All processes owned by the specified user are
+ *     affected. Only processes visible in the caller's PID namespace are
+ *     modified (checked via task_pid_vnr() != 0).
+ *
+ *   The @niceval is clamped to the valid range [MIN_NICE, MAX_NICE] which is
+ *   [-20, 19]. Values outside this range are silently adjusted to the nearest
+ *   valid value, so niceval < -20 becomes -20, and niceval > 19 becomes 19.
+ *
+ *   Permission model: There are two separate permission checks for lowering
+ *   nice values (raising priority):
+ *   1. UID check: The caller's effective UID must match the target process's
+ *      UID or effective UID, OR the caller must have CAP_SYS_NICE in the
+ *      target's user namespace.
+ *   2. RLIMIT check: The target nice value must be within the process's
+ *      RLIMIT_NICE allowance (converted to nice range) OR the caller must
+ *      have CAP_SYS_NICE. RLIMIT_NICE uses rlimit-style values (1-40) which
+ *      map to nice values 19 to -20.
+ *
+ *   Raising nice values (lowering priority) has no restrictions beyond the
+ *   basic UID check - unprivileged users can always lower their own priority.
+ *
+ *   LSM hooks: security_task_setnice() is called for each target task,
+ *   allowing SELinux (PROCESS__SETSCHED permission) and other LSMs to
+ *   impose additional restrictions.
+ *
+ *   For RT/DL tasks: The nice value is stored in static_prio but does not
+ *   affect scheduling until the task returns to a normal scheduling class.
+ *
+ *   Error aggregation: When targeting multiple processes (PRIO_PGRP or
+ *   PRIO_USER), if at least one process is successfully modified, the call
+ *   returns 0. If all processes fail (or no processes match), the last error
+ *   encountered is returned. ESRCH is only returned if no matching process
+ *   was found at all.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: which
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   valid-mask: PRIO_PROCESS | PRIO_PGRP | PRIO_USER
+ *   constraint: Must be exactly one of PRIO_PROCESS (0), PRIO_PGRP (1), or
+ *     PRIO_USER (2). Any other value results in EINVAL.
+ *
+ * param: who
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Interpretation depends on @which. For PRIO_PROCESS, must be a
+ *     valid PID in the caller's PID namespace or 0 (current process). For
+ *     PRIO_PGRP, must be a valid process group ID or 0 (current pgrp). For
+ *     PRIO_USER, must be a valid UID or 0 (current real UID). When @which is
+ *     PRIO_USER, @who is converted to a kuid via make_kuid() using the caller's
+ *     user namespace.
+ *
+ * param: niceval
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: -20, 19
+ *   constraint: Any integer is accepted; values outside [-20, 19] are clamped.
+ *     Lower values mean higher priority; -20 is highest priority (most CPU
+ *     time), 19 is lowest priority (least CPU time).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating at least one target process had its
+ *     nice value updated. When targeting multiple processes, success means at
+ *     least one was modified, even if others failed.
+ *
+ * error: EINVAL, Invalid which parameter
+ *   desc: The @which parameter is not one of PRIO_PROCESS (0), PRIO_PGRP (1),
+ *     or PRIO_USER (2). Checked at syscall entry before any process lookup.
+ *
+ * error: ESRCH, No matching process found
+ *   desc: No process matched the @which/@who criteria. For PRIO_PROCESS, no
+ *     process with the specified PID exists in the caller's PID namespace.
+ *     For PRIO_PGRP, no process group with the specified PGID exists or the
+ *     group is empty. For PRIO_USER, no processes owned by the specified UID
+ *     exist that are visible in the caller's PID namespace. Also returned if
+ *     find_user() fails to locate the user structure for the specified UID.
+ *
+ * error: EPERM, Permission denied (UID check failed)
+ *   desc: The caller does not have permission to modify the target process's
+ *     priority. Returned by set_one_prio_perm() when the caller's effective
+ *     UID does not match either the target's UID or effective UID, AND the
+ *     caller lacks CAP_SYS_NICE in the target's user namespace. Also returned
+ *     by cap_safe_nice() via security_task_setnice() when the target task has
+ *     capabilities not present in the caller's permitted set and the caller
+ *     lacks CAP_SYS_NICE.
+ *
+ * error: EACCES, Permission denied (RLIMIT_NICE check failed)
+ *   desc: The caller is attempting to set a nice value lower than the
+ *     target's current nice value (raising priority), but the new nice value
+ *     exceeds the RLIMIT_NICE allowance and the caller lacks CAP_SYS_NICE.
+ *     Returned by can_nice() when the requested nice value would raise
+ *     priority beyond what RLIMIT_NICE permits for unprivileged users.
+ *
+ * error: LSM-specific errors, Security module denied operation
+ *   desc: A Linux Security Module (SELinux, AppArmor) denied the nice value
+ *     change via security_task_setnice(). SELinux requires PROCESS__SETSCHED
+ *     permission. The specific error code depends on the LSM implementation,
+ *     but is typically EACCES or EPERM. Checked for each target process.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is held for the duration of process iteration and
+ *     lookup. Protects task structures from being freed during iteration.
+ *     Required for find_task_by_vpid(), find_vpid(), and task credential
+ *     access via __task_cred().
+ *
+ * lock: tasklist_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The global tasklist read lock is acquired only for PRIO_PGRP case
+ *     during do_each_pid_thread() iteration to ensure thread group stability.
+ *     Not acquired for PRIO_PROCESS or PRIO_USER cases. Acquired as read_lock
+ *     inside rcu_read_lock section.
+ *
+ * lock: p->pi_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Each target task's priority inheritance lock is acquired via
+ *     guard(task_rq_lock) in set_user_nice() when actually modifying the
+ *     nice value. Protects scheduling-related fields. Acquired with IRQs
+ *     disabled.
+ *
+ * lock: rq->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-CPU run queue lock for each target task is acquired via
+ *     guard(task_rq_lock) in set_user_nice(). Serializes modifications to
+ *     task scheduling state and ensures atomic priority updates.
+ *
+ * lock: uidhash_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: For PRIO_USER case only, acquired by find_user() to look up the
+ *     user_struct for the target UID. Acquired with IRQs disabled
+ *     (spin_lock_irqsave). Also acquired by free_uid() when releasing the
+ *     reference.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Target task(s) static_prio field
+ *   desc: Updates p->static_prio for each successfully modified task.
+ *     For normal scheduling class tasks, this changes p->prio and affects
+ *     CPU scheduling weight. For RT/DL tasks, static_prio is stored but
+ *     does not affect current scheduling.
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: CFS scheduler load weight
+ *   desc: For tasks in the fair scheduling class (SCHED_NORMAL, SCHED_BATCH),
+ *     set_load_weight() is called to update the task's scheduling weight
+ *     based on the new nice value. This affects the vruntime calculation
+ *     and CPU time allocation.
+ *   condition: Task is in fair scheduling class (not RT or DL)
+ *   reversible: yes
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: Run queue ordering
+ *   desc: Changing the nice value may cause the task to be dequeued and
+ *     re-enqueued on the run queue via the scoped sched_change guard in
+ *     set_user_nice(). This can trigger immediate rescheduling if the
+ *     priority change affects the current highest-priority runnable task.
+ *   condition: Task is currently runnable (on_rq)
+ *   reversible: yes
+ *
+ * state-trans: nice_value
+ *   from: current nice value (task_nice(p))
+ *   to: @niceval (clamped to [-20, 19])
+ *   condition: Permission checks pass and niceval differs from current
+ *   desc: The task's nice value is updated from its current value to the
+ *     requested value. No change occurs if niceval equals current nice.
+ *
+ * capability: CAP_SYS_NICE
+ *   type: KAPI_CAP_BYPASS_CHECK | KAPI_CAP_OVERRIDE_RESTRICTION
+ *   allows: (1) Setting nice values for processes owned by other users.
+ *     (2) Lowering nice values (raising priority) regardless of RLIMIT_NICE.
+ *     (3) Modifying tasks that have capabilities not in caller's permitted set.
+ *   without: Can only modify own processes (matching UID/EUID). Can only lower
+ *     nice if current nice >= target nice, or if RLIMIT_NICE permits. Cannot
+ *     modify tasks with elevated capabilities.
+ *   condition: Checked by set_one_prio_perm() via ns_capable() in target's
+ *     user namespace, and by can_nice() via capable(CAP_SYS_NICE), and by
+ *     cap_safe_nice() via ns_capable().
+ *
+ * constraint: RLIMIT_NICE resource limit
+ *   desc: For unprivileged users, RLIMIT_NICE determines the minimum nice
+ *     value (maximum priority) that can be set. RLIMIT_NICE uses values 1-40
+ *     which map to nice values 19 to -20 (conversion: nice = MAX_NICE - rlimit
+ *     + 1). A RLIMIT_NICE of 0 allows no priority increases. Default is 0.
+ *   expr: niceval >= (MAX_NICE - RLIMIT_NICE + 1) OR CAP_SYS_NICE
+ *
+ * constraint: PID namespace isolation
+ *   desc: Processes are only visible and modifiable if they exist in the
+ *     caller's PID namespace hierarchy. For PRIO_PROCESS and PRIO_PGRP, uses
+ *     find_task_by_vpid()/find_vpid(). For PRIO_USER, only processes with
+ *     task_pid_vnr(p) != 0 are considered (visible in caller's PID namespace).
+ *
+ * examples: setpriority(PRIO_PROCESS, 0, 10);  // Lower own priority to nice 10
+ *   setpriority(PRIO_PROCESS, 1234, -5);  // Set PID 1234 to nice -5 (needs privs)
+ *   setpriority(PRIO_PGRP, 0, 5);  // Set all procs in own pgrp to nice 5
+ *   setpriority(PRIO_USER, 1000, 15);  // Set all UID 1000 procs to nice 15
+ *
+ * notes: This syscall originated in 4.2BSD and is specified by POSIX.1-2008.
+ *   The kernel normalizes out-of-range nice values rather than returning an
+ *   error, which differs from strict POSIX behavior.
+ *
+ *   The syscall number is 141 on x86-64, 97 on i386, and 140 in the generic
+ *   syscall table.
+ *
+ *   Historical fix (commit 8639b46139b0): Prior to Linux 4.5, PRIO_USER mode
+ *   could affect processes outside the caller's PID namespace. This was fixed
+ *   by adding task_pid_vnr(p) check.
+ *
+ *   Historical optimization (commit 7f8ca0edfe07): The tasklist_lock is now
+ *   only taken for PRIO_PGRP, not for PRIO_PROCESS or PRIO_USER, improving
+ *   scalability.
+ *
+ *   When multiple processes match (PRIO_PGRP or PRIO_USER), the operation
+ *   is not atomic across all of them - some may succeed while others fail.
+ *   The syscall returns success if at least one succeeded.
+ *
+ *   The getpriority() syscall is the counterpart for reading nice values.
+ *   Note that getpriority() returns 20 - nice (range 1-40) to avoid negative
+ *   return values being confused with errors.
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 {
 	struct task_struct *g, *p;
