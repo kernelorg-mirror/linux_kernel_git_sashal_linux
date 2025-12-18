@@ -3497,11 +3497,274 @@ int set_compat_user_sigmask(const compat_sigset_t __user *umask,
 #endif
 
 /**
- *  sys_rt_sigprocmask - change the list of currently blocked signals
- *  @how: whether to add, remove, or set signals
- *  @nset: stores pending signals
- *  @oset: previous value of signal mask if non-null
- *  @sigsetsize: size of sigset_t type
+ * sys_rt_sigprocmask - examine and change the calling thread's blocked signal mask
+ * @how: Specifies the operation: SIG_BLOCK, SIG_UNBLOCK, or SIG_SETMASK
+ * @nset: Pointer to the new signal mask (input), or NULL to not modify
+ * @oset: Pointer to buffer for the previous signal mask (output), or NULL
+ * @sigsetsize: Size of the sigset_t type (must equal sizeof(sigset_t))
+ *
+ * long-desc: Examines and/or changes the signal mask of the calling thread.
+ *   The signal mask is the set of signals currently blocked for the thread.
+ *   Blocked signals are held pending until unblocked; they are then delivered.
+ *   This is the real-time signal variant introduced in Linux 2.2 to support the
+ *   enlarged 64-signal sigset_t (replacing the original 32-signal sigprocmask).
+ *
+ *   The @how parameter determines how @nset is interpreted when non-NULL:
+ *   - SIG_BLOCK (0): The set of blocked signals is the union of the current set
+ *     and the signal set pointed to by @nset. Adds signals to the blocked mask.
+ *   - SIG_UNBLOCK (1): The signals in @nset are removed from the current set of
+ *     blocked signals. Unblocks the specified signals.
+ *   - SIG_SETMASK (2): The set of blocked signals is set to @nset, replacing the
+ *     current blocked set entirely.
+ *
+ *   If @nset is NULL, the signal mask is not changed; in this case @how is ignored
+ *   and the syscall can be used purely to query the current mask via @oset.
+ *
+ *   If @oset is non-NULL, the previous signal mask is written to it before any
+ *   modifications are applied. This allows atomic read-modify-write operations
+ *   and provides the previous mask for later restoration.
+ *
+ *   It is not possible to block SIGKILL (9) or SIGSTOP (19). Attempts to add
+ *   these signals to the blocked mask are silently ignored (they are removed
+ *   from @nset via sigdelsetmask before applying). This is enforced by POSIX and
+ *   ensures these signals can always terminate or stop a process.
+ *
+ *   The signal mask is per-thread: each thread in a multithreaded process has
+ *   its own signal mask. The main thread's mask is inherited by new threads
+ *   created with pthread_create(). Note that POSIX specifies sigprocmask()
+ *   behavior is unspecified in multithreaded programs; applications should use
+ *   pthread_sigmask() instead, though on Linux they are functionally equivalent.
+ *
+ *   Signal mask inheritance:
+ *   - fork(): Child inherits the parent's signal mask
+ *   - exec(): Signal mask is preserved across exec()
+ *   - clone(): New thread inherits the signal mask if CLONE_SIGHAND is set
+ *
+ *   If any signals become unblocked by this call and are pending (either in the
+ *   thread's private pending queue or the process-wide shared pending queue),
+ *   at least one of them will be delivered before the syscall returns. The order
+ *   of delivery is: standard signals in numerical order, then real-time signals
+ *   in the order they were queued.
+ *
+ *   Implementation note: When the signal mask changes, the kernel checks if
+ *   there are shared pending signals that this thread was blocking but other
+ *   threads might handle. If so, the kernel retargets these signals to other
+ *   eligible threads via retarget_shared_pending(). This ensures signals are
+ *   not lost when a thread blocks a signal another thread could handle.
+ *
+ *   Performance optimization: The kernel avoids acquiring sighand->siglock if
+ *   the new signal mask equals the current mask (sigequalsets check). This
+ *   significantly reduces lock contention in applications that frequently call
+ *   sigprocmask with unchanged masks, such as swapcontext() in glibc.
+ *
+ *   glibc wrapping: The glibc sigprocmask() function transparently calls
+ *   rt_sigprocmask() with the correct sigsetsize. Additionally, glibc internally
+ *   uses two signals (SIGRTMIN and SIGRTMIN+1, signals 32-33) for NPTL threading
+ *   implementation and silently prevents blocking these via sigprocmask().
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: how
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_ENUM
+ *   valid-mask: SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK
+ *   constraint: Must be SIG_BLOCK (0), SIG_UNBLOCK (1), or SIG_SETMASK (2).
+ *     Ignored if @nset is NULL. Returns EINVAL for any other value.
+ *     SIG_BLOCK adds signals to the mask (union), SIG_UNBLOCK removes signals
+ *     (intersection with complement), SIG_SETMASK replaces the mask entirely.
+ *
+ * param: nset
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Pointer to a sigset_t containing the new signal mask, or NULL
+ *     to skip modification. When non-NULL, the memory must be readable and
+ *     contain a valid sigset_t of @sigsetsize bytes. SIGKILL and SIGSTOP bits
+ *     are automatically cleared from this set before applying.
+ *
+ * param: oset
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Pointer to a sigset_t buffer to receive the previous signal
+ *     mask, or NULL to skip retrieval. When non-NULL, the memory must be
+ *     writable for @sigsetsize bytes. The previous mask is written before
+ *     any modifications, enabling atomic save-and-modify operations.
+ *
+ * param: sigsetsize
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must exactly equal sizeof(sigset_t), which is 8 bytes on most
+ *     architectures (64 signals / 8 bits per byte = 8 bytes). This parameter
+ *     exists to allow future kernel versions to support larger signal sets
+ *     while maintaining backward compatibility. Returns EINVAL if mismatched.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. The signal mask has been modified according
+ *     to @how and @nset (if @nset was non-NULL), and the previous mask has
+ *     been written to @oset (if @oset was non-NULL). If both @nset and @oset
+ *     are NULL, the syscall is a no-op and returns 0.
+ *
+ * error: EINVAL, Invalid sigsetsize
+ *   desc: The @sigsetsize parameter does not equal sizeof(sigset_t). This
+ *     indicates an ABI mismatch between the calling program and the kernel.
+ *     On most architectures, sigsetsize must be exactly 8. The glibc wrapper
+ *     handles this automatically, so this error typically only occurs when
+ *     calling the syscall directly with an incorrect size.
+ *
+ * error: EINVAL, Invalid how value
+ *   desc: The @how parameter is not SIG_BLOCK (0), SIG_UNBLOCK (1), or
+ *     SIG_SETMASK (2), and @nset is non-NULL. This error is returned by the
+ *     sigprocmask() helper function after the new mask has been copied from
+ *     userspace. If @nset is NULL, @how is ignored and this error cannot occur.
+ *
+ * error: EFAULT, Bad nset pointer
+ *   desc: The @nset pointer is non-NULL but points to memory that cannot be
+ *     read by the calling process. The copy_from_user() operation failed.
+ *     The signal mask is unchanged when this error occurs.
+ *
+ * error: EFAULT, Bad oset pointer
+ *   desc: The @oset pointer is non-NULL but points to memory that cannot be
+ *     written by the calling process. The copy_to_user() operation failed.
+ *     Important: this error is checked AFTER the signal mask has been modified
+ *     (if @nset was valid), so partial effects are possible. The old mask was
+ *     captured before modification but could not be written to userspace.
+ *
+ * lock: current->sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: conditionally
+ *   released: conditionally
+ *   desc: The signal handler spinlock is acquired with IRQs disabled
+ *     (spin_lock_irq) in __set_current_blocked() only when the new signal mask
+ *     differs from the current mask. If the masks are equal (checked via
+ *     sigequalsets), no lock is acquired - an optimization added in kernel 4.10
+ *     to reduce contention from glibc's swapcontext() which calls sigprocmask
+ *     frequently with unchanged masks. When acquired, the lock is held briefly
+ *     while updating tsk->blocked and calling recalc_sigpending().
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: Current thread's signal mask (current->blocked)
+ *   desc: Modifies the signal mask field (blocked) in the calling thread's
+ *     task_struct. This determines which signals are blocked (held pending)
+ *     for this specific thread. Other threads in the same process are not
+ *     affected; each has its own signal mask. The modification persists until
+ *     changed by another sigprocmask call, the thread exits, or affected by
+ *     signal handler execution (which temporarily extends the mask).
+ *   condition: @nset is non-NULL and the new mask differs from current mask
+ *   reversible: yes (by calling rt_sigprocmask with saved @oset value)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Thread flag TIF_SIGPENDING
+ *   desc: The recalc_sigpending() function is called after modifying the
+ *     signal mask, which may set or clear the TIF_SIGPENDING thread flag.
+ *     This flag indicates whether there are pending signals that should be
+ *     delivered. If signals become unblocked and are pending, TIF_SIGPENDING
+ *     is set, triggering signal delivery before the syscall returns.
+ *   condition: Signal mask is modified
+ *   reversible: yes (automatically managed by kernel)
+ *
+ * side-effect: KAPI_EFFECT_SIGNAL_SEND
+ *   target: Other threads in thread group (via retarget_shared_pending)
+ *   desc: When blocking signals that are in the shared pending queue, the
+ *     kernel retargets them to other threads that can handle them via
+ *     retarget_shared_pending(). This wakes up eligible threads via
+ *     signal_wake_up() if they weren't already marked as having pending
+ *     signals. This ensures process-directed signals are not lost when the
+ *     receiving thread blocks them but other threads can handle them.
+ *   condition: Blocking signals and shared pending signals exist
+ *   reversible: no (wakeups cannot be undone)
+ *
+ * state-trans: thread_signal_mask
+ *   from: previous blocked signal set
+ *   to: new blocked signal set (union with nset for SIG_BLOCK)
+ *   condition: @how is SIG_BLOCK and @nset is non-NULL
+ *   desc: Signals specified in @nset are added to the blocked mask. This is
+ *     equivalent to: new_mask = old_mask | (*nset & ~(SIGKILL|SIGSTOP))
+ *
+ * state-trans: thread_signal_mask
+ *   from: previous blocked signal set
+ *   to: new blocked signal set (with nset signals removed for SIG_UNBLOCK)
+ *   condition: @how is SIG_UNBLOCK and @nset is non-NULL
+ *   desc: Signals specified in @nset are removed from the blocked mask. This
+ *     is equivalent to: new_mask = old_mask & ~(*nset). Pending signals that
+ *     become unblocked will be delivered before the syscall returns.
+ *
+ * state-trans: thread_signal_mask
+ *   from: previous blocked signal set
+ *   to: signal set in nset (for SIG_SETMASK)
+ *   condition: @how is SIG_SETMASK and @nset is non-NULL
+ *   desc: The blocked mask is replaced entirely with @nset (after removing
+ *     SIGKILL and SIGSTOP). This is equivalent to: new_mask = *nset & ~(SIGKILL|SIGSTOP)
+ *
+ * constraint: Per-thread operation
+ *   desc: The signal mask is per-thread, not per-process. In a multithreaded
+ *     application, each thread has its own signal mask. This syscall only
+ *     affects the calling thread's mask. Use pthread_sigmask() for clearer
+ *     semantics in threaded programs, though on Linux it has identical behavior.
+ *
+ * constraint: SIGKILL and SIGSTOP cannot be blocked
+ *   desc: SIGKILL (signal 9) and SIGSTOP (signal 19) are automatically removed
+ *     from any signal set before applying to the blocked mask. These signals
+ *     cannot be caught, blocked, or ignored, as mandated by POSIX. Attempts to
+ *     block them are silently ignored (not an error).
+ *   expr: !(blocked_mask & (sigmask(SIGKILL) | sigmask(SIGSTOP)))
+ *
+ * constraint: Undefined behavior for blocking synchronous signals
+ *   desc: If SIGBUS, SIGFPE, SIGILL, or SIGSEGV are blocked while being
+ *     generated synchronously (by the hardware due to program errors), the
+ *     result is undefined. These signals may only be safely blocked if generated
+ *     asynchronously via kill(), sigqueue(), or raise(). Blocking a synchronous
+ *     SIGSEGV during execution typically leads to immediate re-generation and
+ *     undefined behavior or termination.
+ *
+ * examples:
+ *   // Block SIGINT and SIGTERM
+ *   sigset_t newmask, oldmask;
+ *   sigemptyset(&newmask);
+ *   sigaddset(&newmask, SIGINT);
+ *   sigaddset(&newmask, SIGTERM);
+ *   rt_sigprocmask(SIG_BLOCK, &newmask, &oldmask, sizeof(sigset_t));
+ *
+ *   // Unblock SIGUSR1
+ *   sigemptyset(&newmask);
+ *   sigaddset(&newmask, SIGUSR1);
+ *   rt_sigprocmask(SIG_UNBLOCK, &newmask, NULL, sizeof(sigset_t));
+ *
+ *   // Query current mask without changing it
+ *   rt_sigprocmask(SIG_BLOCK, NULL, &oldmask, sizeof(sigset_t));
+ *
+ *   // Restore previously saved mask
+ *   rt_sigprocmask(SIG_SETMASK, &oldmask, NULL, sizeof(sigset_t));
+ *
+ * notes: This syscall is typically accessed via the glibc sigprocmask() or
+ *   pthread_sigmask() wrapper functions, which handle the sigsetsize parameter
+ *   and provide a more standard interface.
+ *
+ *   The original sigprocmask() syscall (still present on some architectures)
+ *   used a 32-bit signal mask. rt_sigprocmask() was introduced in Linux 2.2
+ *   to support 64 signals (including 32 real-time signals SIGRTMIN to SIGRTMAX).
+ *
+ *   When a signal handler is invoked, the signals specified in sa_mask (from
+ *   sigaction) are added to the blocked mask for the duration of the handler,
+ *   in addition to the signal being handled (unless SA_NODEFER is set). The
+ *   original mask is restored when the handler returns via sigreturn().
+ *
+ *   A 32-bit compatibility variant (compat_sys_rt_sigprocmask) exists for
+ *   32-bit processes running on 64-bit kernels, using compat_sigset_t and
+ *   appropriate conversion functions (get_compat_sigset/put_compat_sigset).
+ *
+ *   glibc internally reserves SIGRTMIN and SIGRTMIN+1 (signals 32-33) for
+ *   NPTL threading implementation and silently filters these from sigprocmask
+ *   calls. Direct syscalls bypass this filtering.
+ *
+ *   No capabilities are required to modify a thread's own signal mask.
+ *
+ * since-version: 2.2
  */
 SYSCALL_DEFINE4(rt_sigprocmask, int, how, sigset_t __user *, nset,
 		sigset_t __user *, oset, size_t, sigsetsize)
