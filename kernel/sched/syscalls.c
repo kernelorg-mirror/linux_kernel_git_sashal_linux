@@ -938,11 +938,236 @@ SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param 
 }
 
 /**
- * sys_sched_setparam - set/change the RT priority of a thread
- * @pid: the pid in question.
- * @param: structure containing the new RT priority.
+ * sys_sched_setparam - Set scheduling parameters for a thread
+ * @pid: Thread ID to target, or 0 for the calling thread
+ * @param: User-space pointer to struct sched_param containing the new priority
  *
- * Return: 0 on success. An error code otherwise.
+ * long-desc: Sets the scheduling parameters (specifically the realtime
+ *   priority) of a thread without changing its scheduling policy. This
+ *   syscall is a subset of sched_setscheduler() - it can only modify the
+ *   sched_priority field within the constraints of the thread's current
+ *   scheduling policy.
+ *
+ *   The @pid parameter identifies the target thread. If @pid is 0, the calling
+ *   thread is modified. The thread is looked up via find_task_by_vpid(), which
+ *   respects PID namespace boundaries - only threads visible in the caller's
+ *   PID namespace can be targeted.
+ *
+ *   The @param structure contains a single field, sched_priority, which must
+ *   be appropriate for the thread's current scheduling policy:
+ *   - For SCHED_FIFO and SCHED_RR (realtime policies): sched_priority must
+ *     be in the range 1 to 99 (MAX_RT_PRIO-1), with higher values meaning
+ *     higher priority.
+ *   - For SCHED_NORMAL, SCHED_BATCH, SCHED_IDLE, and SCHED_DEADLINE:
+ *     sched_priority must be 0 (these policies do not use RT priority).
+ *   - For SCHED_EXT: sched_priority must be 0.
+ *
+ *   Internally, sched_setparam() calls the same __sched_setscheduler() code
+ *   path as sched_setscheduler(), but passes a special SETPARAM_POLICY (-1)
+ *   value that instructs the function to preserve the current scheduling
+ *   policy while only modifying the priority.
+ *
+ *   Permission checks are performed by user_check_sched_setscheduler():
+ *   - For realtime policies, increasing priority beyond RLIMIT_RTPRIO requires
+ *     CAP_SYS_NICE capability.
+ *   - Modifying another user's thread requires CAP_SYS_NICE capability or
+ *     matching real/effective UID.
+ *   - Clearing the SCHED_RESET_ON_FORK flag requires CAP_SYS_NICE.
+ *   - LSMs may impose additional restrictions via security_task_setscheduler().
+ *
+ *   Unlike sched_setattr(), this syscall does not support setting nice values,
+ *   SCHED_DEADLINE parameters, or utilization clamp values. For full scheduler
+ *   control, use sched_setattr() instead.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid thread ID in the caller's PID namespace, or 0
+ *     to target the calling thread. Negative values return EINVAL. Non-existent
+ *     or invisible thread IDs return ESRCH.
+ *
+ * param: param
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to struct sched_param. The
+ *     structure must be readable by the kernel (copy_from_user must succeed).
+ *     The sched_priority field must be valid for the target thread's current
+ *     scheduling policy: 1-99 for RT policies (SCHED_FIFO, SCHED_RR), or 0 for
+ *     all other policies. NULL returns EINVAL. Invalid pointer returns EFAULT.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the thread's scheduling parameters
+ *     have been updated. The change takes effect immediately and may cause
+ *     rescheduling if the priority change affects the run queue ordering.
+ *
+ * error: EINVAL, Invalid pid or param argument
+ *   desc: Returned when @pid is negative, when @param is NULL, when
+ *     sched_priority exceeds MAX_RT_PRIO-1 (99), or when sched_priority is
+ *     inconsistent with the thread's scheduling policy (non-zero for non-RT
+ *     policy, or zero for RT policy). Also returned if the target thread is
+ *     the special per-CPU stop thread (rq->stop), which cannot have its
+ *     scheduling parameters modified.
+ *
+ * error: ESRCH, No thread found with specified PID
+ *   desc: No thread with the specified @pid exists in the caller's PID
+ *     namespace. The lookup uses find_task_by_vpid() which respects PID
+ *     namespace isolation - threads in parent or sibling PID namespaces are
+ *     not visible.
+ *
+ * error: EFAULT, Invalid user-space pointer
+ *   desc: The @param pointer is invalid and copy_from_user() failed. The
+ *     pointer may be unmapped, point to kernel memory, or otherwise be
+ *     inaccessible from user space.
+ *
+ * error: EPERM, Insufficient privileges
+ *   desc: Permission denied. Occurs when: (1) Increasing RT priority beyond
+ *     RLIMIT_RTPRIO without CAP_SYS_NICE. (2) Modifying another user's thread
+ *     without CAP_SYS_NICE. (3) Clearing SCHED_RESET_ON_FORK without CAP_SYS_NICE.
+ *     Check performed by user_check_sched_setscheduler().
+ *
+ * error: EACCES, LSM denied the operation
+ *   desc: A Linux Security Module (SELinux, AppArmor, etc.) denied the
+ *     scheduling parameter change via the security_task_setscheduler() hook.
+ *     SELinux requires the PROCESS__SETSCHED permission. This error is also
+ *     returned by scx_check_setscheduler() if attempting to transition to
+ *     SCHED_EXT when the task has the disallow flag set, though this path is
+ *     not reachable via sched_setparam() since it preserves the current policy.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired by find_get_task() via guard(rcu)() when
+ *     looking up the target thread. This protects the task_struct from being
+ *     freed during the lookup. The reference count is incremented before RCU
+ *     unlock, and decremented after the operation completes.
+ *
+ * lock: pi_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The target task's pi_lock (priority inheritance lock) is acquired
+ *     as part of task_rq_lock() in __sched_setscheduler(). This lock protects
+ *     the task's scheduling-related fields and is held while modifying priority.
+ *     Acquired with interrupts disabled.
+ *
+ * lock: rq->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-CPU run queue lock is acquired via task_rq_lock() in
+ *     __sched_setscheduler(). This lock serializes modifications to the task's
+ *     scheduling parameters and ensures atomic updates to run queue data
+ *     structures. Held while checking and modifying task state.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Syscall has no interruptible wait points
+ *   desc: This syscall does not have explicit signal handling. All operations
+ *     are performed under spinlocks or with RCU protection, and there are no
+ *     interruptible sleep points. The syscall completes quickly and does not
+ *     return EINTR or ERESTARTSYS.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task scheduling parameters (p->rt_priority, p->prio, p->normal_prio)
+ *   desc: Modifies the target thread's realtime priority and effective priority.
+ *     For RT policies, p->rt_priority is set to param->sched_priority, and
+ *     p->prio and p->normal_prio are recalculated accordingly. The change is
+ *     performed atomically under rq->lock protection.
+ *   reversible: yes (can be changed with another sched_setparam call)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: CPU run queue ordering
+ *   desc: If the priority change affects the task's position in the run queue,
+ *     a reschedule may be triggered. If the task's priority increases, it may
+ *     preempt lower-priority tasks. If it decreases, higher-priority tasks may
+ *     preempt it. Balance callbacks are invoked after the change to handle
+ *     potential migrations.
+ *   condition: Task is runnable and priority changes relative position
+ *   reversible: n/a
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: task reference count
+ *   desc: The target task's reference count is incremented by find_get_task()
+ *     to prevent the task from being freed during the operation. The reference
+ *     is decremented automatically when the CLASS(find_get_task) destructor
+ *     runs via put_task_struct().
+ *   reversible: yes (automatically within syscall)
+ *
+ * state-trans: task_rt_priority
+ *   from: previous sched_priority value (0-99)
+ *   to: new sched_priority value from @param
+ *   condition: Successful completion of __sched_setscheduler()
+ *   desc: The task's rt_priority field transitions to the value specified
+ *     in param->sched_priority. For non-RT tasks, this must be 0. For RT
+ *     tasks, this must be 1-99.
+ *
+ * capability: CAP_SYS_NICE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: (1) Increasing RT priority beyond RLIMIT_RTPRIO. (2) Modifying
+ *     scheduling parameters of threads owned by other users. (3) Clearing
+ *     the SCHED_RESET_ON_FORK flag on any thread.
+ *   without: For RT priority increases, the new priority must not exceed
+ *     RLIMIT_RTPRIO. For other users' threads, EPERM is returned. For clearing
+ *     SCHED_RESET_ON_FORK, EPERM is returned.
+ *   condition: Checked by user_check_sched_setscheduler() when escalation or
+ *     cross-user modification is attempted
+ *
+ * constraint: RLIMIT_RTPRIO resource limit
+ *   desc: For threads with RT scheduling policies, the maximum sched_priority
+ *     that can be set without CAP_SYS_NICE is limited by RLIMIT_RTPRIO. If
+ *     RLIMIT_RTPRIO is 0, the thread cannot use RT scheduling at all without
+ *     the capability. If the requested priority exceeds both RLIMIT_RTPRIO
+ *     and the current priority, EPERM is returned (unless CAP_SYS_NICE is held).
+ *
+ * constraint: LSM security hooks
+ *   desc: The security_task_setscheduler() LSM hook is called after basic
+ *     permission checks pass. LSMs like SELinux may impose additional policy
+ *     restrictions. SELinux requires the PROCESS__SETSCHED permission on the
+ *     target process context.
+ *
+ * constraint: Policy-priority consistency
+ *   desc: The sched_priority value must be consistent with the target thread's
+ *     current scheduling policy. RT policies (SCHED_FIFO, SCHED_RR) require
+ *     priority 1-99. All other policies (SCHED_NORMAL, SCHED_BATCH, SCHED_IDLE,
+ *     SCHED_DEADLINE, SCHED_EXT) require priority 0. Violation returns EINVAL.
+ *
+ * examples:
+ *   struct sched_param sp = { .sched_priority = 50 };
+ *   sched_setparam(0, &sp);  // Set current thread RT priority to 50
+ *   sp.sched_priority = 0;
+ *   sched_setparam(child_pid, &sp);  // Set non-RT thread priority (must be 0)
+ *   sp.sched_priority = 99;
+ *   sched_setparam(rt_thread, &sp);  // Set max RT priority (requires privilege)
+ *
+ * notes:
+ *   - POSIX.1-2008 conformant. Available on systems defining _POSIX_PRIORITY_SCHEDULING.
+ *   - This syscall only modifies priority, not policy. Use sched_setscheduler()
+ *     to change both policy and priority, or sched_setattr() for full control.
+ *   - The sched_param structure cannot be extended (unlike sched_attr) due to
+ *     ABI compatibility - it has no size field for versioning.
+ *   - The special SETPARAM_POLICY value (-1) is used internally to signal that
+ *     the policy should be preserved. A historical bug (fixed in v3.14, commit
+ *     d8d28c8f00e8) caused -1 to incorrectly match SCHED_RESET_ON_FORK masking,
+ *     breaking the syscall until the check order was fixed.
+ *   - For SCHED_DEADLINE tasks, sched_priority has no effect - deadline parameters
+ *     can only be modified via sched_setattr().
+ *   - The nice value of a task is preserved across sched_setparam() calls.
+ *   - Priority changes trigger PI (priority inheritance) chain updates via
+ *     rt_mutex_adjust_pi() to handle any tasks blocked on mutexes held by the
+ *     modified task.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE2(sched_setparam, pid_t, pid, struct sched_param __user *, param)
 {
