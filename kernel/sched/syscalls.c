@@ -2780,10 +2780,119 @@ static void do_sched_yield(void)
 /**
  * sys_sched_yield - yield the current processor to other threads.
  *
- * This function yields the current CPU to other tasks. If there are no
- * other threads running on this CPU then this function will return.
+ * long-desc: Voluntarily relinquishes the CPU, allowing other runnable
+ *   threads to execute. The calling thread remains in the runnable state
+ *   but is moved to the end of its scheduling queue or has its virtual
+ *   runtime adjusted depending on the scheduling policy. The syscall always
+ *   succeeds on Linux.
  *
- * Return: 0.
+ *   The behavior varies by scheduling class:
+ *   - SCHED_OTHER/SCHED_BATCH (CFS): The task's vruntime is set to its
+ *     deadline if the task is eligible, effectively forfeiting its remaining
+ *     timeslice. The task will not run again until other eligible tasks have
+ *     had a chance to execute.
+ *   - SCHED_FIFO/SCHED_RR: The task is moved to the end of the queue for its
+ *     static priority level. If it is the only task at that priority, it
+ *     continues running immediately.
+ *   - SCHED_DEADLINE: Sets the dl_yielded flag, causing the task to sleep
+ *     until the start of its next period. This allows other deadline tasks
+ *     to run and facilitates bandwidth reclamation.
+ *   - SCHED_EXT: Behavior is determined by the loaded BPF scheduler.
+ *
+ *   This syscall is primarily intended for real-time scheduling policies.
+ *   Using sched_yield() with SCHED_OTHER is generally discouraged as it
+ *   indicates a design problem. Busy-wait loops using sched_yield() are
+ *   particularly problematic and should use proper synchronization
+ *   primitives like wait_event() or condition variables instead.
+ *
+ *   If the calling thread is the only runnable thread at its priority level
+ *   (or the highest priority for CFS), the thread continues running after
+ *   the syscall returns, though unnecessary context switch overhead is still
+ *   incurred.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Always returns 0. On Linux, sched_yield() cannot fail.
+ *
+ * lock: rq->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The current CPU's runqueue lock is acquired via this_rq_lock_irq()
+ *     with local IRQs disabled. The lock is held while updating scheduler
+ *     statistics and calling the scheduling class's yield_task() method.
+ *     The lock is released before calling schedule() to allow the scheduler
+ *     to select the next task to run.
+ *
+ * signal: pending signals
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: After schedule() returns
+ *   desc: This syscall does not check for pending signals before yielding.
+ *     The call to schedule() will handle any pending signals after the task
+ *     is rescheduled. The syscall is not interruptible and does not return
+ *     EINTR or ERESTARTSYS. Signals are processed in the normal way when the
+ *     task resumes execution.
+ *   timing: KAPI_SIGNAL_TIME_AFTER
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE | KAPI_EFFECT_MODIFY_STATE
+ *   target: current task scheduling state
+ *   desc: Triggers an immediate reschedule by calling schedule(). For CFS
+ *     tasks, modifies the task's vruntime to forfeit the remaining timeslice.
+ *     For RT tasks, requeues the task at the end of its priority queue. For
+ *     deadline tasks, sets the dl_yielded flag. Increments the per-CPU
+ *     yld_count scheduler statistic (visible via /proc/schedstat when
+ *     CONFIG_SCHEDSTATS is enabled).
+ *   reversible: yes (task automatically becomes schedulable again)
+ *
+ * state-trans: task_runqueue_position
+ *   from: front or middle of runqueue
+ *   to: end of runqueue or deferred (for deadline)
+ *   condition: Always occurs when syscall is invoked
+ *   desc: The task transitions from its current position in the scheduling
+ *     data structures to a position that defers its next execution. For CFS,
+ *     the vruntime adjustment places it behind other eligible tasks. For RT,
+ *     it moves to queue tail. For deadline, it is throttled until the next
+ *     period.
+ *
+ * examples:
+ *   sched_yield();  // Yield to other threads, always returns 0
+ *   // Proper usage in RT task to let equal-priority peers run:
+ *   while (work_available()) {
+ *       do_work();
+ *       sched_yield();  // Let other RT threads at same priority run
+ *   }
+ *
+ * notes:
+ *   - POSIX.1-2008 conformant. In POSIX.1-2001, support was optional and
+ *     indicated by _POSIX_PRIORITY_SCHEDULING being defined.
+ *   - On Linux, this syscall always succeeds and always returns 0. The POSIX
+ *     specification allows returning -1 with errno, but Linux never does.
+ *   - The semantics changed significantly between Linux 2.4 and 2.5/2.6. In
+ *     2.4, yield moved the task to the end of the runqueue. In 2.6+, the
+ *     task is moved to the "expired" set, meaning it must wait until all
+ *     other runnable tasks have exhausted their timeslices.
+ *   - Applications that use sched_yield() in busy-wait loops are considered
+ *     broken. Such loops degrade system performance significantly under the
+ *     modern semantics. Use proper blocking primitives instead.
+ *   - For SCHED_DEADLINE tasks, sched_yield() can be used to signal the end
+ *     of the current activation. The task will be awakened by the next
+ *     runtime replenishment at the start of its next period.
+ *   - Stop tasks (highest priority kernel threads) trigger a BUG() if they
+ *     call yield, as this should never happen.
+ *   - In proxy execution scenarios (introduced in recent kernels), the yield
+ *     is attributed to the donor task rather than the currently executing
+ *     proxy task.
+ *   - Unnecessary calls to sched_yield() cause context switches that degrade
+ *     system performance. Only use when there is a genuine need to give other
+ *     threads a chance to run.
+ *
+ * since-version: 2.0
  */
 SYSCALL_DEFINE0(sched_yield)
 {
