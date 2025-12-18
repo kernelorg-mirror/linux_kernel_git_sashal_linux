@@ -3566,6 +3566,294 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	return err;
 }
 
+/**
+ * sys_init_module - Load an ELF kernel module from user memory
+ * @umod: User-space pointer to the module ELF image
+ * @len: Size of the module image in bytes
+ * @uargs: User-space pointer to module parameter string (space-separated)
+ *
+ * long-desc: Loads a kernel module from an ELF image provided in user memory.
+ *   The module image is copied into kernel space, validated as a proper ELF
+ *   relocatable object, has its symbols resolved against the kernel and other
+ *   loaded modules, and then its initialization function is executed.
+ *
+ *   The loading process involves multiple phases:
+ *   1. Capability and permission checks (CAP_SYS_MODULE required)
+ *   2. Copy of module image from user space into kernel memory
+ *   3. Signature verification (if CONFIG_MODULE_SIG enabled)
+ *   4. ELF header and section validation
+ *   5. Version magic ("vermagic") verification against running kernel
+ *   6. Memory allocation for module text, data, and per-CPU sections
+ *   7. Symbol resolution against kernel and loaded modules (may wait up to
+ *      30 seconds for symbols from modules being loaded concurrently)
+ *   8. Relocation processing for position-independent code
+ *   9. Module parameter parsing from uargs string
+ *   10. Sysfs setup for /sys/module/<name> entries
+ *   11. Execution of module constructors and init function
+ *   12. Transition to MODULE_STATE_LIVE
+ *
+ *   Module loading is idempotent for concurrent loads of the same module:
+ *   if another thread is already loading the same module, subsequent callers
+ *   will wait (interruptibly) for that load to complete and receive the same
+ *   result. This prevents duplicate module loads and associated memory waste.
+ *
+ *   The uargs parameter follows the format: "param1=value1 param2=value2 ..."
+ *   Unknown parameters generate warnings but do not cause load failure.
+ *   The special parameter "async_probe=1" enables asynchronous device probing.
+ *
+ *   Module loading can be globally disabled via /proc/sys/kernel/modules_disabled
+ *   (write-once flag) or the "nomodule" kernel command line parameter.
+ *
+ *   For loading modules from files (recommended for security), use finit_module()
+ *   instead, which allows the kernel to verify module authenticity based on
+ *   filesystem origin and extended attributes.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: umod
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONZERO
+ *   constraint: User-space pointer to a valid ELF relocatable object file
+ *     (ET_REL) compiled for the current kernel architecture. The image must
+ *     contain proper ELF headers, a .gnu.linkonce.this_module section with
+ *     struct module, and valid symbol and string tables. For signed modules
+ *     (CONFIG_MODULE_SIG), the signature is appended after the ELF data.
+ *     NULL is not valid; passing NULL with len > 0 causes EFAULT.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 52, ULONG_MAX
+ *   constraint: Size of the module image in bytes. Must be at least large
+ *     enough to contain a valid ELF header (52 bytes on 32-bit, 64 bytes on
+ *     64-bit). The image is copied in 16*PAGE_SIZE chunks with cond_resched()
+ *     between chunks. Very large modules may cause memory allocation failures.
+ *     A length of 0 or less than the ELF header size returns ENOEXEC.
+ *
+ * param: uargs
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: User-space pointer to a NUL-terminated string containing
+ *     space-separated module parameters in "name=value" format. May be NULL
+ *     or point to an empty string if no parameters are needed. The string
+ *     is copied using strndup_user() with a maximum length of ~2GB. Invalid
+ *     pointers cause EFAULT. Unknown parameters generate kernel warnings but
+ *     do not fail the load.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the module has been loaded, its
+ *     init function has completed, and it is now in MODULE_STATE_LIVE. The
+ *     module appears in /proc/modules and /sys/module/<name>. Note that a
+ *     positive return from the module's init function is treated as success
+ *     with a warning, not as an error.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller lacks CAP_SYS_MODULE capability, or module loading has
+ *     been disabled via /proc/sys/kernel/modules_disabled or the "nomodule"
+ *     boot parameter. Also returned if the module is blacklisted via the
+ *     module_blacklist= kernel parameter.
+ *
+ * error: ENOEXEC, Invalid module format
+ *   desc: The module image failed validation. Causes include: invalid ELF
+ *     magic or type, architecture mismatch, invalid section headers or bounds,
+ *     missing required sections, invalid symbol tables, vermagic mismatch,
+ *     missing modversions CRCs, duplicate exports, or livepatch without
+ *     CONFIG_LIVEPATCH. Check dmesg for specific validation failure details.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Failed to allocate memory for the module image copy, module
+ *     structure, per-CPU data, parameter storage, or executable memory
+ *     regions. Module loading is memory-intensive and may fail on systems
+ *     with memory pressure.
+ *
+ * error: EFAULT, Bad address
+ *   desc: Failed to copy data from user space. Either umod points to
+ *     unmapped memory, uargs points to an invalid string, or the module
+ *     image spans unmapped regions. The copy occurs in chunks, so partial
+ *     copies are possible before failure.
+ *
+ * error: EEXIST, Module already loaded
+ *   desc: A module with the same name is already loaded and in
+ *     MODULE_STATE_LIVE. Use delete_module() to unload it first if a
+ *     reload is intended.
+ *
+ * error: EBUSY, Module loading in progress
+ *   desc: Another thread is currently loading a module with the same name.
+ *     The syscall waited for completion but the other load also failed, or
+ *     a timeout occurred while waiting for symbol resolution from another
+ *     module being loaded (30-second timeout for symbol dependencies).
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: A signal was delivered while waiting for a concurrent module
+ *     load to complete, or while waiting for symbol resolution from a
+ *     module being loaded. The module was not loaded; retry is possible.
+ *
+ * error: ENOENT, Unknown symbol
+ *   desc: The module references a kernel or module symbol that does not
+ *     exist and is not marked as weak. The symbol name is logged to dmesg.
+ *     This typically indicates a version mismatch or missing dependency.
+ *
+ * error: EINVAL, Invalid parameter
+ *   desc: A module parameter value could not be parsed or is out of range.
+ *     Also returned if the module has both .ctors and .init_array sections,
+ *     or if symbol version information is inconsistent.
+ *
+ * error: EBADMSG, Bad message (since 3.7)
+ *   desc: Module signature verification is enabled (CONFIG_MODULE_SIG) and
+ *     the signature block is malformed or cannot be parsed. This is distinct
+ *     from a valid signature that fails verification.
+ *
+ * error: ENOKEY, Key unavailable (since 3.7)
+ *   desc: Module signature verification found a valid signature but the
+ *     signing key is not available in the kernel's trusted keyring. When
+ *     CONFIG_MODULE_SIG_FORCE is enabled, this becomes a fatal error.
+ *
+ * error: EKEYREJECTED, Key rejected
+ *   desc: Module signature verification is enforced (CONFIG_MODULE_SIG_FORCE
+ *     or module.sig_enforce=1) and the module is unsigned, has an invalid
+ *     signature, or uses unsupported cryptography. Loading is rejected.
+ *
+ * lock: module_mutex
+ *   type: KAPI_LOCK_MUTEX
+ *   acquired: true
+ *   released: true
+ *   desc: Global module mutex protecting the module list, symbol tables,
+ *     and module state transitions. Acquired during module lookup,
+ *     list insertion, symbol resolution, and formation completion.
+ *     May be held across sleeping operations.
+ *
+ * signal: any
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While waiting for concurrent module load or symbol resolution
+ *   desc: The syscall uses wait_event_interruptible when waiting for
+ *     another instance loading the same module or when waiting for symbols
+ *     from modules being loaded. Fatal signals (SIGKILL, SIGTERM) interrupt
+ *     the wait and cause EINTR return. Non-fatal signals may also interrupt.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_ALLOC_MEMORY
+ *   target: Kernel memory for module text, data, rodata, and per-CPU sections
+ *   desc: Allocates executable memory for module code and regular memory for
+ *     module data. Memory is allocated from execmem/vmalloc pools and remains
+ *     allocated until the module is unloaded via delete_module().
+ *   reversible: yes
+ *   condition: Always on successful load
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Global module list (/proc/modules)
+ *   desc: Adds the module to the kernel's linked list of loaded modules,
+ *     making it visible in /proc/modules and to find_module() lookups.
+ *     The module's exported symbols become available for resolution.
+ *   reversible: yes
+ *   condition: When module passes validation
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Kernel symbol table
+ *   desc: The module's EXPORT_SYMBOL() and EXPORT_SYMBOL_GPL() entries are
+ *     added to the kernel's symbol lookup tables, making them available
+ *     for other modules and kernel subsystems.
+ *   reversible: yes
+ *   condition: After relocation and before init
+ *
+ * side-effect: KAPI_EFFECT_FILESYSTEM
+ *   target: /sys/module/<name>/ sysfs entries
+ *   desc: Creates sysfs directory and files for module attributes including
+ *     parameters, refcnt, holders, sections, and various module info. These
+ *     entries persist until module unload.
+ *   reversible: yes
+ *   condition: Before running init function
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: Kernel taint flags
+ *   desc: May set kernel taint flags including TAINT_OOT_MODULE (out-of-tree),
+ *     TAINT_PROPRIETARY_MODULE, TAINT_FORCED_MODULE (vermagic bypassed),
+ *     TAINT_UNSIGNED_MODULE, TAINT_LIVEPATCH, TAINT_TEST, or TAINT_CRAP
+ *     (staging driver). Taints are permanent for the session.
+ *   reversible: no
+ *   condition: Based on module metadata and signature status
+ *
+ * side-effect: KAPI_EFFECT_IRREVERSIBLE
+ *   target: Module init function execution
+ *   desc: Executes the module's __init function which may register drivers,
+ *     allocate resources, create device nodes, or make other persistent
+ *     kernel changes. Side effects of init depend on the specific module.
+ *   condition: After all validation and setup complete
+ *
+ * state-trans: module
+ *   from: (not loaded)
+ *   to: MODULE_STATE_LIVE
+ *   condition: Successful completion of all loading phases
+ *   desc: New module transitions through UNFORMED -> COMING -> LIVE states.
+ *     UNFORMED indicates setup in progress, COMING indicates init running,
+ *     LIVE indicates fully operational. On failure, transitions to GOING
+ *     before cleanup.
+ *
+ * capability: CAP_SYS_MODULE
+ *   type: KAPI_CAP_PERFORM_OPERATION
+ *   allows: Loading kernel modules
+ *   without: Returns -EPERM immediately
+ *   condition: Checked first before any other processing
+ *
+ * constraint: Module Loading Disabled
+ *   desc: If /proc/sys/kernel/modules_disabled has been set to 1 (one-shot
+ *     irreversible), or the kernel was booted with "nomodule" parameter,
+ *     all module loading is disabled and returns -EPERM.
+ *
+ * constraint: Module Blacklist
+ *   desc: Modules listed in the module_blacklist= kernel parameter cannot
+ *     be loaded and return -EPERM. The blacklist is a comma-separated list
+ *     of module names.
+ *
+ * constraint: Signature Enforcement
+ *   desc: When CONFIG_MODULE_SIG_FORCE is enabled or module.sig_enforce=1,
+ *     only validly signed modules with trusted keys can be loaded. Unsigned
+ *     or invalidly signed modules return -EKEYREJECTED.
+ *
+ * constraint: Kernel Lockdown
+ *   desc: When kernel lockdown is active (LOCKDOWN_MODULE_SIGNATURE), module
+ *     signature requirements are enforced. LSMs may impose additional
+ *     restrictions via security_kernel_load_data() hook.
+ *
+ * examples: syscall(SYS_init_module, buf, buflen, "");  // No parameters
+ *   syscall(SYS_init_module, buf, len, "debug=1 timeout=30");  // With params
+ *
+ * notes: This syscall is primarily used by modprobe and insmod utilities.
+ *   Direct use is discouraged; prefer finit_module() which provides better
+ *   security properties by loading from a file descriptor.
+ *
+ *   glibc does not provide a wrapper for this syscall; use syscall(2).
+ *
+ *   Module loading is serialized for modules with the same name. Concurrent
+ *   loads of different modules proceed in parallel.
+ *
+ *   The 30-second timeout for symbol resolution prevents deadlocks when
+ *   module A depends on symbols from module B which depends on A.
+ *
+ *   Memory for the init section is freed after init completes (via work
+ *   queue to avoid blocking). This is why __init functions cannot be
+ *   called after module initialization.
+ *
+ *   Corner cases:
+ *   - Zero-length buffer: Returns -ENOEXEC (too small for ELF header)
+ *   - NULL umod with len > 0: Returns -EFAULT
+ *   - NULL uargs: Treated as empty parameter string (valid)
+ *   - Module already loaded: Returns -EEXIST
+ *   - Module currently loading: Waits, may return -EINTR or -EBUSY
+ *   - Invalid ELF but valid length: Returns -ENOEXEC after copy
+ *   - Module init returns error: Returns that error, module unloaded
+ *   - Module init returns positive: Warning logged, treated as success
+ *
+ * since-version: 1.0
+ */
 SYSCALL_DEFINE3(init_module, void __user *, umod,
 		unsigned long, len, const char __user *, uargs)
 {
