@@ -284,10 +284,240 @@ err_put:
 }
 
 /**
- * sys_get_robust_list() - Get the robust-futex list head of a task
- * @pid:	pid of the process [zero for current task]
- * @head_ptr:	pointer to a list-head pointer, the kernel fills it in
- * @len_ptr:	pointer to a length field, the kernel fills in the header size
+ * sys_get_robust_list - Retrieve the robust futex list head of a thread
+ * @pid: Thread ID to query, or 0 for the calling thread
+ * @head_ptr: User pointer where the list head address will be stored
+ * @len_ptr: User pointer where the list head structure size will be stored
+ *
+ * long-desc: Retrieves the robust futex list head pointer previously
+ *   registered by a thread via set_robust_list(). This syscall is primarily
+ *   used for debugging, inspection, and process introspection tools.
+ *
+ *   When pid is 0, returns the calling thread's own robust list head. When
+ *   pid is non-zero, it specifies the thread ID (TID) of the target thread.
+ *   Thread IDs are kernel thread IDs as returned by clone(2) or gettid(2),
+ *   not process IDs (PIDs).
+ *
+ *   On success, two values are written to user space:
+ *   1. The robust list head pointer is written to *head_ptr. This may be
+ *      NULL if the thread never called set_robust_list() or explicitly
+ *      registered NULL.
+ *   2. The size of the robust_list_head structure is written to *len_ptr.
+ *      This is always sizeof(struct robust_list_head) for the kernel version,
+ *      providing ABI versioning information.
+ *
+ *   Access to another thread's robust list requires passing a ptrace access
+ *   check with PTRACE_MODE_READ_REALCREDS. This means:
+ *   1. The caller must have matching real UID/GID credentials with the target
+ *      (comparing real UID against target's real, effective, and saved UIDs,
+ *      and similarly for GIDs), OR
+ *   2. The caller must have CAP_SYS_PTRACE capability in the target's user
+ *      namespace, OR
+ *   3. The target process must be dumpable (SUID_DUMP_USER) and the caller
+ *      must have CAP_SYS_PTRACE in the target's mm user namespace.
+ *
+ *   Additionally, Linux Security Modules (AppArmor, SELinux, Landlock) may
+ *   impose further restrictions on ptrace access.
+ *
+ *   The syscall holds signal->exec_update_lock during the permission check
+ *   and pointer retrieval to prevent race conditions with concurrent exec()
+ *   operations that might change the target's credentials.
+ *
+ *   A compat version exists for 32-bit processes on 64-bit kernels. The
+ *   compat version retrieves compat_robust_list (12 bytes) instead of
+ *   robust_list (24 bytes on 64-bit), and writes a compat pointer.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Thread ID of the target thread. Use 0 to query the calling
+ *     thread's own robust list (no permission check required). Non-zero
+ *     values specify a kernel thread ID (TID) as returned by clone(2) or
+ *     gettid(2). The TID must refer to an existing thread visible in the
+ *     caller's PID namespace; otherwise ESRCH is returned. Negative values
+ *     are treated as invalid TIDs and will return ESRCH.
+ *
+ * param: head_ptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must point to valid, writable user memory capable of storing
+ *     a pointer (8 bytes on 64-bit, 4 bytes on 32-bit systems). The kernel
+ *     writes the target thread's robust_list head pointer to this location.
+ *     The written value may be NULL if the target never registered a robust
+ *     list. Cannot be NULL; passing NULL causes EFAULT.
+ *
+ * param: len_ptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Must point to valid, writable user memory capable of storing
+ *     a size_t (8 bytes on 64-bit, 4 bytes on 32-bit systems). The kernel
+ *     writes sizeof(struct robust_list_head) to this location, providing
+ *     ABI version information. Cannot be NULL; passing NULL causes EFAULT.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success, indicating that *head_ptr contains the
+ *     target thread's robust list head pointer and *len_ptr contains the
+ *     structure size. The head pointer may be NULL if no robust list was
+ *     registered.
+ *
+ * error: ESRCH, No such thread
+ *   desc: No thread with the specified pid exists in the caller's PID
+ *     namespace. This includes the case where pid refers to a process that
+ *     has already exited, a TID that never existed, or a TID in a different
+ *     PID namespace not visible to the caller.
+ *
+ * error: EPERM, Permission denied
+ *   desc: The caller lacks permission to access the target thread's robust
+ *     list. This occurs when pid is non-zero (querying another thread) and
+ *     the ptrace access check fails. Permission is denied if: (1) the
+ *     caller's real UID/GID credentials do not match the target's real,
+ *     effective, and saved UID/GID, AND (2) the caller lacks CAP_SYS_PTRACE
+ *     capability, AND (3) either the target is not dumpable or the caller
+ *     lacks CAP_SYS_PTRACE in the target mm's user namespace. LSM modules
+ *     (SELinux, AppArmor, Landlock) may also deny access based on their
+ *     policies.
+ *
+ * error: EFAULT, Bad address
+ *   desc: Either head_ptr or len_ptr points to memory that cannot be
+ *     written. This can occur if the pointers are NULL, point to unmapped
+ *     memory, or point to read-only memory. The put_user() operation fails
+ *     and the syscall returns immediately.
+ *
+ * error: EINTR, Interrupted by signal
+ *   desc: A fatal signal (SIGKILL or SIGSTOP) was received while waiting
+ *     to acquire the exec_update_lock semaphore. This can occur when pid
+ *     is non-zero and the target thread is concurrently executing exec().
+ *     The syscall should not be automatically restarted as the operation
+ *     was not started.
+ *
+ * lock: RCU read lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: Held briefly while looking up the target task by PID via
+ *     find_task_by_vpid() and incrementing its reference count. The lock
+ *     is acquired and released using scoped_guard(rcu).
+ *
+ * lock: signal->exec_update_lock
+ *   type: KAPI_LOCK_RWLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Read semaphore acquired on the target task's signal structure
+ *     before performing the ptrace access check and reading robust_list.
+ *     This serializes with concurrent exec() operations to prevent race
+ *     conditions where credentials change during the access check. Acquired
+ *     via down_read_killable(), which can return -EINTR on fatal signals.
+ *     Always released before returning, even on error paths.
+ *
+ * lock: task->alloc_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: Spinlock acquired indirectly via task_lock() inside
+ *     ptrace_may_access() when checking credentials. Protects reading of
+ *     task credentials during the permission check.
+ *
+ * signal: SIGKILL
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_RETURN
+ *   condition: While blocked on exec_update_lock acquisition
+ *   desc: If a fatal signal (SIGKILL or SIGSTOP) arrives while waiting
+ *     for the exec_update_lock, the syscall aborts and returns -EINTR.
+ *     The down_read_killable() function uses TASK_KILLABLE state, making
+ *     it interruptible only by fatal signals, not by normal signals.
+ *   error: -EINTR
+ *   timing: KAPI_SIGNAL_TIME_DURING
+ *   restartable: no
+ *
+ * side-effect: KAPI_EFFECT_NONE
+ *   target: User memory at head_ptr and len_ptr
+ *   desc: On success, writes two values to user memory: the robust list
+ *     head pointer to *head_ptr and sizeof(struct robust_list_head) to
+ *     *len_ptr. These are read-only operations on kernel state with
+ *     write-only effects on user space. No kernel state is modified.
+ *   reversible: yes
+ *   condition: Always on success
+ *
+ * capability: CAP_SYS_PTRACE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Access to any thread's robust list regardless of credential
+ *     matching or dumpability status
+ *   without: Must have matching credentials with target (real UID/GID
+ *     must match target's real/effective/saved UID/GID) and target must
+ *     be dumpable
+ *   condition: Checked when pid is non-zero (querying another thread)
+ *
+ * constraint: PID namespace visibility
+ *   desc: The pid parameter is interpreted within the caller's PID
+ *     namespace. Threads in child or sibling PID namespaces may have
+ *     different apparent PIDs. A pid value valid in one namespace may
+ *     refer to a different thread or no thread in another namespace.
+ *
+ * constraint: Credential stability
+ *   desc: The exec_update_lock ensures that the target's credentials are
+ *     stable during the permission check. Without this lock, a race with
+ *     exec() could allow access based on pre-exec credentials to a
+ *     post-exec privileged process, potentially leaking sensitive
+ *     information.
+ *
+ * constraint: LSM policy
+ *   desc: Linux Security Modules may impose additional restrictions
+ *     beyond standard credential checks. AppArmor, SELinux, and Landlock
+ *     all implement ptrace_access_check hooks that can deny access based
+ *     on their configured policies, returning -EPERM.
+ *
+ * examples: struct robust_list_head *head;
+ *   size_t len;
+ *   int ret;
+ *   // Get own robust list
+ *   ret = syscall(SYS_get_robust_list, 0, &head, &len);
+ *   if (ret == 0) printf("head=%p, len=%zu\n", head, len);
+ *   // Get another thread's robust list (requires permission)
+ *   ret = syscall(SYS_get_robust_list, tid, &head, &len);
+ *   if (ret == -1 && errno == EPERM) printf("access denied\n");
+ *
+ * notes: This syscall is not intended for normal application use.
+ *   Applications should use glibc's robust mutex implementation via
+ *   pthread_mutexattr_setrobust(). glibc does not provide a wrapper
+ *   function; direct invocation requires syscall(2).
+ *
+ *   The returned pointer may be stale if the target thread concurrently
+ *   calls set_robust_list() after this syscall retrieves the value. There
+ *   is no atomic "get and lock" operation.
+ *
+ *   For 32-bit processes on 64-bit kernels, the compat syscall version
+ *   (compat_sys_get_robust_list) retrieves compat_robust_list instead,
+ *   which is 12 bytes vs 24 bytes. The len_ptr value reflects this.
+ *
+ *   A security fix in kernel 6.x added exec_update_lock protection to
+ *   prevent leaking robust_list pointers across privilege boundaries
+ *   during exec() races. Prior kernels had a TOCTOU vulnerability where
+ *   an attacker could read post-exec addresses from a setuid process.
+ *
+ *   The syscall was briefly deprecated in 2012 (marked for removal) due
+ *   to security concerns, but the deprecation was reverted because the
+ *   syscall was in active use and the security issues were addressed by
+ *   the permission checks.
+ *
+ *   Corner cases:
+ *   - pid=0: Returns caller's own list, no permission check needed
+ *   - pid=caller's own TID: Treated same as pid=0 functionally, but does
+ *     go through find_task_by_vpid and permission check (which passes)
+ *   - head_ptr/len_ptr=NULL: Returns -EFAULT
+ *   - Target never called set_robust_list: Returns NULL in *head_ptr
+ *   - Target thread exiting: Returns -ESRCH if already reaped
+ *   - Target execing: May block on exec_update_lock, returns -EINTR if
+ *     killed while waiting
+ *
+ * since-version: 2.6.17
  */
 SYSCALL_DEFINE3(get_robust_list, int, pid,
 		struct robust_list_head __user * __user *, head_ptr,
