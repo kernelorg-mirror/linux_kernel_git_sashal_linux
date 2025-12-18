@@ -5346,6 +5346,230 @@ do_sigaltstack (const stack_t *ss, stack_t *oss, unsigned long sp,
 	return ret;
 }
 
+/**
+ * sys_sigaltstack - set and/or get alternate signal stack context
+ * @uss: Pointer to new alternate signal stack configuration, or NULL
+ * @uoss: Pointer to buffer for receiving current configuration, or NULL
+ *
+ * long-desc: Sets and/or retrieves the alternate signal stack for the
+ *   calling thread. The alternate signal stack is a specially designated
+ *   memory region used for executing signal handlers, separate from the
+ *   thread's main stack. This is primarily used to handle SIGSEGV and
+ *   other signals that may be generated when the normal stack overflows
+ *   or becomes corrupted.
+ *
+ *   The alternate signal stack is defined by a stack_t structure containing:
+ *   - ss_sp: Base address of the stack memory region
+ *   - ss_size: Size of the stack in bytes
+ *   - ss_flags: Control flags (SS_DISABLE, SS_ONSTACK, SS_AUTODISARM)
+ *
+ *   When @uss is non-NULL, it specifies the new alternate signal stack
+ *   configuration. The ss_flags field controls the operation:
+ *   - ss_flags == 0: Enable a new alternate stack with the given ss_sp/ss_size
+ *   - ss_flags == SS_DISABLE: Disable the alternate stack (ss_sp/ss_size ignored)
+ *   - ss_flags == SS_ONSTACK: Same as 0 on Linux (for compatibility, not portable)
+ *   - SS_AUTODISARM flag (OR-ed): Auto-disarm the stack on signal handler entry
+ *
+ *   The SS_AUTODISARM flag (since Linux 4.7) causes the alternate stack to be
+ *   disabled when a signal handler is entered. The previous stack settings are
+ *   saved in the signal frame's uc_stack field and automatically restored when
+ *   the signal handler returns via sigreturn. This enables safe use of
+ *   swapcontext() inside signal handlers, as subsequent signals will not reuse
+ *   the same signal stack that the handler has switched away from.
+ *
+ *   When @uoss is non-NULL, the current alternate signal stack settings are
+ *   returned before any changes are applied. The returned ss_flags will indicate:
+ *   - SS_DISABLE: No alternate stack is configured
+ *   - SS_ONSTACK: Currently executing on the alternate signal stack
+ *   - SS_AUTODISARM: Stack has auto-disarm enabled
+ *   Multiple flags may be combined in the output.
+ *
+ *   Attempting to change the alternate stack while currently executing on it
+ *   (on_sig_stack() returns true) is not permitted and returns EPERM. However,
+ *   if SS_AUTODISARM is set, the stack is considered disabled during signal
+ *   handler execution, so modification is permitted.
+ *
+ *   The stack size must be at least MINSIGSTKSZ (typically 2048 bytes). On
+ *   architectures with dynamic signal frames (CONFIG_DYNAMIC_SIGFRAME, e.g.,
+ *   x86 with AVX-512/AMX), additional size validation is performed via
+ *   sigaltstack_size_valid() which may require larger stacks depending on the
+ *   task's FPU/XSTATE feature permissions. The AT_MINSIGSTKSZ auxiliary vector
+ *   entry provides the runtime-recommended minimum stack size.
+ *
+ *   The kernel automatically aligns ss_sp to an appropriate boundary for
+ *   the architecture. On most architectures, stacks grow downward, so the
+ *   signal handler frame is placed at ss_sp + ss_size.
+ *
+ *   Fork/clone behavior: The alternate signal stack is inherited by child
+ *   processes. However, if CLONE_VM is specified without CLONE_VFORK, the
+ *   child's alternate stack is reset to disabled (sas_ss_reset) because the
+ *   parent's stack memory is shared.
+ *
+ *   Execve behavior: The alternate signal stack is cleared (disabled) when a
+ *   new program is executed via execve(). The new program starts with no
+ *   alternate signal stack configured.
+ *
+ *   Both @uss and @uoss may be NULL. If both are NULL, the syscall is a no-op
+ *   and returns 0. If @uss is NULL, only the current stack is retrieved. If
+ *   @uoss is NULL, only the new stack is set.
+ *
+ *   Optimization: If the new stack settings (@uss) exactly match the current
+ *   settings, the syscall returns 0 immediately without acquiring any locks.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: uss
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Pointer to stack_t structure defining the new alternate signal
+ *     stack, or NULL to skip setting. The ss_sp field must point to a valid
+ *     user-space memory region of at least ss_size bytes. The ss_size field
+ *     must be at least MINSIGSTKSZ (typically 2048), and may need to be larger
+ *     on architectures with dynamic signal frames (check AT_MINSIGSTKSZ).
+ *     The ss_flags field must be 0, SS_DISABLE, SS_ONSTACK, or a combination
+ *     with SS_AUTODISARM. Invalid flag combinations return EINVAL.
+ *
+ * param: uoss
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_OUT | KAPI_PARAM_OPTIONAL | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_NONE
+ *   constraint: Pointer to stack_t structure to receive the current alternate
+ *     signal stack configuration, or NULL to skip retrieval. When provided,
+ *     the current ss_sp, ss_size, and ss_flags are written before any changes
+ *     are applied. The output ss_flags reflects the current state (SS_DISABLE
+ *     if no stack configured, SS_ONSTACK if currently on the stack,
+ *     SS_AUTODISARM if auto-disarm is enabled).
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_EXACT
+ *   success: 0
+ *   desc: Returns 0 on success. If both @uss and @uoss are NULL, returns 0
+ *     as a no-op. If the new settings match the current settings exactly,
+ *     returns 0 without making changes (optimization path).
+ *
+ * error: EFAULT, Invalid user pointer
+ *   desc: Either @uss points outside the accessible address space and could
+ *     not be read (copy_from_user failed), or @uoss points outside the
+ *     accessible address space and the current stack settings could not be
+ *     written (copy_to_user failed). The EFAULT for @uoss is only checked
+ *     after successful processing, so partial side effects are possible if
+ *     @uss was valid but @uoss is invalid.
+ *
+ * error: EPERM, Modification while on alternate stack
+ *   desc: Attempted to change the alternate signal stack (by providing @uss)
+ *     while currently executing on that stack. This check is performed by
+ *     on_sig_stack() which compares the current stack pointer against the
+ *     configured sas_ss_sp/sas_ss_size range. If SS_AUTODISARM is set, the
+ *     stack is considered disabled during handler execution and this error
+ *     does not occur.
+ *
+ * error: EINVAL, Invalid flags
+ *   desc: The ss_flags field in @uss contains invalid flags. Valid combinations
+ *     are: 0 (enable stack), SS_ONSTACK (same as 0 on Linux), SS_DISABLE
+ *     (disable stack), and these may be OR-ed with SS_AUTODISARM. Any other
+ *     bits set in ss_flags cause EINVAL. Note that using SS_ONSTACK reduces
+ *     portability as other Unix systems may reject it.
+ *
+ * error: ENOMEM, Stack size too small
+ *   desc: The ss_size field in @uss is smaller than the minimum required size.
+ *     The minimum is MINSIGSTKSZ (typically 2048 bytes) for basic operation,
+ *     but on x86 with CONFIG_DYNAMIC_SIGFRAME, larger stacks may be required
+ *     depending on the task's XSTATE feature permissions (AVX-512, AMX, etc.).
+ *     The sigaltstack_size_valid() function performs this architecture-specific
+ *     validation while holding sighand->siglock. Applications should query
+ *     AT_MINSIGSTKSZ from the auxiliary vector for the recommended minimum.
+ *
+ * lock: current->sighand->siglock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: On architectures with CONFIG_DYNAMIC_SIGFRAME (x86), the signal
+ *     handler lock is acquired with IRQs disabled (spin_lock_irq) via
+ *     sigaltstack_lock() when modifying the alternate stack settings. This
+ *     serializes access with XSTATE permission requests that also check the
+ *     signal stack size. On architectures without CONFIG_DYNAMIC_SIGFRAME,
+ *     sigaltstack_lock() is a no-op and no lock is acquired. The lock is
+ *     only held during the actual modification of sas_ss_sp/sas_ss_size/
+ *     sas_ss_flags, not during the copy_from_user/copy_to_user operations.
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE | KAPI_EFFECT_PROCESS_STATE
+ *   target: Current task's alternate signal stack configuration
+ *   desc: Modifies current->sas_ss_sp (stack base address), current->sas_ss_size
+ *     (stack size), and current->sas_ss_flags (control flags). These fields in
+ *     task_struct control where signal handlers execute when SA_ONSTACK is set
+ *     in the sigaction flags. When SS_DISABLE is set, sas_ss_sp is set to NULL
+ *     and sas_ss_size is set to 0. The changes persist until modified by another
+ *     sigaltstack() call, execve() (which clears them), or certain clone() flags
+ *     that reset the stack.
+ *   condition: @uss is non-NULL and different from current settings
+ *   reversible: yes (by calling sigaltstack with previous settings)
+ *
+ * state-trans: alternate_signal_stack
+ *   from: disabled
+ *   to: enabled
+ *   condition: @uss->ss_flags is 0 or SS_ONSTACK (not SS_DISABLE) with valid size
+ *   desc: Transitions from no alternate stack to an active alternate stack.
+ *     Signal handlers registered with SA_ONSTACK will now execute on this stack.
+ *
+ * state-trans: alternate_signal_stack
+ *   from: enabled
+ *   to: disabled
+ *   condition: @uss->ss_flags includes SS_DISABLE
+ *   desc: Disables the alternate signal stack. Signal handlers will execute
+ *     on the normal thread stack regardless of SA_ONSTACK flag.
+ *
+ * state-trans: alternate_signal_stack
+ *   from: enabled
+ *   to: auto-disarm-enabled
+ *   condition: @uss->ss_flags includes SS_AUTODISARM (without SS_DISABLE)
+ *   desc: Configures the stack with auto-disarm behavior. On signal handler
+ *     entry, the stack settings are saved to the signal frame and the stack
+ *     is automatically disabled. Settings are restored on sigreturn.
+ *
+ * constraint: Minimum stack size
+ *   desc: The alternate signal stack must be at least MINSIGSTKSZ bytes
+ *     (typically 2048). On architectures with extended state (x86 AVX-512,
+ *     AMX), larger sizes may be required. The AT_MINSIGSTKSZ auxiliary vector
+ *     entry provides the runtime minimum. Using a stack smaller than required
+ *     for the signal frame results in undefined behavior (stack corruption).
+ *   expr: ss_size >= MINSIGSTKSZ && sigaltstack_size_valid(ss_size)
+ *
+ * constraint: Cannot modify while on stack
+ *   desc: The alternate signal stack cannot be modified while executing on it.
+ *     This prevents corruption of the current signal handler's stack frame.
+ *     The SS_AUTODISARM flag provides a workaround by disabling the stack
+ *     during handler execution.
+ *   expr: !on_sig_stack(current_user_stack_pointer()) || (sas_ss_flags & SS_AUTODISARM)
+ *
+ * examples: sigaltstack(&new_stack, NULL);  // Set new stack
+ *   sigaltstack(NULL, &old_stack);  // Query current stack
+ *   sigaltstack(&new_stack, &old_stack);  // Atomically swap
+ *   sigaltstack(&(stack_t){.ss_flags = SS_DISABLE}, NULL);  // Disable stack
+ *
+ * notes: The SIGSTKSZ constant (typically 8192 bytes) is the recommended
+ *   stack size for most applications. MINSIGSTKSZ is the absolute minimum.
+ *   For robust applications on modern x86 systems, query AT_MINSIGSTKSZ and
+ *   add SIGSTKSZ to it for safety.
+ *
+ *   Using SS_ONSTACK in the input ss_flags is a Linux-specific no-op that may
+ *   cause portability problems. POSIX only specifies SS_DISABLE for input;
+ *   SS_ONSTACK is defined for output only (to indicate execution on the stack).
+ *
+ *   The SS_AUTODISARM flag (Linux 4.7+) is essential for applications that use
+ *   swapcontext() or similar context-switching functions inside signal handlers.
+ *   Without it, a subsequent signal could corrupt the switched-away handler's
+ *   state by reusing the same signal stack.
+ *
+ *   There is no RLIMIT affecting sigaltstack. The memory for the stack must be
+ *   allocated by the application (typically via mmap with MAP_STACK flag).
+ *
+ *   No capability checks are performed. Any process can configure its own
+ *   alternate signal stack.
+ *
+ * since-version: 2.2
+ */
 SYSCALL_DEFINE2(sigaltstack,const stack_t __user *,uss, stack_t __user *,uoss)
 {
 	stack_t new, old;
