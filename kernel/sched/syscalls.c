@@ -2145,12 +2145,320 @@ static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
 }
 
 /**
- * sys_sched_setaffinity - set the CPU affinity of a process
- * @pid: pid of the process
+ * sys_sched_setaffinity - set the CPU affinity mask of a thread
+ * @pid: thread ID of the target thread (0 means calling thread)
  * @len: length in bytes of the bitmask pointed to by user_mask_ptr
- * @user_mask_ptr: user-space pointer to the new CPU mask
+ * @user_mask_ptr: user-space pointer to the new CPU affinity mask
  *
- * Return: 0 on success. An error code otherwise.
+ * long-desc: Sets the CPU affinity mask of the thread specified by @pid to the
+ *   value pointed to by @user_mask_ptr. The CPU affinity mask determines which
+ *   CPUs the thread is eligible to run on. If the thread is not currently
+ *   running on one of the CPUs specified in the new mask, it will be migrated
+ *   to an eligible CPU. The @pid argument is a thread ID (the value returned by
+ *   gettid() or clone()), not a process ID - to operate on a different thread
+ *   in a multi-threaded process, use the specific thread's TID. When @pid is 0,
+ *   the calling thread is modified.
+ *
+ *   The @len parameter specifies the size in bytes of the affinity mask. If
+ *   @len is smaller than the kernel's cpumask_size(), the remaining bits are
+ *   treated as zero. If @len is larger, only cpumask_size() bytes are copied.
+ *   This allows the syscall to work across kernel versions with different
+ *   NR_CPUS configurations.
+ *
+ *   The actual affinity is constrained to the intersection of the requested
+ *   mask and the CPUs allowed by the task's cpuset. If this intersection is
+ *   empty, the syscall fails with -EINVAL. The kernel preserves the
+ *   user-requested mask internally, so if the cpuset later expands to include
+ *   more CPUs that match the original request, the task may run on those CPUs.
+ *
+ *   Child processes created via fork() inherit the parent's CPU affinity mask.
+ *   The affinity mask is preserved across execve(). Each thread in a thread
+ *   group can have its own affinity mask, adjusted independently.
+ *
+ * context-flags: KAPI_CTX_PROCESS | KAPI_CTX_SLEEPABLE
+ *
+ * param: pid
+ *   type: KAPI_TYPE_INT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, PID_MAX_LIMIT
+ *   constraint: Must be either 0 (for the calling thread) or a valid thread ID
+ *     in the caller's PID namespace. Negative values are not valid but are
+ *     treated as a lookup for a non-existent thread (returns -ESRCH). The value
+ *     is interpreted as a TID (thread ID), not a TGID (process ID). Using a
+ *     TGID will only affect the main thread of that process, not all threads.
+ *
+ * param: len
+ *   type: KAPI_TYPE_UINT
+ *   flags: KAPI_PARAM_IN
+ *   constraint-type: KAPI_CONSTRAINT_RANGE
+ *   range: 0, UINT_MAX
+ *   constraint: Length in bytes of the user-space CPU mask buffer. The kernel
+ *     handles variable-sized masks: if @len is less than cpumask_size(), the
+ *     kernel clears the mask first then copies @len bytes (remaining bits are
+ *     zero). If @len is greater than cpumask_size(), only cpumask_size() bytes
+ *     are copied. A @len of 0 results in an empty mask, which will fail with
+ *     -EINVAL if it results in no valid CPUs.
+ *
+ * param: user_mask_ptr
+ *   type: KAPI_TYPE_USER_PTR
+ *   flags: KAPI_PARAM_IN | KAPI_PARAM_USER
+ *   constraint-type: KAPI_CONSTRAINT_CUSTOM
+ *   constraint: Must be a valid user-space pointer to a buffer of at least
+ *     @len bytes containing the desired CPU affinity bitmask. The mask is a
+ *     bitmap where bit N set indicates CPU N is allowed. If @user_mask_ptr is
+ *     NULL or points to inaccessible memory, copy_from_user() fails and the
+ *     syscall returns -EFAULT. The buffer does not need to be aligned.
+ *
+ * return:
+ *   type: KAPI_TYPE_INT
+ *   check-type: KAPI_RETURN_ERROR_CHECK
+ *   success: 0
+ *   desc: Returns 0 on success, indicating the thread's CPU affinity has been
+ *     updated. The thread will be migrated to an allowed CPU if necessary.
+ *     The user-requested mask is stored internally and will be used to restore
+ *     affinity if the cpuset later changes to permit more CPUs.
+ *
+ * error: ENOMEM, Out of memory
+ *   desc: Memory allocation failed. The syscall allocates temporary cpumask
+ *     structures (via alloc_cpumask_var() with GFP_KERNEL) and storage for the
+ *     user-requested mask (via alloc_user_cpus_ptr()). This error is most
+ *     likely under extreme memory pressure. On non-SMP kernels where
+ *     alloc_user_cpus_ptr() returns NULL by design, this path is handled
+ *     specially and does not trigger ENOMEM.
+ *
+ * error: EFAULT, Bad address
+ *   desc: The @user_mask_ptr pointer is invalid or inaccessible. Returned when
+ *     copy_from_user() fails to read @len bytes from @user_mask_ptr. This
+ *     occurs when the pointer is NULL, points to unmapped memory, points to
+ *     kernel memory, or the buffer is not fully readable.
+ *
+ * error: ESRCH, No such process
+ *   desc: No thread with the specified @pid exists in the caller's PID
+ *     namespace. The lookup uses find_task_by_vpid() which respects PID
+ *     namespace isolation - threads in parent or sibling PID namespaces are
+ *     not visible. This error also occurs if the thread existed but exited
+ *     before the lookup completed. When @pid is 0, this error cannot occur
+ *     as the calling thread is used directly.
+ *
+ * error: EINVAL, Invalid argument
+ *   desc: Returned in several cases: (1) The target task has the
+ *     PF_NO_SETAFFINITY flag set, indicating it is a special kernel thread
+ *     (such as per-CPU kthreads, migration threads, or workqueue workers)
+ *     whose affinity userspace is not allowed to modify. (2) The effective
+ *     CPU mask (intersection of requested mask with cpuset-allowed CPUs)
+ *     contains no active CPUs. (3) For non-kthread tasks, the requested mask
+ *     is not a subset of task_cpu_possible_mask() (which may be restricted on
+ *     asymmetric systems). (4) A race with concurrent cpuset updates caused
+ *     the effective mask to become invalid; in this case the kernel attempts
+ *     to fall back to the cpuset mask, but if this also fails the syscall
+ *     returns -EINVAL. (5) For tasks with migration disabled, if the new mask
+ *     does not include the CPU the task is currently running on.
+ *
+ * error: EPERM, Operation not permitted
+ *   desc: Permission denied. The caller does not have permission to modify the
+ *     target thread's affinity. This occurs when: (1) The calling process does
+ *     not own the target thread (i.e., caller's EUID does not match the target
+ *     thread's UID or EUID), AND (2) the caller lacks the CAP_SYS_NICE
+ *     capability in the target thread's user namespace. The ownership check
+ *     uses check_same_owner() and compares effective UIDs.
+ *
+ * error: EACCES, Permission denied (LSM)
+ *   desc: A Linux Security Module (such as SELinux, AppArmor, Smack, or
+ *     another LSM) denied permission to modify the target thread's scheduling
+ *     parameters via the security_task_setscheduler() hook. SELinux requires
+ *     the PROCESS__SETSCHED permission for this operation. This error is
+ *     distinct from EPERM which is returned for capability/ownership checks.
+ *
+ * error: EBUSY, Device or resource busy
+ *   desc: Returned for SCHED_DEADLINE tasks when the requested CPU affinity
+ *     mask is not a superset of the root domain's span. SCHED_DEADLINE uses
+ *     per-root-domain bandwidth accounting, so a deadline task must be able
+ *     to run on all CPUs in its root domain. The check is performed by
+ *     dl_task_check_affinity() and only applies when deadline bandwidth
+ *     control is enabled. Regular (non-deadline) tasks do not encounter this
+ *     error. Also returned if the current task has migration disabled and
+ *     the new mask doesn't include the current CPU.
+ *
+ * lock: rcu_read_lock
+ *   type: KAPI_LOCK_RCU
+ *   acquired: true
+ *   released: true
+ *   desc: RCU read lock is acquired via guard(rcu)() in find_get_task() when
+ *     looking up the target thread, and in check_same_owner() when comparing
+ *     credentials. This protects the task_struct and cred structures from
+ *     being freed during access. The task's reference count is incremented
+ *     before RCU unlock using get_task_struct(), and decremented after the
+ *     operation completes via the CLASS(find_get_task) destructor.
+ *
+ * lock: pi_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The target task's pi_lock (priority inheritance lock) is acquired
+ *     as part of task_rq_lock() in __set_cpus_allowed_ptr(). This spinlock
+ *     protects the task's scheduling-related fields including cpus_mask and
+ *     user_cpus_ptr. Acquired with interrupts disabled (raw_spin_lock_irqsave).
+ *     The lock ordering is: pi_lock -> rq->lock.
+ *
+ * lock: rq->lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The per-CPU run queue lock is acquired via task_rq_lock() in
+ *     __set_cpus_allowed_ptr(). This lock serializes modifications to the
+ *     task's CPU affinity and ensures atomic updates to run queue data
+ *     structures during potential task migration. Released before the
+ *     function returns, but may be temporarily dropped during migration.
+ *
+ * lock: callback_lock
+ *   type: KAPI_LOCK_SPINLOCK
+ *   acquired: true
+ *   released: true
+ *   desc: The cpuset callback_lock is acquired with spin_lock_irqsave() in
+ *     cpuset_cpus_allowed() when reading the task's cpuset-allowed CPUs.
+ *     This ensures a consistent view of the cpuset's effective_cpus mask
+ *     while determining which CPUs the task may actually use.
+ *
+ * signal: none
+ *   direction: KAPI_SIGNAL_RECEIVE
+ *   action: KAPI_SIGNAL_ACTION_DEFAULT
+ *   condition: Syscall has no interruptible wait points
+ *   desc: This syscall does not have explicit signal handling. While it uses
+ *     GFP_KERNEL allocations which can sleep, these are not interruptible by
+ *     signals. The spinlocks used (pi_lock, rq->lock) are not sleeping locks.
+ *     The syscall does not return EINTR or ERESTARTSYS. A pending signal will
+ *     be delivered after the syscall completes.
+ *   timing: KAPI_SIGNAL_TIME_NONE
+ *   restartable: n/a
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task CPU affinity mask (cpus_mask and cpus_ptr)
+ *   desc: Modifies the target task's cpus_mask field to reflect the new
+ *     allowed CPUs (intersection of requested mask and cpuset). Also updates
+ *     cpus_ptr which points to the effective mask. The task can only be
+ *     scheduled on CPUs in this mask after the syscall returns.
+ *   reversible: yes (can be changed with another sched_setaffinity call)
+ *
+ * side-effect: KAPI_EFFECT_MODIFY_STATE
+ *   target: task user_cpus_ptr (user-requested affinity)
+ *   desc: Saves a copy of the user-requested affinity mask in the task's
+ *     user_cpus_ptr field. This is the original mask requested by userspace,
+ *     before intersection with cpuset-allowed CPUs. The kernel preserves this
+ *     so that if the cpuset later expands, the task's affinity can be
+ *     automatically updated to include more CPUs from the original request.
+ *     Memory for this mask is allocated with GFP_KERNEL. On SMP systems, this
+ *     is always allocated; on non-SMP it remains NULL.
+ *   condition: Always on SMP systems
+ *   reversible: yes (replaced by subsequent sched_setaffinity calls)
+ *
+ * side-effect: KAPI_EFFECT_SCHEDULE
+ *   target: task migration and run queue placement
+ *   desc: If the task is not currently running on a CPU in the new affinity
+ *     mask, it will be migrated to an eligible CPU. For runnable tasks, this
+ *     may involve removing the task from its current run queue and adding it
+ *     to another CPU's run queue. The migration uses affine_move_task() which
+ *     may use CPU stop machine for synchronous migration. If the task is
+ *     currently running on a CPU that is no longer allowed, it will be
+ *     migrated when it next enters the scheduler.
+ *   condition: Current CPU not in new mask
+ *   reversible: n/a (migration is immediate)
+ *
+ * side-effect: KAPI_EFFECT_PROCESS_STATE
+ *   target: task reference count
+ *   desc: The target task's reference count is incremented by find_get_task()
+ *     (via get_task_struct()) to prevent the task from being freed during
+ *     the operation. The reference is automatically decremented when the
+ *     CLASS(find_get_task) destructor runs via put_task_struct().
+ *   reversible: yes (automatically within syscall)
+ *
+ * state-trans: task_cpus_mask
+ *   from: previous CPU affinity mask
+ *   to: intersection of requested mask and cpuset-allowed CPUs
+ *   condition: Successful completion of __set_cpus_allowed_ptr()
+ *   desc: The task's effective CPU affinity transitions from its previous
+ *     value to the new value. If the new mask equals the old mask,
+ *     only the user_cpus_ptr is updated (no migration occurs).
+ *
+ * state-trans: task_user_cpus_ptr
+ *   from: previous user-requested mask (or NULL if never set)
+ *   to: copy of newly requested mask from userspace
+ *   condition: Successful set with SCA_USER flag
+ *   desc: The stored user-requested affinity transitions to the new value.
+ *     This may differ from the effective cpus_mask if cpuset constraints
+ *     apply. The old user_cpus_ptr is freed via kfree() after the new
+ *     one is installed.
+ *
+ * capability: CAP_SYS_NICE
+ *   type: KAPI_CAP_BYPASS_CHECK
+ *   allows: Modifying the CPU affinity of threads owned by other users. When
+ *     the caller's EUID does not match the target thread's UID or EUID, this
+ *     capability (checked in the target's user namespace via ns_capable())
+ *     allows the operation to proceed.
+ *   without: The syscall returns -EPERM if the caller does not own the target
+ *     thread and lacks this capability. Ownership means the caller's EUID
+ *     matches the target's UID or EUID.
+ *   condition: Checked only when check_same_owner() returns false
+ *
+ * constraint: cpuset restrictions
+ *   desc: The effective CPU affinity is always constrained to the CPUs allowed
+ *     by the task's cpuset (determined by cpuset_cpus_allowed()). The syscall
+ *     stores the user-requested mask but the actual schedulable CPUs are the
+ *     intersection with cpuset-allowed CPUs. If this intersection is empty,
+ *     the syscall fails with -EINVAL.
+ *
+ * constraint: PF_NO_SETAFFINITY flag
+ *   desc: Certain kernel threads have the PF_NO_SETAFFINITY flag set, which
+ *     prevents userspace from modifying their CPU affinity. These include
+ *     per-CPU kthreads, migration threads, and some workqueue workers. The
+ *     check is performed both at the beginning of sched_setaffinity() and
+ *     again under locks in __set_cpus_allowed_ptr_locked() to handle races.
+ *     Attempting to modify such a task returns -EINVAL.
+ *
+ * constraint: SCHED_DEADLINE root domain coverage
+ *   desc: Tasks using the SCHED_DEADLINE scheduling policy must have an
+ *     affinity mask that is a superset of their root domain's CPU span when
+ *     deadline bandwidth control is enabled. This ensures proper bandwidth
+ *     accounting across the root domain. The check is performed by
+ *     dl_task_check_affinity() and returns -EBUSY if violated.
+ *
+ * constraint: migration_disabled tasks
+ *   desc: If a task has migration disabled (via migrate_disable()), its
+ *     affinity can only be changed to a mask that includes its current CPU.
+ *     Attempting to set an affinity that excludes the current CPU when
+ *     migration is disabled returns -EBUSY. This protects tasks that have
+ *     explicitly requested to stay on their current CPU.
+ *
+ * examples: sched_setaffinity(0, sizeof(cpu_set_t), &mask);  // Set calling thread
+ *   sched_setaffinity(pid, sizeof(cpu_set_t), &mask);  // Set specific thread
+ *   sched_setaffinity(gettid(), 8, &mask);  // 8-byte (64 CPU) mask
+ *
+ * notes: The glibc wrapper function for sched_setaffinity() differs from
+ *   the raw kernel syscall. The glibc version has signature:
+ *   int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask);
+ *   and always returns 0 on success or -1 with errno set on failure.
+ *
+ *   On NUMA systems, binding tasks to specific CPUs can significantly affect
+ *   performance due to memory locality. Consider using libnuma or mbind()
+ *   in conjunction with CPU affinity for optimal NUMA placement.
+ *
+ *   The kernel's NR_CPUS configuration determines the maximum number of CPUs
+ *   supported. On systems with more than 1024 CPUs, the standard cpu_set_t
+ *   (128 bytes, supporting up to 1024 CPUs) is insufficient and dynamic
+ *   allocation via CPU_ALLOC() is required.
+ *
+ *   When using isolcpus= kernel boot parameter to isolate CPUs from the
+ *   scheduler, sched_setaffinity() or cpuset cgroups are the only ways to
+ *   schedule tasks on those isolated CPUs.
+ *
+ *   Race condition handling: If a cpuset update races with this syscall,
+ *   the kernel handles it gracefully. The syscall may return -EINVAL if the
+ *   cpuset changes make the requested affinity impossible, but it will not
+ *   leave the task in an inconsistent state. Historical race conditions
+ *   between fork() and sched_setaffinity() have been fixed (see commit
+ *   87ca4f9efbd7c for use-after-free fix in dup_user_cpus_ptr()).
+ *
+ * since-version: 2.5.8
  */
 SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
 		unsigned long __user *, user_mask_ptr)
