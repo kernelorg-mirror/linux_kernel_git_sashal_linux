@@ -15,3 +15,8 @@ obj-$(CONFIG_PM_AUTOSLEEP)	+= autosleep.o
 obj-$(CONFIG_PM_WAKELOCKS)	+= wakelock.o
 
 obj-$(CONFIG_MAGIC_SYSRQ)	+= poweroff.o
+
+# MStar power management support
+EXTRA_CFLAGS += -Idrivers/mstar2/include
+obj-$(CONFIG_MP_MSTAR_STR_BASE)	+= mstar_xc_str.o
+obj-$(CONFIG_MSTAR_FASTBOOT)	+= mstar_fastboot.o
