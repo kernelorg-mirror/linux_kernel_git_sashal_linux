@@ -1,0 +1,10 @@
+/ {
+
+    camera-motor {
+        compatible = "mtk,camera-motor";
+        rotate_up_gpio = <65>;
+        rotate_down_gpio = <66>;
+        rotate_max_time = <3000>; //unit ms
+        rotate_min_time = <0>; //unit ms
+    };
+};

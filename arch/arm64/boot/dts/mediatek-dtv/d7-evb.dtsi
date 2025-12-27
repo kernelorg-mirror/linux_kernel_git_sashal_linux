@@ -1,0 +1,130 @@
+#include <dt-bindings/sound/dbmdx/dbmd7_fw_const_extra.h>
+#include <dt-bindings/sound/dbmdx/D7_FW_API.h>
+#include <dt-bindings/sound/dbmdx/Pomelo_API.h>
+#include <dt-bindings/sound/dbmdx/addon_const_common.h>
+
+/ {
+
+
+
+//soc {
+	//status = "okay";
+	dbmd7_uart: dbmd7_uart_interface {
+		status = "okay";
+		compatible = "dspg,dbmd7-uart";
+		uart_device = "/dev/ttyS5";
+		/* fast-boot; */
+		/* software-flow-control; */
+		read-chunk-size  = <0x1000>;
+		write-chunk-size = <0x1000>;
+	};
+	spi0: spi0 {
+		status = "okay";
+		compatible = "dspg,dbmdx-dummy-spi-master";
+		dbmd7_spi:dbmd7_interface@0x0  {
+			status = "okay";
+			compatible = "dspg,dbmd7-spi";
+			reg = <0>;
+			spi-max-frequency = <125000000>;
+			read-chunk-size  = <0x2000> ;
+			write-chunk-size = <0x8000> ;
+			dma_min_buffer_size = <0>;
+		};
+	};
+	dbmd7:dbmdx {
+		status = "okay";
+		compatible = "dspg,dbmdx-dev";
+		reset-gpio = <15>;          // PAD_GPIO10_PM
+		/*wakeup-gpio = <90>;*/     // PAD_MIC_SD1
+		rx-ready-gpio = <95>;       // PAD_PCM2_RESET
+		host-wakeup-gpio = <18>;    // PAD_GPIO13_PM
+		host-wakeup-reg = <0x0f1a>; // MTK add for PM gpio interrupt setting (PAD_GPIO13_PM)
+		pm-gpio-irq = <33>;         // E_IRQEXPL_PM_IRQ: 78 , E_IRQ_PM_SLEEP: 33
+		multi-interface-support = <1>;
+		cd-interfaces = <&dbmd7_spi &dbmd7_uart>;
+		primary-interfaces = <0 0 0 0>;
+                primary-firmware-name = "FW_D7_ver_010836.bin";
+		addon-firmware-names = "Addon_Sensory.bin", "Addon_ASRP.bin", "Addon_Pomelo.bin", "Addon_AWWE.bin", "D7_FW_ptcm.bin";
+		asrp-params-names = "AsrpParams_Pomelo_Aec_8Mic_2Spk_vB93x_T43_P11.bin", "AsrpParams_Vizio_TV_VC_Aec_vB93x_T43_P1111.bin", "AsrpParams_Pomelo_Nr_4Mic_vB93x_T43_P11.bin";
+		amodel-name = "trecs_Hey_Vizio_946KB.bin", "WR_250k.en-US.alexa.bin";
+		host-speeds = <0x0000 921600 0 7000000
+			     0x0000 921600 0 7000000
+			     0x0000 921600 0 7000000 >;
+		master-clk-rate = <24576000>;
+		/* constant-clk-rate = <32768>; */
+		firmware_id = <0xdb70 0xdb71>;
+		use_gpio_for_wakeup = <0>; /* Use wakeup gpio */
+		wakeup_set_value = <0>;  /* Value to write to wakeup gpio */
+		min_samples_chunk_size = <128>;
+		/* Send FW by command, Verify chip id, Send preboot */
+		boot_options = <0x2200>;
+		amodel_options = <3>;
+		send_uevent_on_detection = <1>;
+		send_uevent_after_buffering = <1>;
+		rx_ready_host_wakeup_gpio = <0xd2d3>;
+		check_alive = <0>;
+		/* command  priority  id    reg_num  val1  val2  val3 */
+		init_cfg_reg_list = <
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+
+			WRITE_REG_TYPE_32  PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_FW  REG_FW__MEMORY_MANAGEMENT  0x10350 0x00 0x00
+
+			WRITE_REG_TYPE_16  PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_RTOS  REG_RTOS__TIMER_FREQ  0x3e8 0x00 0x00
+
+			WRITE_REG_MSLEEP_MSEC  0x00  0x00  0x00	20  0x00 0x00
+
+			WRITE_REG_TYPE_16  PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_FW REG_FW__MAX_MSG_LENGTH 4108 0x00 0x00
+
+			WRITE_REG_MSLEEP_MSEC  0x00  0x00  0x00	20  0x00 0x00
+
+			WRITE_REG_TYPE_32 PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_MAILBOX REG_MB__TEMP_BUFF_LEN 96000 0x00 0x00
+
+			WRITE_REG_MSLEEP_MSEC  0x00  0x00  0x00	20  0x00 0x00
+			WRITE_REG_TYPE_32 PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_FW REG_FW__PRINTF_BUFFER_LENGTH 0x10000 0x00 0x00
+
+			WRITE_REG_TYPE_32 PRIORITY_RUN_ON_IDLE_ISR
+			MSG_ID_USER USERDEF_REG_NUM__USE_OTL_TUNING_FILES 0x00 0x00 0x00
+
+			WRITE_REG_TYPE_32 PRIORITY_RUN_ON_IDLE_ISR
+			POMELO_ADDON_NUMBER POMELO_REG__SET_TARGET_DEVICE 0x01 0x00 0x00
+
+			WRITE_REG_MSLEEP_MSEC  0x00  0x00  0x00	20  0x00 0x00
+
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+			WRITE_REG_DUMMY 0x00 0x00 0x00 0x00 0x00 0x00
+		>;
+		core_log_watermark = <0x0d00>;
+		fifo_en_mask = <0x000f>; /* 1=audio, 2=lp, 4=hf0, 8=hf1 */
+		
+		
+		dbmdx_codec: dbmdx-codec {
+			compatible = "dspg,dbmdx-codec";
+			#sound-dai-cells = <0>;
+		};
+		
+		dbmdx_soundcard: dbmdx-soundcard {
+			compatible = "dspg,dbmdx-soundcard";
+			status = "okay";
+		};
+		
+		dbmd7_snd_spi: dbmd7-spi {
+			compatible = "dspg,dbmdx-snd-spi";
+			status = "okay";
+		};
+
+	};
+
+//};
+
+};
