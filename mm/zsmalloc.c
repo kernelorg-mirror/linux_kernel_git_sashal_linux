@@ -904,6 +904,7 @@ static inline int testpin_tag(unsigned long handle)
 	return bit_spin_is_locked(HANDLE_PIN_BIT, (unsigned long *)handle);
 }
 
+
 static inline int trypin_tag(unsigned long handle)
 {
 	return bit_spin_trylock(HANDLE_PIN_BIT, (unsigned long *)handle);
@@ -1256,7 +1257,6 @@ out:
 static int zs_cpu_prepare(unsigned int cpu)
 {
 	struct mapping_area *area;
-
 	area = &per_cpu(zs_map_area, cpu);
 	return __zs_cpu_up(area);
 }
@@ -1264,7 +1264,6 @@ static int zs_cpu_prepare(unsigned int cpu)
 static int zs_cpu_dead(unsigned int cpu)
 {
 	struct mapping_area *area;
-
 	area = &per_cpu(zs_map_area, cpu);
 	__zs_cpu_down(area);
 	return 0;
@@ -1341,12 +1340,11 @@ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
 	get_zspage_mapping(zspage, &class_idx, &fg);
 	class = pool->size_class[class_idx];
 	off = (class->size * obj_idx) & ~PAGE_MASK;
-
 	area = &get_cpu_var(zs_map_area);
 	area->vm_mm = mm;
 	if (off + class->size <= PAGE_SIZE) {
 		/* this object is contained entirely within a page */
-		area->vm_addr = kmap_atomic(page);
+    	area->vm_addr = kmap_atomic(page);
 		ret = area->vm_addr + off;
 		goto out;
 	}
@@ -1358,8 +1356,9 @@ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
 
 	ret = __zs_map_object(area, pages, off, class->size);
 out:
-	if (likely(!PageHugeObject(page)))
+	if (likely(!PageHugeObject(page))) {
 		ret += ZS_HANDLE_SIZE;
+	}
 
 	return ret;
 }
@@ -1397,7 +1396,6 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle)
 		__zs_unmap_object(area, pages, off, class->size);
 	}
 	put_cpu_var(zs_map_area);
-
 	migrate_read_unlock(zspage);
 	unpin_tag(handle);
 }
