@@ -34,6 +34,9 @@
 #include <linux/sched.h>
 #include <linux/smp.h>
 #include <linux/delay.h>
+#ifdef CONFIG_MP_PLATFORM_ARM_64bit_PORTING
+#include <linux/of.h>
+#endif
 
 /*
  * In case the boot CPU is hotpluggable, we record its initial state and
@@ -121,6 +124,19 @@ static const char *const compat_hwcap2_str[] = {
 };
 #endif /* CONFIG_COMPAT */
 
+#ifdef CONFIG_MP_PLATFORM_ARM_64bit_PORTING
+static inline const char *_get_model_name(void)
+{
+	struct property *prop;
+
+	prop = of_find_property(of_find_node_by_path("/"), "model", NULL);
+	if (!prop)
+		prop = of_find_property(of_find_node_by_path("/"),
+					"compatible", NULL);
+	return prop ? (const char *)prop->value : "NULL";
+}
+#endif
+
 static int c_show(struct seq_file *m, void *v)
 {
 	int i, j;
@@ -130,6 +146,9 @@ static int c_show(struct seq_file *m, void *v)
 		struct cpuinfo_arm64 *cpuinfo = &per_cpu(cpu_data, i);
 		u32 midr = cpuinfo->reg_midr;
 
+#ifdef CONFIG_MP_PLATFORM_ARM_64bit_PORTING
+		seq_printf(m, "Hardware\t: %s\n", _get_model_name());
+#endif
 		/*
 		 * glibc reads /proc/cpuinfo to determine the number of
 		 * online processors, looking for lines beginning with
