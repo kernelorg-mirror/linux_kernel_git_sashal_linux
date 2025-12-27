@@ -1,0 +1,7 @@
+config MSTAR_LP_STANDBY
+
+bool "Support Mstar low power standby mode"
+
+help
+    Support Mstar low power standby mode
+default n
