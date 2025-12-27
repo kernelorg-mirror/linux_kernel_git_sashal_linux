@@ -86,6 +86,9 @@ endif
 obj-$(CONFIG_PARAVIRT)	+= paravirt.o
 
 head-y			:= head$(MMUEXT).o
+
+obj-$(CONFIG_MP_PLATFORM_MSTAR_LEGANCY_INTR)	+= mstar_irq.o
+
 obj-$(CONFIG_DEBUG_LL)	+= debug.o
 obj-$(CONFIG_EARLY_PRINTK)	+= early_printk.o
 
