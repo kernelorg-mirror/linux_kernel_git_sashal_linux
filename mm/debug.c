@@ -63,8 +63,8 @@ void __dump_page(struct page *page, const char *reason)
 	 */
 	mapcount = PageSlab(page) ? 0 : page_mapcount(page);
 
-	pr_emerg("page:%px count:%d mapcount:%d mapping:%px index:%#lx",
-		  page, page_ref_count(page), mapcount,
+	pr_emerg("page:%p (phy is 0x%lX), count:%d mapcount:%d mapping:%p index:%#lx",
+		  page, page_to_phys(page), page_ref_count(page), mapcount,
 		  page->mapping, page_to_pgoff(page));
 	if (PageCompound(page))
 		pr_cont(" compound_mapcount: %d", compound_mapcount(page));

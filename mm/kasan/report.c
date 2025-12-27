@@ -398,6 +398,11 @@ void kasan_report(unsigned long addr, size_t size,
 {
 	struct kasan_access_info info;
 
+#ifdef CONFIG_ARM
+	if (unlikely(!kasan_initialized))
+		return;
+#endif
+
 	if (likely(!kasan_report_enabled()))
 		return;
 

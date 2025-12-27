@@ -40,6 +40,10 @@
 #include "kasan.h"
 #include "../slab.h"
 
+#ifdef CONFIG_ARM
+bool kasan_initialized __read_mostly;
+#endif
+
 void kasan_enable_current(void)
 {
 	current->kasan_depth++;
@@ -245,6 +249,11 @@ static __always_inline void check_memory_region_inline(unsigned long addr,
 						size_t size, bool write,
 						unsigned long ret_ip)
 {
+#ifdef CONFIG_ARM
+	if (unlikely(!kasan_initialized))
+		return;
+#endif
+
 	if (unlikely(size == 0))
 		return;
 
