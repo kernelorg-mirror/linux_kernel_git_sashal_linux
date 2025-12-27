@@ -59,11 +59,50 @@
 #include <asm/processor.h>
 #include <asm/stacktrace.h>
 
+#include <mach/system.h>
+#include <mstar/mpatch_macro.h>
+
 #ifdef CONFIG_STACKPROTECTOR
 #include <linux/stackprotector.h>
 unsigned long __stack_chk_guard __read_mostly;
 EXPORT_SYMBOL(__stack_chk_guard);
 #endif
+
+#if (MP_PLATFORM_PM == 1)
+static void arm_machine_restart(char mode, const char *cmd)
+{
+	/*
+	 * Tell the mm system that we are going to reboot -
+	 * we may need it to insert some 1:1 mappings so that
+	 * soft boot works.
+	 */
+	cpu_switch_mm(idmap_pg_dir, &init_mm);
+	flush_tlb_all();
+
+#ifndef CONFIG_MP_PLATFORM_ARM
+	/* Clean and invalidate caches */
+	flush_cache_all();
+
+	/* Turn D-cache off */
+	cpu_cache_off();
+
+	/* Push out any further dirty data, and ensure cache is empty */
+	flush_cache_all();
+#endif
+	/*
+	 * Now call the architecture specific reboot code.
+	 */
+	arch_reset(mode, cmd);
+}
+#endif
+
+void soft_restart(unsigned long addr)
+{
+	setup_mm_for_reboot();
+	cpu_soft_restart(virt_to_phys(cpu_reset), addr);
+	/* Should never get here */
+	BUG();
+}
 
 /*
  * Function pointers to optional machine specific functions
@@ -71,7 +110,12 @@ EXPORT_SYMBOL(__stack_chk_guard);
 void (*pm_power_off)(void);
 EXPORT_SYMBOL_GPL(pm_power_off);
 
+#if (MP_PLATFORM_PM == 1)
+void (*arm_pm_restart)(char str, const char *cmd) = arm_machine_restart;
+EXPORT_SYMBOL_GPL(arm_pm_restart);
+#else
 void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd);
+#endif
 
 /*
  * This is our default idle handler.
@@ -137,7 +181,9 @@ void machine_power_off(void)
 
 /*
  * Restart requires that the secondary CPUs stop performing any activity
- * while the primary CPU resets the system. Systems with multiple CPUs must
+ * while the primary CPU resets the system. Systems with a single CPU can
+ * use soft_restart() as their machine descriptor's .restart hook, since that
+ * will cause the only available CPU to reset. Systems with multiple CPUs must
  * provide a HW restart implementation, to ensure that all CPUs reset at once.
  * This is required so that any code running after reset on the primary CPU
  * doesn't have to co-ordinate with other CPUs to ensure they aren't still
@@ -158,10 +204,15 @@ void machine_restart(char *cmd)
 		efi_reboot(reboot_mode, NULL);
 
 	/* Now call the architecture specific reboot code. */
+#if (MP_PLATFORM_PM == 1)
+	if (arm_pm_restart)
+		arm_pm_restart('h', cmd);
+#else
 	if (arm_pm_restart)
 		arm_pm_restart(reboot_mode, cmd);
 	else
 		do_kernel_restart(cmd);
+#endif
 
 	/*
 	 * Whoops - the architecture was unable to reboot.
