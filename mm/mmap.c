@@ -45,6 +45,9 @@
 #include <linux/moduleparam.h>
 #include <linux/pkeys.h>
 #include <linux/oom.h>
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+#include "../drv/fusion/shmpool.h"
+#endif
 #include <linux/sched/mm.h>
 
 #include <linux/uaccess.h>
@@ -983,7 +986,8 @@ again:
  */
 static inline int is_mergeable_vma(struct vm_area_struct *vma,
 				struct file *file, unsigned long vm_flags,
-				struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+				struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+				const char __user *anon_name)
 {
 	/*
 	 * VM_SOFTDIRTY should not prevent from VMA merging, if we
@@ -1000,6 +1004,8 @@ static inline int is_mergeable_vma(struct vm_area_struct *vma,
 	if (vma->vm_ops && vma->vm_ops->close)
 		return 0;
 	if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
+		return 0;
+	if (vma_get_anon_name(vma) != anon_name)
 		return 0;
 	return 1;
 }
@@ -1033,9 +1039,10 @@ static int
 can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
 		     struct anon_vma *anon_vma, struct file *file,
 		     pgoff_t vm_pgoff,
-		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+		     const char __user *anon_name)
 {
-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
+	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		if (vma->vm_pgoff == vm_pgoff)
 			return 1;
@@ -1054,9 +1061,10 @@ static int
 can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 		    struct anon_vma *anon_vma, struct file *file,
 		    pgoff_t vm_pgoff,
-		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+		    const char __user *anon_name)
 {
-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
+	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		pgoff_t vm_pglen;
 		vm_pglen = vma_pages(vma);
@@ -1067,9 +1075,9 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 }
 
 /*
- * Given a mapping request (addr,end,vm_flags,file,pgoff), figure out
- * whether that can be merged with its predecessor or its successor.
- * Or both (it neatly fills a hole).
+ * Given a mapping request (addr,end,vm_flags,file,pgoff,anon_name),
+ * figure out whether that can be merged with its predecessor or its
+ * successor.  Or both (it neatly fills a hole).
  *
  * In most cases - when called for mmap, brk or mremap - [addr,end) is
  * certain not to be mapped by the time vma_merge is called; but when
@@ -1111,7 +1119,8 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			unsigned long end, unsigned long vm_flags,
 			struct anon_vma *anon_vma, struct file *file,
 			pgoff_t pgoff, struct mempolicy *policy,
-			struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+			struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+			const char __user *anon_name)
 {
 	pgoff_t pglen = (end - addr) >> PAGE_SHIFT;
 	struct vm_area_struct *area, *next;
@@ -1144,7 +1153,8 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			mpol_equal(vma_policy(prev), policy) &&
 			can_vma_merge_after(prev, vm_flags,
 					    anon_vma, file, pgoff,
-					    vm_userfaultfd_ctx)) {
+					    vm_userfaultfd_ctx,
+					    anon_name)) {
 		/*
 		 * OK, it can.  Can we now merge in the successor as well?
 		 */
@@ -1153,7 +1163,8 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 				can_vma_merge_before(next, vm_flags,
 						     anon_vma, file,
 						     pgoff+pglen,
-						     vm_userfaultfd_ctx) &&
+						     vm_userfaultfd_ctx,
+						     anon_name) &&
 				is_mergeable_anon_vma(prev->anon_vma,
 						      next->anon_vma, NULL)) {
 							/* cases 1, 6 */
@@ -1176,7 +1187,8 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			mpol_equal(policy, vma_policy(next)) &&
 			can_vma_merge_before(next, vm_flags,
 					     anon_vma, file, pgoff+pglen,
-					     vm_userfaultfd_ctx)) {
+					     vm_userfaultfd_ctx,
+					     anon_name)) {
 		if (prev && addr < prev->vm_end)	/* case 4 */
 			err = __vma_adjust(prev, prev->vm_start,
 					 addr, prev->vm_pgoff, NULL, next);
@@ -1325,6 +1337,13 @@ static inline int mlock_future_check(struct mm_struct *mm,
 	return 0;
 }
 
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+static bool in_dfb_range(unsigned long start ,unsigned long end)
+{
+	return end > DFB_BASE_ADDRESS && start < (DFB_BASE_ADDRESS + DFB_SHM_SIZE);
+}
+#endif
+
 static inline u64 file_mmap_size_max(struct file *file, struct inode *inode)
 {
 	if (S_ISREG(inode->i_mode))
@@ -1366,6 +1385,9 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	struct mm_struct *mm = current->mm;
 	int pkey = 0;
 
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+	char path_buf[256];
+#endif
 	*populate = 0;
 
 	if (!len)
@@ -1380,8 +1402,35 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
 		if (!(file && path_noexec(&file->f_path)))
 			prot |= PROT_EXEC;
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+	if(addr && in_dfb_range(addr, addr + len) && !(current->flags & PF_MAPPED_DFB))
+	{
+		if(flags & MAP_FIXED)
+		{
+			printk(KERN_WARNING "[WARN] Detect '%s' MAP_FIXED mmap to the range reserved for DFB from 0x%lx to 0x%lx \n",current->comm,addr,addr+len);
+			flags &= ~MAP_FIXED;
+		}
+		if(file){
+			char *p = d_path(&(file->f_path),path_buf, 256);
+			if(strstr(p,"/dev/fusion") || strstr(p,"fusion.0"))
+			{
+				printk(KERN_WARNING "[Fusion] '%s'(pid: %d) is mapping the '%s' to reserved vma from 0x%lx to 0x%lx \n",current->comm,task_pid_nr(current),p,addr,addr+len);
+				flags |= MAP_FIXED;
+				current->flags |= PF_MAPPED_DFB;
+			}else{
+				if(!strstr(file->f_path.dentry->d_iname,"ashmem")) {
+					printk(KERN_ERR "[WARN] '%s' mapped by '%s'(pid: %d) overlap the range reserved for DFB from 0x%lx to 0x%lx ! Try the address behind DFB \n",file->f_path.dentry->d_iname,current->comm,task_pid_nr(current),addr,addr+len);
+					addr = (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE);
+                                }
+			}
+		}else{
+			printk(KERN_ERR "[WARN] something mapped by '%s'(pid: %d) overlap the range reserved for DFB from 0x%lx to 0x%lx ! Try the address behind DFB \n",current->comm,task_pid_nr(current),addr,addr+len);
+			addr = (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE);
+		}
+	}
 
-	/* force arch specific MAP_FIXED handling in get_unmapped_area */
+#endif
+
 	if (flags & MAP_FIXED_NOREPLACE)
 		flags |= MAP_FIXED;
 
@@ -1721,7 +1770,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	 * Can we just expand an old mapping?
 	 */
 	vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
-			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX);
+			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX, NULL);
 	if (vma)
 		goto out;
 
@@ -1891,6 +1940,15 @@ unsigned long unmapped_area(struct vm_unmapped_area_info *info)
 
 		gap_start = vma->vm_prev ? vm_end_gap(vma->vm_prev) : 0;
 check_current:
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+		if(in_dfb_range(gap_start,gap_end) && (unsigned long)DFB_BASE_ADDRESS >= gap_start && !(current->flags & PF_MAPPED_DFB))
+		{
+			if(((unsigned long)DFB_BASE_ADDRESS - gap_start) > (gap_end - (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE)))
+				gap_end = (unsigned long)DFB_BASE_ADDRESS;
+			else
+				gap_start = (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE);
+		}
+#endif
 		/* Check if current node has a suitable gap */
 		if (gap_start > high_limit)
 			return -ENOMEM;
@@ -1996,6 +2054,15 @@ unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 check_current:
 		/* Check if current node has a suitable gap */
 		gap_end = vm_start_gap(vma);
+#ifdef CONFIG_MP_RESERVED_VMA_PATCH_FOR_DFB
+		if(in_dfb_range(gap_start,gap_end) && (unsigned long)DFB_BASE_ADDRESS >= gap_start && !(current->flags & PF_MAPPED_DFB))
+		{
+			if(((unsigned long)DFB_BASE_ADDRESS - gap_start) > (gap_end - (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE)))
+				gap_end = (unsigned long)DFB_BASE_ADDRESS;
+			else
+				gap_start = (unsigned long)(DFB_BASE_ADDRESS + DFB_SHM_SIZE);
+		}
+#endif
 		if (gap_end < low_limit)
 			return -ENOMEM;
 		if (gap_start <= high_limit &&
@@ -2814,7 +2881,6 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 	return vm_munmap(addr, len);
 }
 
-
 /*
  * Emulation of deprecated remap_file_pages() syscall.
  */
@@ -2913,6 +2979,12 @@ out:
 		ret = 0;
 	return ret;
 }
+#ifdef CONFIG_MP_PLATFORM_UTOPIA2K_EXPORT_SYMBOL
+#ifdef CONFIG_ARM64
+#define sys_munmap __arm64_sys_munmap
+#endif
+EXPORT_SYMBOL(sys_munmap);
+#endif
 
 static inline void verify_mm_writelocked(struct mm_struct *mm)
 {
@@ -2977,7 +3049,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 
 	/* Can we just expand an old private anonymous mapping? */
 	vma = vma_merge(mm, prev, addr, addr + len, flags,
-			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
+			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX, NULL);
 	if (vma)
 		goto out;
 
@@ -3175,7 +3247,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		return NULL;	/* should never get here */
 	new_vma = vma_merge(mm, prev, addr, addr + len, vma->vm_flags,
 			    vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
-			    vma->vm_userfaultfd_ctx);
+			    vma->vm_userfaultfd_ctx, vma_get_anon_name(vma));
 	if (new_vma) {
 		/*
 		 * Source vma may have been merged into new_vma
