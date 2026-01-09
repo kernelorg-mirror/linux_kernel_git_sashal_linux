@@ -14,6 +14,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const STORE_PATH: &str = ".llminus-resolutions.json";
 
+/// Default maximum tokens for prompt (conservative for broad provider compatibility)
+/// Most providers support at least 128K; we use 100K as a safe default.
+const DEFAULT_MAX_TOKENS: usize = 100_000;
+
+/// Approximate characters per token (for English text)
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Estimate the number of tokens in a text string
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / CHARS_PER_TOKEN
+}
+
 #[derive(Parser)]
 #[command(name = "llminus")]
 #[command(about = "LLM-powered git conflict resolution tool")]
@@ -45,6 +57,9 @@ enum Commands {
     Resolve {
         /// Command to invoke. The prompt will be passed via stdin.
         command: String,
+        /// Maximum tokens for prompt (reduces RAG examples if exceeded)
+        #[arg(short, long, default_value_t = DEFAULT_MAX_TOKENS)]
+        max_tokens: usize,
     },
     /// Pull a kernel patch/pull request from lore.kernel.org and merge it
     Pull {
@@ -53,6 +68,9 @@ enum Commands {
         /// Command to invoke for LLM assistance
         #[arg(short, long, default_value = "llm")]
         command: String,
+        /// Maximum tokens for prompt (reduces RAG examples if exceeded)
+        #[arg(long, default_value_t = DEFAULT_MAX_TOKENS)]
+        max_tokens: usize,
     },
 }
 
@@ -825,6 +843,7 @@ fn parse_conflict_file(path: &str) -> Result<Vec<ConflictFile>> {
 }
 
 /// Result of a similarity search
+#[derive(Clone)]
 struct SimilarResolution {
     resolution: MergeResolution,
     similarity: f32,
@@ -1636,7 +1655,7 @@ fn build_resolve_prompt(
     prompt
 }
 
-fn resolve(command: &str) -> Result<()> {
+fn resolve(command: &str, max_tokens: usize) -> Result<()> {
     // Get merge context (what branch/tag is being merged)
     let merge_ctx = get_merge_context();
     if let Some(ref source) = merge_ctx.merge_source {
@@ -1653,17 +1672,45 @@ fn resolve(command: &str) -> Result<()> {
 
     // Try to find similar historical resolutions (gracefully handles missing database)
     println!("Looking for similar historical conflicts...");
-    let similar = try_find_similar_resolutions(3, &conflicts);
+    let all_similar = try_find_similar_resolutions(3, &conflicts);
 
-    if similar.is_empty() {
+    if all_similar.is_empty() {
         println!("No historical resolution database found (run 'llminus learn' and 'llminus vectorize' to build one)");
         println!("Proceeding without historical examples...");
     } else {
-        println!("Found {} similar historical resolutions", similar.len());
+        println!("Found {} similar historical resolutions", all_similar.len());
     }
 
-    // Build the prompt and invoke LLM
-    let prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, None);
+    // Build the prompt with adaptive RAG example reduction
+    let mut similar = all_similar.clone();
+    let mut prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, None);
+    let mut tokens = estimate_tokens(&prompt);
+
+    // Reduce RAG examples until we're under the token limit
+    while tokens > max_tokens && !similar.is_empty() {
+        let original_count = all_similar.len();
+        similar.pop(); // Remove the least similar (last) example
+        prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, None);
+        tokens = estimate_tokens(&prompt);
+
+        if similar.len() < original_count {
+            println!(
+                "Reduced RAG examples from {} to {} to fit token limit (~{} tokens, limit: {})",
+                original_count,
+                similar.len(),
+                tokens,
+                max_tokens
+            );
+        }
+    }
+
+    if tokens > max_tokens {
+        println!(
+            "Warning: Prompt still exceeds token limit (~{} tokens, limit: {}) even without RAG examples",
+            tokens, max_tokens
+        );
+    }
+
     invoke_llm(command, &prompt)
 }
 
@@ -1672,7 +1719,8 @@ fn invoke_llm(command: &str, prompt: &str) -> Result<()> {
     use std::io::Write;
     use std::process::Stdio;
 
-    println!("Invoking: {} (prompt: {} bytes)", command, prompt.len());
+    let tokens = estimate_tokens(prompt);
+    println!("Invoking: {} (prompt: {} bytes, ~{} tokens)", command, prompt.len(), tokens);
     println!("{}", "=".repeat(80));
 
     // Parse command (handle arguments)
@@ -1712,7 +1760,7 @@ fn invoke_llm(command: &str, prompt: &str) -> Result<()> {
 }
 
 /// Pull a kernel pull request from lore.kernel.org
-fn pull(message_id: &str, command: &str) -> Result<()> {
+fn pull(message_id: &str, command: &str, max_tokens: usize) -> Result<()> {
     check_repo()?;
 
     // Step 1: Fetch and parse the pull request email
@@ -1748,16 +1796,44 @@ fn pull(message_id: &str, command: &str) -> Result<()> {
 
     // Try to find similar historical resolutions
     println!("Looking for similar historical conflicts...");
-    let similar = try_find_similar_resolutions(3, &conflicts);
+    let all_similar = try_find_similar_resolutions(3, &conflicts);
 
-    if similar.is_empty() {
+    if all_similar.is_empty() {
         println!("No historical resolution database found (this is optional)");
     } else {
-        println!("Found {} similar historical resolutions", similar.len());
+        println!("Found {} similar historical resolutions", all_similar.len());
     }
 
-    // Build the prompt with pull request context and invoke LLM
-    let prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, Some(&pull_req));
+    // Build the prompt with adaptive RAG example reduction
+    let mut similar = all_similar.clone();
+    let mut prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, Some(&pull_req));
+    let mut tokens = estimate_tokens(&prompt);
+
+    // Reduce RAG examples until we're under the token limit
+    while tokens > max_tokens && !similar.is_empty() {
+        let original_count = all_similar.len();
+        similar.pop(); // Remove the least similar (last) example
+        prompt = build_resolve_prompt(&conflicts, &similar, &merge_ctx, Some(&pull_req));
+        tokens = estimate_tokens(&prompt);
+
+        if similar.len() < original_count {
+            println!(
+                "Reduced RAG examples from {} to {} to fit token limit (~{} tokens, limit: {})",
+                original_count,
+                similar.len(),
+                tokens,
+                max_tokens
+            );
+        }
+    }
+
+    if tokens > max_tokens {
+        println!(
+            "Warning: Prompt still exceeds token limit (~{} tokens, limit: {}) even without RAG examples",
+            tokens, max_tokens
+        );
+    }
+
     println!("\n=== Invoking LLM for Conflict Resolution ===");
     invoke_llm(command, &prompt)?;
 
@@ -1819,8 +1895,8 @@ fn main() -> Result<()> {
         Commands::Learn { range } => learn(range.as_deref()),
         Commands::Vectorize { batch_size } => vectorize(batch_size),
         Commands::Find { n } => find(n),
-        Commands::Resolve { command } => resolve(&command),
-        Commands::Pull { message_id, command } => pull(&message_id, &command),
+        Commands::Resolve { command, max_tokens } => resolve(&command, max_tokens),
+        Commands::Pull { message_id, command, max_tokens } => pull(&message_id, &command, max_tokens),
     }
 }
 
@@ -1894,7 +1970,7 @@ mod tests {
     fn test_resolve_command_parses() {
         let cli = Cli::try_parse_from(["llminus", "resolve", "my-llm"]).unwrap();
         match cli.command {
-            Commands::Resolve { command } => assert_eq!(command, "my-llm"),
+            Commands::Resolve { command, .. } => assert_eq!(command, "my-llm"),
             _ => panic!("Expected Resolve command"),
         }
     }
@@ -1903,7 +1979,7 @@ mod tests {
     fn test_resolve_command_with_args() {
         let cli = Cli::try_parse_from(["llminus", "resolve", "my-llm --model fancy"]).unwrap();
         match cli.command {
-            Commands::Resolve { command } => assert_eq!(command, "my-llm --model fancy"),
+            Commands::Resolve { command, .. } => assert_eq!(command, "my-llm --model fancy"),
             _ => panic!("Expected Resolve command"),
         }
     }
@@ -2214,7 +2290,7 @@ second theirs
     fn test_pull_command_parses() {
         let cli = Cli::try_parse_from(["llminus", "pull", "test@kernel.org"]).unwrap();
         match cli.command {
-            Commands::Pull { message_id, command } => {
+            Commands::Pull { message_id, command, .. } => {
                 assert_eq!(message_id, "test@kernel.org");
                 assert_eq!(command, "llm"); // default
             }
@@ -2228,7 +2304,7 @@ second theirs
             "llminus", "pull", "test@kernel.org", "-c", "my-llm --model fancy"
         ]).unwrap();
         match cli.command {
-            Commands::Pull { message_id, command } => {
+            Commands::Pull { message_id, command, .. } => {
                 assert_eq!(message_id, "test@kernel.org");
                 assert_eq!(command, "my-llm --model fancy");
             }
