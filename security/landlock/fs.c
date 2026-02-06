@@ -165,7 +165,7 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 
 	/* Files only get access rights that make sense. */
 	if (!d_is_dir(path->dentry) &&
-	    (access_rights | ACCESS_FILE) != ACCESS_FILE)
+	    !access_mask_subset(access_rights, ACCESS_FILE))
 		return -EINVAL;
 	if (WARN_ON_ONCE(ruleset->num_layers != 1))
 		return -EINVAL;
@@ -1220,7 +1220,7 @@ static int hook_file_open(struct file *const file)
 	 */
 	landlock_file(file)->allowed_access = allowed_access;
 
-	if ((open_access_request & allowed_access) == open_access_request)
+	if (access_mask_subset(open_access_request, allowed_access))
 		return 0;
 
 	return -EACCES;
