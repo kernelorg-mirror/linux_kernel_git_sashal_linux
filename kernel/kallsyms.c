@@ -477,9 +477,9 @@ bool kallsyms_lookup_lineinfo(unsigned long addr, unsigned long sym_start,
 	unsigned int offset, low, high, mid, block;
 	unsigned int cur_addr, cur_file_id, cur_line;
 	unsigned int best_file_id = 0, best_line = 0;
-	unsigned int block_entries, data_end;
+	unsigned int block_entries;
+	const u8 *p, *pend;
 	bool found = false;
-	u32 pos;
 
 	if (!lineinfo_num_entries || !lineinfo_num_blocks)
 		return false;
@@ -517,17 +517,17 @@ bool kallsyms_lookup_lineinfo(unsigned long addr, unsigned long sym_start,
 			block_entries = remaining;
 	}
 
-	/* Determine end of this block's data in the compressed stream */
+	/* Set up cursor and end pointer for this block's compressed data */
+	p = lineinfo_data + lineinfo_block_offsets[block];
 	if (block + 1 < lineinfo_num_blocks)
-		data_end = lineinfo_block_offsets[block + 1];
+		pend = lineinfo_data + lineinfo_block_offsets[block + 1];
 	else
-		data_end = UINT_MAX; /* last block: read to end */
+		pend = lineinfo_data + UINT_MAX; /* last block: read to end */
 
 	/* Decode entry 0: addr from block_addrs, file_id and line from stream */
-	pos = lineinfo_block_offsets[block];
 	cur_addr = lineinfo_block_addrs[block];
-	cur_file_id = lineinfo_read_uleb128(lineinfo_data, &pos, data_end);
-	cur_line = lineinfo_read_uleb128(lineinfo_data, &pos, data_end);
+	cur_file_id = leb128_read_u32(&p, pend);
+	cur_line = leb128_read_u32(&p, pend);
 
 	/* Check entry 0 */
 	if (cur_addr <= offset &&
@@ -542,9 +542,9 @@ bool kallsyms_lookup_lineinfo(unsigned long addr, unsigned long sym_start,
 		unsigned int addr_delta;
 		int32_t file_delta, line_delta;
 
-		addr_delta = lineinfo_read_uleb128(lineinfo_data, &pos, data_end);
-		file_delta = zigzag_decode(lineinfo_read_uleb128(lineinfo_data, &pos, data_end));
-		line_delta = zigzag_decode(lineinfo_read_uleb128(lineinfo_data, &pos, data_end));
+		addr_delta = leb128_read_u32(&p, pend);
+		file_delta = leb128_zigzag_decode(leb128_read_u32(&p, pend));
+		line_delta = leb128_zigzag_decode(leb128_read_u32(&p, pend));
 
 		cur_addr += addr_delta;
 		cur_file_id = (unsigned int)((int32_t)cur_file_id + file_delta);

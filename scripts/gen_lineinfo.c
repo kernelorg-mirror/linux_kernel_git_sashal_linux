@@ -409,10 +409,10 @@ static void compress_entries(void)
 
 		/* Entry 0: file_id (ULEB128), line (ULEB128) */
 		compressed_ensure(20);
-		compressed_size += lineinfo_write_uleb128(
+		compressed_size += leb128_write_u32(
 			compressed_data + compressed_size,
 			entries[base].file_id);
-		compressed_size += lineinfo_write_uleb128(
+		compressed_size += leb128_write_u32(
 			compressed_data + compressed_size,
 			entries[base].line);
 
@@ -432,15 +432,15 @@ static void compress_entries(void)
 			line_delta = (int32_t)entries[idx].line - (int32_t)prev_line;
 
 			compressed_ensure(15);
-			n = lineinfo_write_uleb128(buf, addr_delta);
+			n = leb128_write_u32(buf, addr_delta);
 			memcpy(compressed_data + compressed_size, buf, n);
 			compressed_size += n;
 
-			n = lineinfo_write_uleb128(buf, zigzag_encode(file_delta));
+			n = leb128_write_u32(buf, leb128_zigzag_encode(file_delta));
 			memcpy(compressed_data + compressed_size, buf, n);
 			compressed_size += n;
 
-			n = lineinfo_write_uleb128(buf, zigzag_encode(line_delta));
+			n = leb128_write_u32(buf, leb128_zigzag_encode(line_delta));
 			memcpy(compressed_data + compressed_size, buf, n);
 			compressed_size += n;
 

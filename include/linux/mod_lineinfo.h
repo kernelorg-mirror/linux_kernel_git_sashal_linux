@@ -26,12 +26,9 @@
 #define _LINUX_MOD_LINEINFO_H
 
 #ifdef __KERNEL__
-#include <linux/types.h>
+#include <linux/leb128.h>
 #else
-#include <stdint.h>
-typedef uint32_t u32;
-typedef uint16_t u16;
-typedef uint8_t  u8;
+#include "leb128.h"
 #endif
 
 #define LINEINFO_BLOCK_ENTRIES 64
@@ -75,63 +72,5 @@ static inline u32 mod_lineinfo_filenames_off(u32 num_blocks, u32 data_size,
 	       num_files * sizeof(u32);
 }
 
-/* Zigzag encoding: map signed to unsigned so small magnitudes are small */
-static inline u32 zigzag_encode(int32_t v)
-{
-	return ((u32)v << 1) ^ (u32)(v >> 31);
-}
-
-static inline int32_t zigzag_decode(u32 v)
-{
-	return (int32_t)((v >> 1) ^ -(v & 1));
-}
-
-/*
- * Read a ULEB128 varint from a byte stream.
- * Returns the decoded value and advances *pos past the encoded bytes.
- * If *pos would exceed 'end', returns 0 and sets *pos = end (safe for
- * NMI/panic context -- no crash, just a missed annotation).
- */
-static inline u32 lineinfo_read_uleb128(const u8 *data, u32 *pos, u32 end)
-{
-	u32 result = 0;
-	unsigned int shift = 0;
-
-	while (*pos < end) {
-		u8 byte = data[*pos];
-		(*pos)++;
-		result |= (u32)(byte & 0x7f) << shift;
-		if (!(byte & 0x80))
-			return result;
-		shift += 7;
-		if (shift >= 32) {
-			/* Malformed -- skip remaining continuation bytes */
-			while (*pos < end && (data[*pos] & 0x80))
-				(*pos)++;
-			if (*pos < end)
-				(*pos)++;
-			return result;
-		}
-	}
-	return result;
-}
-
-/* Write a ULEB128 varint -- build tool only */
-#ifndef __KERNEL__
-static inline unsigned int lineinfo_write_uleb128(u8 *buf, u32 value)
-{
-	unsigned int len = 0;
-
-	do {
-		u8 byte = value & 0x7f;
-
-		value >>= 7;
-		if (value)
-			byte |= 0x80;
-		buf[len++] = byte;
-	} while (value);
-	return len;
-}
-#endif /* !__KERNEL__ */
 
 #endif /* _LINUX_MOD_LINEINFO_H */
