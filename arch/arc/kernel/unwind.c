@@ -18,6 +18,7 @@
 #include <linux/stop_machine.h>
 #include <linux/uaccess.h>
 #include <linux/ptrace.h>
+#include <linux/leb128.h>
 #include <asm/sections.h>
 #include <linux/unaligned.h>
 #include <asm/unwind.h>
@@ -448,46 +449,12 @@ void unwind_remove_table(void *handle, int init_only)
 
 static uleb128_t get_uleb128(const u8 **pcur, const u8 *end)
 {
-	const u8 *cur = *pcur;
-	uleb128_t value;
-	unsigned int shift;
-
-	for (shift = 0, value = 0; cur < end; shift += 7) {
-		if (shift + 7 > 8 * sizeof(value)
-		    && (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
-			cur = end + 1;
-			break;
-		}
-		value |= (uleb128_t) (*cur & 0x7f) << shift;
-		if (!(*cur++ & 0x80))
-			break;
-	}
-	*pcur = cur;
-
-	return value;
+	return (uleb128_t)leb128_read_u64(pcur, end);
 }
 
 static sleb128_t get_sleb128(const u8 **pcur, const u8 *end)
 {
-	const u8 *cur = *pcur;
-	sleb128_t value;
-	unsigned int shift;
-
-	for (shift = 0, value = 0; cur < end; shift += 7) {
-		if (shift + 7 > 8 * sizeof(value)
-		    && (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
-			cur = end + 1;
-			break;
-		}
-		value |= (sleb128_t) (*cur & 0x7f) << shift;
-		if (!(*cur & 0x80)) {
-			value |= -(*cur++ & 0x40) << shift;
-			break;
-		}
-	}
-	*pcur = cur;
-
-	return value;
+	return (sleb128_t)leb128_read_s64(pcur, end);
 }
 
 static const u32 *__cie_for_fde(const u32 *fde)
