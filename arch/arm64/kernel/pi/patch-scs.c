@@ -6,6 +6,7 @@
 
 #include <linux/errno.h>
 #include <linux/init.h>
+#include <linux/leb128.h>
 #include <linux/linkage.h>
 #include <linux/types.h>
 
@@ -91,22 +92,6 @@ static void __always_inline scs_patch_loc(u64 loc)
 		    :: "r"(loc));
 }
 
-/*
- * Skip one uleb128/sleb128 encoded quantity from the opcode stream. All bytes
- * except the last one have bit #7 set.
- */
-static int __always_inline skip_xleb128(const u8 **opcode, int size)
-{
-	u8 c;
-
-	do {
-		c = *(*opcode)++;
-		size--;
-	} while (c & BIT(7));
-
-	return size;
-}
-
 struct eh_frame {
 	/*
 	 * The size of this frame if 0 < size < U32_MAX, 0 terminates the list.
@@ -154,6 +139,7 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 	int size = frame->size - offsetof(struct eh_frame, opcodes) + 4;
 	u64 loc = (u64)offset_to_ptr(&frame->initial_loc);
 	const u8 *opcode = frame->opcodes;
+	const u8 *end;
 	int l;
 
 	if (use_sdata8) {
@@ -169,12 +155,13 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 	l = *opcode++;
 	opcode += l;
 	size -= l + 1;
+	end = opcode + size;
 
 	/*
 	 * Starting from 'loc', apply the CFA opcodes that advance the location
 	 * pointer, and identify the locations of the PAC instructions.
 	 */
-	while (size-- > 0) {
+	while (opcode < end) {
 		switch (*opcode++) {
 		case DW_CFA_nop:
 		case DW_CFA_remember_state:
@@ -183,18 +170,16 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 
 		case DW_CFA_advance_loc1:
 			loc += *opcode++ * code_alignment_factor;
-			size--;
 			break;
 
 		case DW_CFA_advance_loc2:
 			loc += *opcode++ * code_alignment_factor;
 			loc += (*opcode++ << 8) * code_alignment_factor;
-			size -= 2;
 			break;
 
 		case DW_CFA_def_cfa:
 		case DW_CFA_offset_extended:
-			size = skip_xleb128(&opcode, size);
+			leb128_skip(&opcode, end);
 			fallthrough;
 		case DW_CFA_def_cfa_offset:
 		case DW_CFA_def_cfa_offset_sf:
@@ -202,7 +187,7 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 		case DW_CFA_same_value:
 		case DW_CFA_restore_extended:
 		case 0x80 ... 0xbf:
-			size = skip_xleb128(&opcode, size);
+			leb128_skip(&opcode, end);
 			break;
 
 		case DW_CFA_negate_ra_state:
