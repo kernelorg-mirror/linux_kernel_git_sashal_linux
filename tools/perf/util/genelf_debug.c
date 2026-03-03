@@ -11,6 +11,7 @@
  * @author Philippe Elie
  */
 #include <linux/compiler.h>
+#include <linux/leb128.h>
 #include <linux/zalloc.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -196,13 +197,10 @@ static void emit_string(struct buffer_ext *be, const char *s)
 static void emit_unsigned_LEB128(struct buffer_ext *be,
 				 unsigned long data)
 {
-	do {
-		ubyte cur = data & 0x7F;
-		data >>= 7;
-		if (data)
-			cur |= 0x80;
-		buffer_ext_add(be, &cur, 1);
-	} while (data);
+	u8 buf[LEB128_U64_MAX_BYTES];
+	unsigned int len = leb128_write_u64(buf, data);
+
+	buffer_ext_add(be, buf, len);
 }
 
 static void emit_signed_LEB128(struct buffer_ext *be, long data)
