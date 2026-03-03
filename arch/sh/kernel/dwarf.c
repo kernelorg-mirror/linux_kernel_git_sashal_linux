@@ -14,6 +14,7 @@
 /* #define DEBUG */
 #include <linux/kernel.h>
 #include <linux/io.h>
+#include <linux/leb128.h>
 #include <linux/list.h>
 #include <linux/mempool.h>
 #include <linux/mm.h>
@@ -132,82 +133,22 @@ static inline int dwarf_read_addr(unsigned long *src, unsigned long *dst)
 	return sizeof(unsigned long *);
 }
 
-/**
- *	dwarf_read_uleb128 - read unsigned LEB128 data
- *	@addr: the address where the ULEB128 data is stored
- *	@ret: address to store the result
- *
- *	Decode an unsigned LEB128 encoded datum. The algorithm is taken
- *	from Appendix C of the DWARF 3 spec. For information on the
- *	encodings refer to section "7.6 - Variable Length Data". Return
- *	the number of bytes read.
- */
 static inline unsigned long dwarf_read_uleb128(char *addr, unsigned int *ret)
 {
-	unsigned int result;
-	unsigned char byte;
-	int shift, count;
+	const u8 *p = (const u8 *)addr;
+	const u8 *start = p;
 
-	result = 0;
-	shift = 0;
-	count = 0;
-
-	while (1) {
-		byte = __raw_readb(addr);
-		addr++;
-		count++;
-
-		result |= (byte & 0x7f) << shift;
-		shift += 7;
-
-		if (!(byte & 0x80))
-			break;
-	}
-
-	*ret = result;
-
-	return count;
+	*ret = (unsigned int)leb128_read_u64(&p, p + LEB128_U64_MAX_BYTES);
+	return p - start;
 }
 
-/**
- *	dwarf_read_leb128 - read signed LEB128 data
- *	@addr: the address of the LEB128 encoded data
- *	@ret: address to store the result
- *
- *	Decode signed LEB128 data. The algorithm is taken from Appendix
- *	C of the DWARF 3 spec. Return the number of bytes read.
- */
 static inline unsigned long dwarf_read_leb128(char *addr, int *ret)
 {
-	unsigned char byte;
-	int result, shift;
-	int num_bits;
-	int count;
+	const u8 *p = (const u8 *)addr;
+	const u8 *start = p;
 
-	result = 0;
-	shift = 0;
-	count = 0;
-
-	while (1) {
-		byte = __raw_readb(addr);
-		addr++;
-		result |= (byte & 0x7f) << shift;
-		shift += 7;
-		count++;
-
-		if (!(byte & 0x80))
-			break;
-	}
-
-	/* The number of bits in a signed integer. */
-	num_bits = 8 * sizeof(result);
-
-	if ((shift < num_bits) && (byte & 0x40))
-		result |= (-1 << shift);
-
-	*ret = result;
-
-	return count;
+	*ret = (int)leb128_read_s64(&p, p + LEB128_U64_MAX_BYTES);
+	return p - start;
 }
 
 /**
