@@ -9,6 +9,7 @@
 #include <linux/errno.h>
 #include <linux/hashtable.h>
 #include <linux/kernel.h>
+#include <linux/leb128.h>
 #include <linux/log2.h>
 #include <linux/moduleloader.h>
 #include <linux/sizes.h>
@@ -504,16 +505,7 @@ static int apply_uleb128_accumulation(struct module *me, void *location, long bu
 	 * ULEB128 is a variable length encoding. Encode the buffer into
 	 * the ULEB128 data format.
 	 */
-	u8 *p = location;
-
-	while (buffer != 0) {
-		u8 value = buffer & 0x7f;
-
-		buffer >>= 7;
-		value |= (!!buffer) << 7;
-
-		*p++ = value;
-	}
+	leb128_write_u64(location, (u64)buffer);
 	return 0;
 }
 
