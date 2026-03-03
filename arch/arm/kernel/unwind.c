@@ -24,6 +24,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/export.h>
+#include <linux/leb128.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -310,25 +311,20 @@ static int unwind_exec_pop_subset_r0_to_r3(struct unwind_ctrl_block *ctrl,
 
 static unsigned long unwind_decode_uleb128(struct unwind_ctrl_block *ctrl)
 {
-	unsigned long bytes = 0;
-	unsigned long insn;
-	unsigned long result = 0;
+	u8 buf[4];
+	const u8 *p = buf;
+	int n = 0;
 
 	/*
-	 * unwind_get_byte() will advance `ctrl` one instruction at a time, so
-	 * loop until we get an instruction byte where bit 7 is not set.
-	 *
-	 * Note: This decodes a maximum of 4 bytes to output 28 bits data where
-	 * max is 0xfffffff: that will cover a vsp increment of 1073742336, hence
-	 * it is sufficient for unwinding the stack.
+	 * Buffer bytes from the unwind stream into a flat array, then
+	 * decode with the shared LEB128 reader.  Maximum 4 bytes (28 bits)
+	 * which covers a vsp increment of up to 1073742336.
 	 */
 	do {
-		insn = unwind_get_byte(ctrl);
-		result |= (insn & 0x7f) << (bytes * 7);
-		bytes++;
-	} while (!!(insn & 0x80) && (bytes != sizeof(result)));
+		buf[n] = unwind_get_byte(ctrl);
+	} while (buf[n++] & 0x80 && n < 4);
 
-	return result;
+	return (unsigned long)leb128_read_u32(&p, buf + n);
 }
 
 /*
