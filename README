@@ -154,8 +154,12 @@ kernel:
 
 * Documentation/process/coding-assistants.rst
 
-This documentation contains essential requirements about licensing, attribution,
-and the Developer Certificate of Origin that all AI tools must comply with.
+For AI-assisted patch review and debugging, subsystem-specific review prompts
+are available:
+
+* AI Review Prompts: Documentation/ai-review/index.rst
+* Review Entry Point: ai-review/review-core.md
+* Subsystem Guide Index: ai-review/subsystem-index.md
 
 
 Communication and Support

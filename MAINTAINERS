@@ -218,6 +218,15 @@ L:	linux-hwmon@vger.kernel.org
 S:	Maintained
 F:	drivers/hwmon/abituguru3.c
 
+AI REVIEW PROMPTS
+M:	Sasha Levin <sashal@kernel.org>
+R:	Chris Mason <clm@fb.com>
+L:	linux-doc@vger.kernel.org
+S:	Maintained
+F:	ai-review/
+F:	*/ai-review/
+F:	Documentation/ai-review/
+
 ACCES 104-DIO-48E GPIO DRIVER
 M:	William Breathitt Gray <wbg@kernel.org>
 L:	linux-gpio@vger.kernel.org
