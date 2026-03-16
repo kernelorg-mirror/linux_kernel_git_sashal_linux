@@ -52,20 +52,13 @@ regexes
 | Open Firmware (DT) | drivers/of/, of_node, of_find_, of_get_, of_parse_, for_each_child_of_node, for_each_available_child_of_node, of_node_put, of_node_get | drivers/of/ai-review/of.md |
 | Perf Tools | tools/perf/, openat, fdopendir, closedir | tools/perf/ai-review/perf.md |
 | MIPS | arch/mips/, tlb_probe, tlb_read, tlb_write_indexed, write_c0_entryhi, read_c0_index, TLBP, TLBR, TLBWI | arch/mips/ai-review/mips.md |
-| hwmon | drivers/hwmon/, asus-ec-sensors, ec_board_info | drivers/hwmon/ai-review/hwmon.md |
-| Media/Video | drivers/media/, v4l2_, V4L2_PIX_FMT_, iris_, video_device | drivers/media/ai-review/media.md |
 | Wireless/mac80211 | drivers/net/wireless/, net/mac80211/, BSS_CHANGED_, vif_cfg_changed, link_info_changed, bss_info_changed | net/ai-review/wireless.md |
 | Selftests | tools/testing/selftests/, TEST_PROGS, TEST_FILES, TEST_GEN_FILES | tools/testing/selftests/ai-review/selftests.md |
-| IRQ Chip | drivers/irqchip/, gic_, its_, irq_chip, irq_domain | drivers/irqchip/ai-review/irqchip.md |
-| CAN | drivers/net/can/, can_, canfd_, rcar_canfd, socketcan | drivers/net/can/ai-review/can.md |
 | DT Bindings | Documentation/devicetree/bindings/, *.yaml in devicetree | drivers/of/ai-review/dt-bindings.md |
 | USB Storage | drivers/usb/storage/, unusual_devs.h, UNUSUAL_DEV, USB_SC_, USB_PR_ | drivers/usb/storage/ai-review/usb-storage.md |
 | ATA/libata | drivers/ata/, ata_dev_, ata_port_, ata_read_log_, ATA_QUIRK_ | drivers/ata/ai-review/ata.md |
 | I/O Accessors | writesl, readsl, writesw, readsw, writesb, readsb, __raw_writel, __raw_readl, FIFO | kernel/ai-review/io-accessors.md |
-| DPLL | drivers/dpll/, dpll_, zl3073x_, ZL_REG_, ZL_INFO_ | drivers/dpll/ai-review/dpll.md |
 | Kconfig | Kconfig, `config `, `select `, `depends on `, `tristate `, `bool ` | scripts/kconfig/ai-review/kconfig.md |
-| I3C | drivers/i3c/, i3c_master_, i3c_device_, i2c_adapter, svc-i3c-master | drivers/i3c/ai-review/i3c.md |
-| Input | drivers/input/, edt-ft5x06, touchscreen@, report-rate-hz | drivers/input/ai-review/input.md |
 | Objtool | tools/objtool/, INSN_BUG, INSN_TRAP, decode.c | tools/objtool/ai-review/objtool.md |
 | KHO (Kexec Handover) | lib/test_kho.c, kho_, kho_is_enabled, kho_retrieve_subtree, kho_preserve_folio, kho_add_subtree, register_kho_notifier | kernel/ai-review/kho.md |
 
