@@ -40,6 +40,21 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Check if this dependency expression can be satisfied given a set of
+    /// known-true symbols. Used by K006 to properly handle OR expressions:
+    /// `A || B` is satisfied if either A or B is in the satisfied set.
+    pub fn is_satisfiable(&self, satisfied: &std::collections::HashSet<String>) -> bool {
+        match self {
+            Expr::Symbol(s) => satisfied.contains(s),
+            Expr::Const(_) => true,
+            Expr::Or(a, b) => a.is_satisfiable(satisfied) || b.is_satisfiable(satisfied),
+            Expr::And(a, b) => a.is_satisfiable(satisfied) && b.is_satisfiable(satisfied),
+            // Negation, comparisons — conservatively assume satisfied
+            // (we can't prove these false without full evaluation)
+            _ => true,
+        }
+    }
+
     /// Collect all symbol names referenced in this expression.
     pub fn collect_symbols(&self, out: &mut Vec<String>) {
         match self {
