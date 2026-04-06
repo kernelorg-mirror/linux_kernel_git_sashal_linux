@@ -66,12 +66,10 @@ impl Config {
 
 fn print_usage() {
     eprintln!(
-        "Usage: kconfiglint [OPTIONS] [PATHS...]
+        "Usage: kconfiglint [OPTIONS]
 
-Lint Linux kernel Kconfig files and Makefiles.
-
-ARGUMENTS:
-  [PATHS...]                 Files/directories to check (default: full tree)
+Lint Linux kernel Kconfig files and Makefiles. Always scans the full
+kernel tree since cross-domain checks require the complete symbol table.
 
 OPTIONS:
   -k, --kconfig-only         Only Kconfig checks (K-series)
