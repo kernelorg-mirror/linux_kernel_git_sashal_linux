@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+
+[package]
+name = "kconfiglint"
+version = "0.1.0"
+edition = "2024"
+description = "Linux kernel Kconfig and Makefile linter"
+
+[[bin]]
+name = "kconfiglint"
+path = "src/main.rs"
