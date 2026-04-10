@@ -494,6 +494,7 @@ static char slot_type_char[] = {
 	[STACK_ZERO]	= '0',
 	[STACK_DYNPTR]	= 'd',
 	[STACK_ITER]	= 'i',
+	[STACK_POISON]	= 'p',
 };
 
 static void print_liveness(struct bpf_verifier_env *env,
@@ -737,7 +738,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 
 		for (j = 0; j < BPF_REG_SIZE; j++) {
 			slot_type = state->stack[i].slot_type[j];
-			if (slot_type != STACK_INVALID)
+			if (slot_type != STACK_INVALID && slot_type != STACK_POISON)
 				valid = true;
 			types_buf[j] = slot_type_char[slot_type];
 		}
