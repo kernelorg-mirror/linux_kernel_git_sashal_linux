@@ -832,6 +832,12 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
 
 int mark_chain_precision(struct bpf_verifier_env *env, int regno);
 
+bool check_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap);
+bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
+	    struct bpf_reg_state *rcur, struct bpf_idmap *idmap, bool exact);
+bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
+	      struct bpf_func_state *cur, struct bpf_idmap *idmap, bool exact);
+
 #define BPF_BASE_TYPE_MASK	GENMASK(BPF_BASE_TYPE_BITS - 1, 0)
 
 /* extract base type from bpf_{arg, return, reg}_type. */
