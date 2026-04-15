@@ -1098,10 +1098,10 @@ fn fetch_lore_email(message_id: &str) -> Result<String> {
         .with_context(|| format!("Failed to fetch {}", url))?;
 
     if response.status() != 200 {
-        bail!("HTTP error {}: {}", response.status(), response.status_text());
+        bail!("HTTP error {}", response.status());
     }
 
-    response.into_string()
+    response.into_body().read_to_string()
         .context("Failed to read response body")
 }
 
