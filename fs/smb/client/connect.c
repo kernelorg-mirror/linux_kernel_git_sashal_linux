@@ -3428,7 +3428,6 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
 	server = mnt_ctx->server;
 	ctx = mnt_ctx->fs_ctx;
 	cifs_sb = mnt_ctx->cifs_sb;
-	sbflags = cifs_sb_flags(cifs_sb);
 
 	/* search for existing tcon to this server share */
 	tcon = cifs_get_tcon(mnt_ctx->ses, ctx);
@@ -3440,7 +3439,7 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
 
 	/* if new SMB3.11 POSIX extensions are supported do not remap / and \ */
 	if (tcon->posix_extensions)
-		sbflags |= CIFS_MOUNT_POSIX_PATHS;
+		atomic_or(CIFS_MOUNT_POSIX_PATHS, &cifs_sb->mnt_cifs_flags);
 
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 	/* tell server which Unix caps we support */
@@ -3463,6 +3462,7 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
 #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
 		tcon->unix_ext = 0; /* server does not support them */
 
+	sbflags = cifs_sb_flags(cifs_sb);
 	/* do not care if a following call succeed - informational */
 	if (!tcon->pipe && server->ops->qfs_tcon) {
 		server->ops->qfs_tcon(mnt_ctx->xid, tcon, cifs_sb);
@@ -3508,7 +3508,6 @@ int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx)
 
 out:
 	mnt_ctx->tcon = tcon;
-	atomic_set(&cifs_sb->mnt_cifs_flags, sbflags);
 	return rc;
 }
 
