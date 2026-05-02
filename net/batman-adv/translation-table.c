@@ -973,8 +973,7 @@ batadv_tt_prepare_tvlv_local_data(struct batadv_priv *bat_priv,
 	}
 
 	/* recalculate in case number of VLANs reduced */
-	change_offset = sizeof(**tt_data);
-	change_offset += num_vlan * sizeof(*tt_vlan);
+	change_offset = struct_size(*tt_data, vlan_data, num_vlan);
 	tvlv_len = *tt_len + change_offset;
 
 	(*tt_data)->num_vlan = htons(num_vlan);
