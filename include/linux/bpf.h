@@ -1189,8 +1189,6 @@ struct bpf_trampoline {
 	/* hlist for trampoline_table */
 	struct hlist_node hlist;
 	struct ftrace_ops *fops;
-	/* serializes access to fields of this trampoline */
-	struct mutex mutex;
 	refcount_t refcnt;
 	u32 flags;
 	u64 key;
