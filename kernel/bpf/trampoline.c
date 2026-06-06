@@ -564,12 +564,46 @@ static int bpf_freplace_check_tgt_prog(struct bpf_prog *tgt_prog)
 	return 0;
 }
 
+static int bpf_trampoline_add_prog(struct bpf_trampoline *tr,
+				   struct bpf_tramp_link *link,
+				   int cnt)
+{
+	enum bpf_tramp_prog_type kind;
+	struct bpf_tramp_link *link_exiting;
+
+	kind = bpf_attach_type_to_tramp(link->link.prog);
+	if (cnt >= BPF_MAX_TRAMP_LINKS)
+		return -E2BIG;
+	if (!hlist_unhashed(&link->tramp_hlist))
+		/* prog already linked */
+		return -EBUSY;
+	hlist_for_each_entry(link_exiting, &tr->progs_hlist[kind], tramp_hlist) {
+		if (link_exiting->link.prog != link->link.prog)
+			continue;
+		/* prog already linked */
+		return -EBUSY;
+	}
+
+	hlist_add_head(&link->tramp_hlist, &tr->progs_hlist[kind]);
+	tr->progs_cnt[kind]++;
+	return 0;
+}
+
+static void bpf_trampoline_remove_prog(struct bpf_trampoline *tr,
+				    struct bpf_tramp_link *link)
+{
+	enum bpf_tramp_prog_type kind;
+
+	kind = bpf_attach_type_to_tramp(link->link.prog);
+	hlist_del_init(&link->tramp_hlist);
+	tr->progs_cnt[kind]--;
+}
+
 static int __bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 				      struct bpf_trampoline *tr,
 				      struct bpf_prog *tgt_prog)
 {
 	enum bpf_tramp_prog_type kind;
-	struct bpf_tramp_link *link_exiting;
 	int err = 0;
 	int cnt = 0, i;
 
@@ -594,25 +628,12 @@ static int __bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 		return bpf_arch_text_poke(tr->func.addr, BPF_MOD_JUMP, NULL,
 					  link->link.prog->bpf_func);
 	}
-	if (cnt >= BPF_MAX_TRAMP_LINKS)
-		return -E2BIG;
-	if (!hlist_unhashed(&link->tramp_hlist))
-		/* prog already linked */
-		return -EBUSY;
-	hlist_for_each_entry(link_exiting, &tr->progs_hlist[kind], tramp_hlist) {
-		if (link_exiting->link.prog != link->link.prog)
-			continue;
-		/* prog already linked */
-		return -EBUSY;
-	}
-
-	hlist_add_head(&link->tramp_hlist, &tr->progs_hlist[kind]);
-	tr->progs_cnt[kind]++;
+	err = bpf_trampoline_add_prog(tr, link, cnt);
+	if (err)
+		return err;
 	err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
-	if (err) {
-		hlist_del_init(&link->tramp_hlist);
-		tr->progs_cnt[kind]--;
-	}
+	if (err)
+		bpf_trampoline_remove_prog(tr, link);
 	return err;
 }
 
@@ -645,8 +666,7 @@ static int __bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 		tgt_prog->aux->is_extended = false;
 		return err;
 	}
-	hlist_del_init(&link->tramp_hlist);
-	tr->progs_cnt[kind]--;
+	bpf_trampoline_remove_prog(tr, link);
 	return bpf_trampoline_update(tr, true /* lock_direct_mutex */);
 }
 
