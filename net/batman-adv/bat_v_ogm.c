@@ -261,7 +261,8 @@ static void batadv_v_ogm_send_meshif(struct batadv_priv *bat_priv)
 {
 	struct batadv_hard_iface *hard_iface;
 	struct batadv_ogm2_packet *ogm_packet;
-	struct sk_buff *skb, *skb_tmp;
+	struct sk_buff *skb;
+	struct sk_buff *skb_tmp;
 	unsigned char **ogm_buff;
 	struct list_head *iter;
 	int *ogm_buff_len;
@@ -694,8 +695,10 @@ static bool batadv_v_ogm_route_update(struct batadv_priv *bat_priv,
 	struct batadv_neigh_node *router = NULL;
 	struct batadv_orig_node *orig_neigh_node;
 	struct batadv_neigh_node *orig_neigh_router = NULL;
-	struct batadv_neigh_ifinfo *router_ifinfo = NULL, *neigh_ifinfo = NULL;
-	u32 router_throughput, neigh_throughput;
+	struct batadv_neigh_ifinfo *router_ifinfo = NULL;
+	struct batadv_neigh_ifinfo *neigh_ifinfo = NULL;
+	u32 router_throughput;
+	u32 neigh_throughput;
 	u32 router_last_seqno;
 	u32 neigh_last_seqno;
 	s32 neigh_seq_diff;
@@ -856,7 +859,9 @@ static void batadv_v_ogm_process(const struct sk_buff *skb, int ogm_offset,
 	struct batadv_neigh_node *neigh_node = NULL;
 	struct batadv_hard_iface *hard_iface;
 	struct batadv_ogm2_packet *ogm_packet;
-	u32 ogm_throughput, link_throughput, path_throughput;
+	u32 ogm_throughput;
+	u32 link_throughput;
+	u32 path_throughput;
 	struct list_head *iter;
 	int ret;
 

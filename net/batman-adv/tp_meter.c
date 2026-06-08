@@ -264,7 +264,8 @@ static void batadv_tp_batctl_error_notify(enum batadv_tp_meter_reason reason,
 static struct batadv_tp_vars *batadv_tp_list_find(struct batadv_priv *bat_priv,
 						  const u8 *dst)
 {
-	struct batadv_tp_vars *pos, *tp_vars = NULL;
+	struct batadv_tp_vars *pos;
+	struct batadv_tp_vars *tp_vars = NULL;
 
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(pos, &bat_priv->tp_list, list) {
@@ -303,7 +304,8 @@ static struct batadv_tp_vars *
 batadv_tp_list_find_session(struct batadv_priv *bat_priv, const u8 *dst,
 			    const u8 *session)
 {
-	struct batadv_tp_vars *pos, *tp_vars = NULL;
+	struct batadv_tp_vars *pos;
+	struct batadv_tp_vars *tp_vars = NULL;
 
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(pos, &bat_priv->tp_list, list) {
@@ -791,7 +793,8 @@ out:
 static bool batadv_tp_avail(struct batadv_tp_vars *tp_vars,
 			    size_t payload_len)
 {
-	u32 win_left, win_limit;
+	u32 win_left;
+	u32 win_limit;
 
 	win_limit = atomic_read(&tp_vars->last_acked) + tp_vars->cwnd;
 	win_left = win_limit - tp_vars->last_sent;
@@ -833,7 +836,8 @@ static int batadv_tp_send(void *arg)
 	struct batadv_priv *bat_priv = tp_vars->bat_priv;
 	struct batadv_hard_iface *primary_if = NULL;
 	struct batadv_orig_node *orig_node = NULL;
-	size_t payload_len, packet_len;
+	size_t payload_len;
+	size_t packet_len;
 	int err = 0;
 
 	if (unlikely(tp_vars->role != BATADV_TP_SENDER)) {
@@ -1141,7 +1145,8 @@ static void batadv_tp_reset_receiver_timer(struct batadv_tp_vars *tp_vars)
 static void batadv_tp_receiver_shutdown(struct timer_list *t)
 {
 	struct batadv_tp_vars *tp_vars = from_timer(tp_vars, t, timer);
-	struct batadv_tp_unacked *un, *safe;
+	struct batadv_tp_unacked *un;
+	struct batadv_tp_unacked *safe;
 	struct batadv_priv *bat_priv;
 
 	bat_priv = tp_vars->bat_priv;
@@ -1194,7 +1199,8 @@ static int batadv_tp_send_ack(struct batadv_priv *bat_priv, const u8 *dst,
 	struct batadv_orig_node *orig_node;
 	struct batadv_icmp_tp_packet *icmp;
 	struct sk_buff *skb;
-	int r, ret;
+	int r;
+	int ret;
 
 	orig_node = batadv_orig_hash_find(bat_priv, dst);
 	if (unlikely(!orig_node)) {
@@ -1327,7 +1333,8 @@ out:
  */
 static void batadv_tp_ack_unordered(struct batadv_tp_vars *tp_vars)
 {
-	struct batadv_tp_unacked *un, *safe;
+	struct batadv_tp_unacked *un;
+	struct batadv_tp_unacked *safe;
 	u32 to_ack;
 
 	/* go through the unacked packet list and possibly ACK them as
