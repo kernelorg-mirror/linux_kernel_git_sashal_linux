@@ -283,8 +283,8 @@ bool batadv_send_skb_prepare_unicast_4addr(struct batadv_priv *bat_priv,
 					   struct batadv_orig_node *orig,
 					   int packet_subtype)
 {
-	struct batadv_hard_iface *primary_if;
 	struct batadv_unicast_4addr_packet *uc_4addr_packet;
+	struct batadv_hard_iface *primary_if;
 	bool ret = false;
 
 	primary_if = batadv_primary_if_get_selected(bat_priv);
@@ -334,8 +334,8 @@ int batadv_send_skb_unicast(struct batadv_priv *bat_priv,
 			    unsigned short vid)
 {
 	struct batadv_unicast_packet *unicast_packet;
-	struct ethhdr *ethhdr;
 	int ret = NET_XMIT_DROP;
+	struct ethhdr *ethhdr;
 
 	if (!orig_node)
 		goto out;

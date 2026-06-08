@@ -275,9 +275,9 @@ static struct batadv_mcast_mla_flags
 batadv_mcast_mla_flags_get(struct batadv_priv *bat_priv)
 {
 	struct net_device *dev = bat_priv->mesh_iface;
+	struct batadv_mcast_mla_flags mla_flags;
 	struct batadv_mcast_querier_state *qr4;
 	struct batadv_mcast_querier_state *qr6;
-	struct batadv_mcast_mla_flags mla_flags;
 	struct net_device *bridge;
 
 	bridge = batadv_mcast_get_bridge(dev);
@@ -523,8 +523,8 @@ batadv_mcast_mla_meshif_get(struct net_device *dev,
 			    struct batadv_mcast_mla_flags *flags)
 {
 	struct net_device *bridge = batadv_mcast_get_bridge(dev);
-	int ret4;
 	int ret6 = 0;
+	int ret4;
 
 	if (bridge)
 		dev = bridge;
@@ -588,11 +588,11 @@ static int batadv_mcast_mla_bridge_get(struct net_device *dev,
 				       struct batadv_mcast_mla_flags *flags)
 {
 	struct list_head bridge_mcast_list = LIST_HEAD_INIT(bridge_mcast_list);
-	struct br_ip_list *br_ip_entry;
-	struct br_ip_list *tmp;
 	u8 tvlv_flags = flags->tvlv_flags;
+	struct br_ip_list *br_ip_entry;
 	struct batadv_hw_addr *new;
 	u8 mcast_addr[ETH_ALEN];
+	struct br_ip_list *tmp;
 	int ret;
 
 	/* we don't need to detect these devices/listeners, the IGMP/MLD
@@ -939,8 +939,8 @@ out:
  */
 static void batadv_mcast_mla_update(struct work_struct *work)
 {
-	struct delayed_work *delayed_work;
 	struct batadv_priv_mcast *priv_mcast;
+	struct delayed_work *delayed_work;
 	struct batadv_priv *bat_priv;
 
 	delayed_work = to_delayed_work(work);
@@ -1227,14 +1227,14 @@ enum batadv_forw_mode
 batadv_mcast_forw_mode(struct batadv_priv *bat_priv, struct sk_buff *skb,
 		       unsigned short vid, int *is_routable)
 {
-	int ret;
-	int tt_count;
-	int ip_count;
-	int unsnoop_count;
-	int total_count;
 	bool is_unsnoopable = false;
 	struct ethhdr *ethhdr;
+	int unsnoop_count;
 	int rtr_count = 0;
+	int total_count;
+	int tt_count;
+	int ip_count;
+	int ret;
 
 	ret = batadv_mcast_forw_mode_check(bat_priv, skb, &is_unsnoopable,
 					   is_routable);
@@ -1309,13 +1309,11 @@ static int
 batadv_mcast_forw_tt(struct batadv_priv *bat_priv, struct sk_buff *skb,
 		     unsigned short vid)
 {
-	int ret = NET_XMIT_SUCCESS;
-	struct sk_buff *newskb;
-
 	struct batadv_tt_orig_list_entry *orig_entry;
-
 	struct batadv_tt_global_entry *tt_global;
 	const u8 *addr = eth_hdr(skb)->h_dest;
+	int ret = NET_XMIT_SUCCESS;
+	struct sk_buff *newskb;
 
 	tt_global = batadv_tt_global_hash_find(bat_priv, addr, vid);
 	if (!tt_global)
@@ -1610,8 +1608,8 @@ static void batadv_mcast_want_unsnoop_update(struct batadv_priv *bat_priv,
 					     struct batadv_orig_node *orig,
 					     u8 mcast_flags)
 {
-	struct hlist_node *node = &orig->mcast_want_all_unsnoopables_node;
 	struct hlist_head *head = &bat_priv->mcast.want_all_unsnoopables_list;
+	struct hlist_node *node = &orig->mcast_want_all_unsnoopables_node;
 
 	lockdep_assert_held(&orig->mcast_handler_lock);
 
@@ -1655,8 +1653,8 @@ static void batadv_mcast_want_ipv4_update(struct batadv_priv *bat_priv,
 					  struct batadv_orig_node *orig,
 					  u8 mcast_flags)
 {
-	struct hlist_node *node = &orig->mcast_want_all_ipv4_node;
 	struct hlist_head *head = &bat_priv->mcast.want_all_ipv4_list;
+	struct hlist_node *node = &orig->mcast_want_all_ipv4_node;
 
 	lockdep_assert_held(&orig->mcast_handler_lock);
 
@@ -1700,8 +1698,8 @@ static void batadv_mcast_want_ipv6_update(struct batadv_priv *bat_priv,
 					  struct batadv_orig_node *orig,
 					  u8 mcast_flags)
 {
-	struct hlist_node *node = &orig->mcast_want_all_ipv6_node;
 	struct hlist_head *head = &bat_priv->mcast.want_all_ipv6_list;
+	struct hlist_node *node = &orig->mcast_want_all_ipv6_node;
 
 	lockdep_assert_held(&orig->mcast_handler_lock);
 
@@ -1745,8 +1743,8 @@ static void batadv_mcast_want_rtr4_update(struct batadv_priv *bat_priv,
 					  struct batadv_orig_node *orig,
 					  u8 mcast_flags)
 {
-	struct hlist_node *node = &orig->mcast_want_all_rtr4_node;
 	struct hlist_head *head = &bat_priv->mcast.want_all_rtr4_list;
+	struct hlist_node *node = &orig->mcast_want_all_rtr4_node;
 
 	lockdep_assert_held(&orig->mcast_handler_lock);
 
@@ -1790,8 +1788,8 @@ static void batadv_mcast_want_rtr6_update(struct batadv_priv *bat_priv,
 					  struct batadv_orig_node *orig,
 					  u8 mcast_flags)
 {
-	struct hlist_node *node = &orig->mcast_want_all_rtr6_node;
 	struct hlist_head *head = &bat_priv->mcast.want_all_rtr6_list;
+	struct hlist_node *node = &orig->mcast_want_all_rtr6_node;
 
 	lockdep_assert_held(&orig->mcast_handler_lock);
 
