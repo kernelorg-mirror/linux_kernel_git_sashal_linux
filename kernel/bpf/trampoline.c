@@ -420,6 +420,13 @@ out:
 	return ERR_PTR(err);
 }
 
+void bpf_trampoline_set_flags(struct bpf_trampoline *tr, u32 flags)
+{
+	trampoline_lock(tr);
+	tr->flags |= flags;
+	trampoline_unlock(tr);
+}
+
 static int bpf_trampoline_update(struct bpf_trampoline *tr, bool lock_direct_mutex)
 {
 	struct bpf_tramp_image *im;
