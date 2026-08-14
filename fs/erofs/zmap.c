@@ -694,11 +694,8 @@ static int z_erofs_map_sanity_check(struct inode *inode,
 
 	if (!(map->m_flags & EROFS_MAP_ENCODED))
 		return 0;
-	if (unlikely(map->m_algorithmformat >= Z_EROFS_COMPRESSION_RUNTIME_MAX)) {
-		erofs_err(inode->i_sb, "unknown algorithm %d @ pos %llu for nid %llu, please upgrade kernel",
-			  map->m_algorithmformat, map->m_la, EROFS_I(inode)->nid);
-		return -EOPNOTSUPP;
-	}
+
+	DBG_BUGON(map->m_algorithmformat >= Z_EROFS_COMPRESSION_RUNTIME_MAX);
 	if (unlikely(map->m_algorithmformat < Z_EROFS_COMPRESSION_MAX &&
 		     !(sbi->available_compr_algs & (1 << map->m_algorithmformat)))) {
 		erofs_err(inode->i_sb, "inconsistent algorithmtype %u for nid %llu",
