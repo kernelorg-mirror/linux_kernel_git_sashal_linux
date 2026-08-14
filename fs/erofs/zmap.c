@@ -540,7 +540,8 @@ static int z_erofs_do_map_blocks(struct inode *inode,
 	}
 
 	if (m.headtype == Z_EROFS_LCLUSTER_TYPE_PLAIN) {
-		if (vi->z_advise & Z_EROFS_ADVISE_INTERLACED_PCLUSTER)
+		if ((vi->z_advise & Z_EROFS_ADVISE_INTERLACED_PCLUSTER) &&
+		    !(map->m_flags & EROFS_MAP_META))
 			map->m_algorithmformat = Z_EROFS_COMPRESSION_INTERLACED;
 		else
 			map->m_algorithmformat = Z_EROFS_COMPRESSION_SHIFTED;
